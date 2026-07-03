@@ -33,6 +33,46 @@ const TITLES = {
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
 const today = () => new Date().toISOString().slice(0, 10);
+
+/* ---- week + follow-up helpers ---- */
+const mondayOf = (d) => {
+  const x = new Date(d);
+  const day = (x.getDay() + 6) % 7; /* Mon=0 … Sun=6 */
+  x.setDate(x.getDate() - day);
+  x.setHours(0, 0, 0, 0);
+  return x;
+};
+const fmtShort = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+const weekLabel = (mon) => {
+  const sat = new Date(mon);
+  sat.setDate(sat.getDate() + 5); /* Monday → Saturday */
+  return `${fmtShort(mon)} – ${fmtShort(sat)}`;
+};
+const weekOptions = () => {
+  const cur = mondayOf(new Date());
+  const out = [];
+  for (let i = 1; i >= -11; i--) {
+    const m = new Date(cur);
+    m.setDate(m.getDate() + i * 7);
+    out.push(weekLabel(m));
+  }
+  return out;
+};
+const addDays = (iso, n) => {
+  if (!iso) return "";
+  const d = new Date(iso + "T00:00:00");
+  if (isNaN(d)) return "";
+  d.setDate(d.getDate() + (+n || 0));
+  return d.toISOString().slice(0, 10);
+};
+const APP_STATUSES = ["applied", "followed up", "replied", "screening", "interview", "final round", "offer", "rejected"];
+const statusColor = (s) =>
+  s === "offer" ? "#4ADE80" : s === "rejected" ? "#7A8699" : ["interview", "final round"].includes(s) ? "#F5B942" : ["replied", "screening"].includes(s) ? "#7DB0F7" : "#E8EDF5";
+const isOpenApp = (a) => !["offer", "rejected"].includes(a.status);
+const dueApps = (w) =>
+  (w.applications || []).filter(
+    (a) => a.contacted && isOpenApp(a) && addDays(a.contacted, a.followUpDays ?? 7) <= today()
+  );
 const newSyncKey = () =>
   "fd_" +
   (crypto.randomUUID
@@ -430,11 +470,14 @@ export default function FlightDeck() {
         (x) =>
           `${x.date} ${x.name || "?"} (${x.intensity || "?"}/10) claim:"${x.claim || ""}" action:"${x.action || "none"}"`
       );
+    const allApps = state.funnel.flatMap((w) => w.applications || []);
+    const due = state.funnel.flatMap((w) => dueApps(w));
     const now = new Date();
     return [
       `Today: ${now.toDateString()}.`,
       `Runway: ${months.toFixed(1)} months (zone: ${zone.name}). Fund P${state.runway.fund}, expenses P${state.runway.expenses}/mo.`,
       `Funnel totals: apps ${totals.apps}, outreach ${totals.outreach}, replies ${totals.replies}, screens ${totals.screens}, interviews ${totals.interviews}, offers ${totals.offers}.`,
+      `Tracked applications: ${allApps.length} total. Follow-ups DUE today or overdue: ${due.length}${due.length ? " — " + due.slice(0, 5).map((a) => `${a.company || "unnamed"} (contacted ${a.contacted}, status ${a.status})`).join("; ") : ""}.`,
       `Recent weeks (newest first):\n${weeks.join("\n") || "none logged yet"}`,
       `Recent emotion-protocol entries (newest first):\n${emos.join("\n") || "none logged yet"}`,
     ].join("\n\n");
@@ -513,15 +556,39 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
   const saveModal = (data) => {
     const { kind, entry } = modal;
     if (kind === "funnel") {
+      const manage = data.__manageApps;
+      delete data.__manageApps;
+      const id = entry?.id || uid();
       mutate(
         (s) => ({
           ...s,
           funnel: entry
             ? s.funnel.map((w) => (w.id === entry.id ? { ...w, ...data } : w))
-            : [{ id: uid(), ...data }, ...s.funnel],
+            : [{ id, applications: [], ...data }, ...s.funnel],
         }),
         entry ? "Week updated" : "Week logged"
       );
+      setModal(manage ? { kind: "apps", weekId: id } : null);
+      return;
+    } else if (kind === "application") {
+      mutate(
+        (s) => ({
+          ...s,
+          funnel: s.funnel.map((w) =>
+            w.id === modal.weekId
+              ? {
+                  ...w,
+                  applications: entry
+                    ? (w.applications || []).map((a) => (a.id === entry.id ? { ...a, ...data } : a))
+                    : [{ id: uid(), ...data }, ...(w.applications || [])],
+                }
+              : w
+          ),
+        }),
+        entry ? "Application updated" : "Application added"
+      );
+      setModal({ kind: "apps", weekId: modal.weekId });
+      return;
     } else if (kind === "emotion") {
       mutate(
         (s) => ({
@@ -722,6 +789,8 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {state.funnel.map((w) => {
           const onPace = (+w.apps || 0) >= 8 && (+w.outreach || 0) >= 20;
+          const tracked = (w.applications || []).length;
+          const due = dueApps(w).length;
           return (
             <SwipeRow
               key={w.id}
@@ -738,6 +807,20 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
               <div style={{ fontFamily: mono, fontSize: 12, color: C.muted, marginTop: 6 }}>
                 A {w.apps || 0} · O {w.outreach || 0} · R {w.replies || 0} · S {w.screens || 0} · I {w.interviews || 0} · OF {w.offers || 0}
               </div>
+              {(tracked > 0 || due > 0) && (
+                <div style={{ display: "flex", gap: 10, marginTop: 6, alignItems: "center" }}>
+                  {tracked > 0 && (
+                    <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.blue }}>
+                      ▸ {tracked} APPLICATION{tracked === 1 ? "" : "S"} TRACKED
+                    </div>
+                  )}
+                  {due > 0 && (
+                    <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.red }}>
+                      ⚑ {due} FOLLOW-UP{due === 1 ? "" : "S"} DUE
+                    </div>
+                  )}
+                </div>
+              )}
             </SwipeRow>
           );
         })}
@@ -939,7 +1022,35 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
         </div>
       )}
 
-      {modal && <Modal modal={modal} onClose={() => setModal(null)} onSave={saveModal} />}
+      {modal && modal.kind === "apps" && (
+        <AppsModal
+          week={state.funnel.find((w) => w.id === modal.weekId)}
+          onClose={() => setModal(null)}
+          onAdd={() => setModal({ kind: "application", weekId: modal.weekId, entry: null })}
+          onEdit={(a) => setModal({ kind: "application", weekId: modal.weekId, entry: a })}
+          onDelete={(appId) =>
+            mutate(
+              (s) => ({
+                ...s,
+                funnel: s.funnel.map((w) =>
+                  w.id === modal.weekId
+                    ? { ...w, applications: (w.applications || []).filter((a) => a.id !== appId) }
+                    : w
+                ),
+              }),
+              "Application deleted"
+            )
+          }
+        />
+      )}
+      {modal && modal.kind !== "apps" && (
+        <Modal
+          key={modal.kind + "-" + (modal.entry?.id || "new") + "-" + (modal.weekId || "")}
+          modal={modal}
+          onClose={() => setModal(null)}
+          onSave={saveModal}
+        />
+      )}
       {syncModal && (
         <SyncModal
           currentKey={syncKeyRef.current}
@@ -955,16 +1066,31 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
 /* ---------- edit modal (centered) ---------- */
 function Modal({ modal, onClose, onSave }) {
   const { kind, entry } = modal;
+  const opts = weekOptions();
+  const [customWeek, setCustomWeek] = useState(
+    () => kind === "funnel" && entry?.week && !opts.includes(entry.week)
+  );
   const [f, setF] = useState(() => {
     if (kind === "funnel")
       return {
-        week: entry?.week || "",
+        week: entry?.week || weekLabel(mondayOf(new Date())),
         apps: entry?.apps ?? "",
         outreach: entry?.outreach ?? "",
         replies: entry?.replies ?? "",
         screens: entry?.screens ?? "",
         interviews: entry?.interviews ?? "",
         offers: entry?.offers ?? "",
+      };
+    if (kind === "application")
+      return {
+        company: entry?.company || "",
+        contact: entry?.contact || "",
+        email: entry?.email || "",
+        contacted: entry?.contacted || today(),
+        followUpDays: entry?.followUpDays ?? 7,
+        status: entry?.status || "applied",
+        notes: entry?.notes || "",
+        custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
       };
     if (kind === "emotion")
       return { name: entry?.name || "", intensity: entry?.intensity ?? "", claim: entry?.claim || "", action: entry?.action || "" };
@@ -973,11 +1099,33 @@ function Modal({ modal, onClose, onSave }) {
   });
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
 
+  const selectStyle = {
+    width: "100%",
+    boxSizing: "border-box",
+    fontSize: 16,
+    fontFamily: sans,
+    color: C.ink,
+    background: C.bg,
+    border: `1px solid ${C.panelEdge}`,
+    borderRadius: 10,
+    padding: "10px 12px",
+    outline: "none",
+    appearance: "none",
+  };
+
   const titles = {
     funnel: entry ? "Edit week" : "Log a week",
+    application: entry ? "Edit application" : "Track an application",
     emotion: entry ? "Edit protocol entry" : "Run the protocol",
     decision: entry ? "Edit decision" : "Written decision",
     runway: "Update runway numbers",
+  };
+
+  const followUpDate = kind === "application" ? addDays(f.contacted, f.followUpDays) : "";
+
+  const saveApplication = () => {
+    const clean = { ...f, custom: (f.custom || []).filter((c) => c.k || c.v) };
+    onSave(clean);
   };
 
   return (
@@ -995,7 +1143,38 @@ function Modal({ modal, onClose, onSave }) {
 
         {kind === "funnel" && (
           <>
-            <Field label="Week label" value={f.week} onChange={set("week")} placeholder="e.g. Jul 6–10" />
+            <div style={{ marginBottom: 12 }}>
+              <Label>Week (Monday – Saturday)</Label>
+              {!customWeek ? (
+                <select
+                  value={opts.includes(f.week) ? f.week : "__custom__"}
+                  onChange={(e) => {
+                    if (e.target.value === "__custom__") setCustomWeek(true);
+                    else set("week")(e.target.value);
+                  }}
+                  style={selectStyle}
+                >
+                  {opts.map((o) => (
+                    <option key={o} value={o}>
+                      {o}
+                    </option>
+                  ))}
+                  <option value="__custom__">Custom…</option>
+                </select>
+              ) : (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input
+                    value={f.week}
+                    placeholder="e.g. Jul 6 – Jul 11"
+                    onChange={(e) => set("week")(e.target.value)}
+                    style={{ ...selectStyle, flex: 1 }}
+                  />
+                  <Btn ghost onClick={() => setCustomWeek(false)} style={{ padding: "10px 12px" }}>
+                    List
+                  </Btn>
+                </div>
+              )}
+            </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
               <Field label="Applications" type="number" value={f.apps} onChange={set("apps")} />
               <Field label="Outreaches" type="number" value={f.outreach} onChange={set("outreach")} />
@@ -1004,6 +1183,95 @@ function Modal({ modal, onClose, onSave }) {
               <Field label="Interviews" type="number" value={f.interviews} onChange={set("interviews")} />
               <Field label="Offers" type="number" value={f.offers} onChange={set("offers")} />
             </div>
+            <button
+              onClick={() => onSave({ ...f, __manageApps: true })}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                background: C.bg,
+                border: `1px dashed ${C.blue}`,
+                color: C.blue,
+                borderRadius: 10,
+                padding: "11px 12px",
+                fontSize: 13,
+                fontWeight: 700,
+                letterSpacing: "0.04em",
+                cursor: "pointer",
+                marginBottom: 12,
+              }}
+            >
+              ▸ Applications ({(entry?.applications || []).length}) — track companies & follow-ups
+            </button>
+          </>
+        )}
+
+        {kind === "application" && (
+          <>
+            <Field label="Company name" value={f.company} onChange={set("company")} placeholder="e.g. Acme SaaS Inc." />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <Field label="Contact person" value={f.contact} onChange={set("contact")} placeholder="e.g. Jane Cruz" />
+              <Field label="Email" value={f.email} onChange={set("email")} placeholder="jane@acme.com" />
+              <Field label="Date contacted" type="date" value={f.contacted} onChange={set("contacted")} />
+              <Field label="Follow up in (days)" type="number" value={f.followUpDays} onChange={set("followUpDays")} />
+            </div>
+            {followUpDate && (
+              <div
+                style={{
+                  fontFamily: mono,
+                  fontSize: 12,
+                  color: followUpDate <= today() ? C.red : C.green,
+                  margin: "-4px 0 12px",
+                }}
+              >
+                ⚑ Follow-up date: {followUpDate}
+                {followUpDate <= today() ? " — DUE" : ""}
+              </div>
+            )}
+            <div style={{ marginBottom: 12 }}>
+              <Label>Status</Label>
+              <select value={f.status} onChange={(e) => set("status")(e.target.value)} style={selectStyle}>
+                {APP_STATUSES.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <Field label="Notes" value={f.notes} onChange={set("notes")} placeholder="role, salary range, next step…" />
+
+            <Label>Custom fields</Label>
+            {(f.custom || []).map((c, i) => (
+              <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                <input
+                  value={c.k}
+                  placeholder="Label (e.g. Portfolio sent)"
+                  onChange={(e) =>
+                    setF((p) => ({ ...p, custom: p.custom.map((x, j) => (j === i ? { ...x, k: e.target.value } : x)) }))
+                  }
+                  style={{ ...selectStyle, flex: 1, fontSize: 16 }}
+                />
+                <input
+                  value={c.v}
+                  placeholder="Value"
+                  onChange={(e) =>
+                    setF((p) => ({ ...p, custom: p.custom.map((x, j) => (j === i ? { ...x, v: e.target.value } : x)) }))
+                  }
+                  style={{ ...selectStyle, flex: 1, fontSize: 16 }}
+                />
+                <button
+                  onClick={() => setF((p) => ({ ...p, custom: p.custom.filter((_, j) => j !== i) }))}
+                  style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0 }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            <button
+              onClick={() => setF((p) => ({ ...p, custom: [...(p.custom || []), { k: "", v: "" }] }))}
+              style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 12 }}
+            >
+              + Add custom field
+            </button>
           </>
         )}
 
@@ -1029,7 +1297,84 @@ function Modal({ modal, onClose, onSave }) {
 
         <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
           <Btn ghost onClick={onClose} style={{ flex: 1 }}>Cancel</Btn>
-          <Btn onClick={() => onSave(f)} style={{ flex: 2 }}>Save</Btn>
+          <Btn onClick={() => (kind === "application" ? saveApplication() : onSave(f))} style={{ flex: 2 }}>Save</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- applications list modal (centered) ---------- */
+function AppsModal({ week, onClose, onAdd, onEdit, onDelete }) {
+  if (!week) return null;
+  const apps = week.applications || [];
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 460, maxHeight: "80vh", overflowY: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <div style={{ fontSize: 16, fontWeight: 800 }}>Applications — {week.week || "Week"}</div>
+          <Btn onClick={onAdd} style={{ padding: "8px 12px", fontSize: 12 }}>+ Add</Btn>
+        </div>
+
+        {apps.length === 0 && (
+          <div style={{ color: C.muted, fontSize: 13, padding: "18px 0", textAlign: "center" }}>
+            No applications tracked yet for this week. Add each company you applied to and Flight Deck will watch the follow-up dates.
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {apps.map((a) => {
+            const fu = a.contacted ? addDays(a.contacted, a.followUpDays ?? 7) : "";
+            const due = fu && isOpenApp(a) && fu <= today();
+            return (
+              <div
+                key={a.id}
+                onClick={() => onEdit(a)}
+                style={{ background: C.bg, border: `1px solid ${due ? C.red : C.panelEdge}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer", position: "relative", paddingRight: 38 }}
+              >
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(a.id);
+                  }}
+                  title="Delete application"
+                  style={{ position: "absolute", top: 8, right: 8, width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
+                >
+                  ×
+                </button>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{a.company || "Unnamed company"}</div>
+                  <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: statusColor(a.status), textTransform: "uppercase", flexShrink: 0 }}>
+                    {a.status || "applied"}
+                  </div>
+                </div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>
+                  {[a.contact, a.email].filter(Boolean).join(" · ") || "no contact yet"}
+                </div>
+                <div style={{ fontFamily: mono, fontSize: 11, marginTop: 6, color: due ? C.red : C.muted }}>
+                  {a.contacted ? `contacted ${a.contacted}` : "no contact date"}
+                  {fu ? ` → follow up ${fu}${due ? " ⚑ DUE" : ""}` : ""}
+                </div>
+                {(a.custom || []).length > 0 && (
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+                    {a.custom.map((c) => `${c.k}: ${c.v}`).join(" · ")}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{ marginTop: 14 }}>
+          <Btn ghost onClick={onClose} style={{ width: "100%" }}>Close</Btn>
         </div>
       </div>
     </div>
