@@ -1,0 +1,17 @@
+{
+  "name": "flight-deck",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/main.jsx --bundle --minify --jsx=automatic --outfile=dist/app.js && cp index.html dist/index.html",
+    "dev": "netlify dev"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "@netlify/functions": "^2.8.0"
+  }
+}
