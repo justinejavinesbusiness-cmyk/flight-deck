@@ -1,12 +1,14 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 
 /* ============================================================
-   FLIGHT DECK — Job Search Operating System (deployed build)
-   - Mobile: swipe left/right switches modes, swipe an entry LEFT deletes
-   - Desktop (>=1024px): full dashboard grid, hover x deletes
-   - Persistence: Supabase (keyed by a private sync code) + local cache
-   - Coach: Claude Sonnet via /api/coach Netlify function
+   FLIGHT DECK v2 — Job Search Operating System
+   ARCHITECTURE: the Pipeline (CRM) is the source of truth.
+   - Applications are individual records with status + follow-up
+   - Weekly funnel numbers DERIVE from the pipeline automatically
+   - Outreach is the only manually logged weekly number
+   - Due follow-ups surface as action items in the Briefing
+   - The Claude coach reads the whole pipeline
    ============================================================ */
 
 const SUPA_URL = "https://ywzvhloswottkasvhzfv.supabase.co";
@@ -24,9 +26,10 @@ const C = {
   blue: "#7DB0F7",
 };
 
-const MODES = ["BRIEFING", "FUNNEL", "EMOTIONS", "RUNWAY"];
+const MODES = ["BRIEFING", "PIPELINE", "FUNNEL", "EMOTIONS", "RUNWAY"];
 const TITLES = {
   BRIEFING: "Daily Briefing",
+  PIPELINE: "Pipeline (CRM)",
   FUNNEL: "Funnel Tracker",
   EMOTIONS: "Emotion Protocol",
   RUNWAY: "Runway Gauge",
@@ -42,6 +45,10 @@ const mondayOf = (d) => {
   x.setHours(0, 0, 0, 0);
   return x;
 };
+const iso = (d) => {
+  const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return z.toISOString().slice(0, 10);
+};
 const fmtShort = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 const weekLabel = (mon) => {
   const sat = new Date(mon);
@@ -54,58 +61,68 @@ const weekOptions = () => {
   for (let i = 1; i >= -11; i--) {
     const m = new Date(cur);
     m.setDate(m.getDate() + i * 7);
-    out.push(weekLabel(m));
+    out.push({ label: weekLabel(m), start: iso(m) });
   }
   return out;
 };
-const addDays = (iso, n) => {
-  if (!iso) return "";
-  const d = new Date(iso + "T00:00:00");
+const weekStartOfDate = (isoDate) => {
+  if (!isoDate) return null;
+  const d = new Date(isoDate + "T00:00:00");
+  if (isNaN(d)) return null;
+  return iso(mondayOf(d));
+};
+const addDays = (isoDate, n) => {
+  if (!isoDate) return "";
+  const d = new Date(isoDate + "T00:00:00");
   if (isNaN(d)) return "";
   d.setDate(d.getDate() + (+n || 0));
   return d.toISOString().slice(0, 10);
 };
+
+/* ---- application status model ---- */
 const APP_STATUSES = ["applied", "followed up", "replied", "screening", "interview", "final round", "offer", "rejected"];
-const statusColor = (s) =>
-  s === "offer" ? "#4ADE80" : s === "rejected" ? "#7A8699" : ["interview", "final round"].includes(s) ? "#F5B942" : ["replied", "screening"].includes(s) ? "#7DB0F7" : "#E8EDF5";
+const STAGE_IDX = { applied: 0, "followed up": 1, replied: 2, screening: 3, interview: 4, "final round": 5, offer: 6 };
 const isOpenApp = (a) => !["offer", "rejected"].includes(a.status);
-const dueApps = (w) =>
-  (w.applications || []).filter(
-    (a) => a.contacted && isOpenApp(a) && addDays(a.contacted, a.followUpDays ?? 7) <= today()
-  );
-const newSyncKey = () =>
-  "fd_" +
-  (crypto.randomUUID
-    ? crypto.randomUUID().replace(/-/g, "")
-    : Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join(""));
+const reached = (a, stage) => a.status !== "rejected" && (STAGE_IDX[a.status] ?? 0) >= STAGE_IDX[stage];
+const statusColor = (s) =>
+  s === "offer" ? C.green : s === "rejected" ? C.muted : ["interview", "final round"].includes(s) ? C.amber : ["replied", "screening"].includes(s) ? C.blue : C.ink;
+const followUpOf = (a) => (a.contacted ? addDays(a.contacted, a.followUpDays ?? 7) : "");
+const isDue = (a) => {
+  const fu = followUpOf(a);
+  return fu && isOpenApp(a) && fu <= today();
+};
 
 const DEFAULT_STATE = {
-  funnel: [],
+  applications: [],
+  funnel: [], /* weekly logs: {id, week, weekStart, outreach} + legacy manual counts */
   emotions: [],
   decisions: [],
   runway: { fund: 1200000, expenses: 50000 },
 };
-const DEFAULT_COACH = {
-  dailyDate: null,
-  daily: null,
-  dailyDone: [],
-  weeklyDate: null,
-  weekly: null,
-};
+const DEFAULT_COACH = { dailyDate: null, daily: null, dailyDone: [], weeklyDate: null, weekly: null };
 
 const mono = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-const sans =
-  "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+const sans = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+
+/* migrate v1 data (nested week.applications, manual counts) into v2 shape */
+function migrate(saved) {
+  const s = { ...DEFAULT_STATE, ...saved };
+  if (!Array.isArray(s.applications)) s.applications = [];
+  s.funnel = (s.funnel || []).map((w) => {
+    if (Array.isArray(w.applications) && w.applications.length) {
+      s.applications = [...w.applications.map((a) => ({ ...a })), ...s.applications];
+    }
+    const { applications, ...rest } = w;
+    return rest;
+  });
+  return s;
+}
 
 /* ---------- supabase rpc ---------- */
 async function rpc(fn, args) {
   const r = await fetch(`${SUPA_URL}/rest/v1/rpc/${fn}`, {
     method: "POST",
-    headers: {
-      apikey: SUPA_KEY,
-      Authorization: `Bearer ${SUPA_KEY}`,
-      "content-type": "application/json",
-    },
+    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "content-type": "application/json" },
     body: JSON.stringify(args),
   });
   if (!r.ok) throw new Error(`supabase ${r.status}`);
@@ -148,23 +165,7 @@ function SwipeRow({ onDelete, onTap, showX, children }) {
 
   return (
     <div style={{ position: "relative", overflow: "hidden", borderRadius: 12 }}>
-      <div
-        style={{
-          position: "absolute",
-          inset: 0,
-          background: C.red,
-          borderRadius: 12,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "flex-end",
-          paddingRight: 18,
-          color: "#2b0b0b",
-          fontFamily: sans,
-          fontWeight: 700,
-          fontSize: 13,
-          letterSpacing: "0.08em",
-        }}
-      >
+      <div style={{ position: "absolute", inset: 0, background: C.red, borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "flex-end", paddingRight: 18, color: "#2b0b0b", fontFamily: sans, fontWeight: 700, fontSize: 13, letterSpacing: "0.08em" }}>
         DELETE
       </div>
       <div
@@ -174,18 +175,7 @@ function SwipeRow({ onDelete, onTap, showX, children }) {
         onClick={() => {
           if (!moved.current && onTap) onTap();
         }}
-        style={{
-          transform: `translateX(${dx}px)`,
-          transition: start.current ? "none" : "transform 0.18s ease-out",
-          background: C.panel,
-          border: `1px solid ${C.panelEdge}`,
-          borderRadius: 12,
-          padding: "12px 14px",
-          paddingRight: showX ? 38 : 14,
-          position: "relative",
-          touchAction: "pan-y",
-          cursor: "pointer",
-        }}
+        style={{ transform: `translateX(${dx}px)`, transition: start.current ? "none" : "transform 0.18s ease-out", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px", paddingRight: showX ? 38 : 14, position: "relative", touchAction: "pan-y", cursor: "pointer" }}
       >
         {showX && (
           <button
@@ -194,21 +184,7 @@ function SwipeRow({ onDelete, onTap, showX, children }) {
               onDelete();
             }}
             title="Delete entry"
-            style={{
-              position: "absolute",
-              top: 8,
-              right: 8,
-              width: 24,
-              height: 24,
-              borderRadius: 12,
-              border: `1px solid ${C.panelEdge}`,
-              background: "transparent",
-              color: C.muted,
-              fontSize: 13,
-              lineHeight: "22px",
-              cursor: "pointer",
-              padding: 0,
-            }}
+            style={{ position: "absolute", top: 8, right: 8, width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
           >
             ×
           </button>
@@ -222,20 +198,24 @@ function SwipeRow({ onDelete, onTap, showX, children }) {
 /* ---------- shared pieces ---------- */
 function Label({ children }) {
   return (
-    <div
-      style={{
-        fontFamily: sans,
-        fontSize: 10,
-        letterSpacing: "0.18em",
-        color: C.muted,
-        textTransform: "uppercase",
-        marginBottom: 4,
-      }}
-    >
+    <div style={{ fontFamily: sans, fontSize: 10, letterSpacing: "0.18em", color: C.muted, textTransform: "uppercase", marginBottom: 4 }}>
       {children}
     </div>
   );
 }
+
+const inputStyle = {
+  width: "100%",
+  boxSizing: "border-box",
+  fontSize: 16,
+  fontFamily: sans,
+  color: C.ink,
+  background: C.bg,
+  border: `1px solid ${C.panelEdge}`,
+  borderRadius: 10,
+  padding: "10px 12px",
+  outline: "none",
+};
 
 function Field({ label, value, onChange, type = "text", placeholder }) {
   return (
@@ -247,18 +227,7 @@ function Field({ label, value, onChange, type = "text", placeholder }) {
         value={value}
         placeholder={placeholder || ""}
         onChange={(e) => onChange(e.target.value)}
-        style={{
-          width: "100%",
-          boxSizing: "border-box",
-          fontSize: 16,
-          fontFamily: type === "number" ? mono : sans,
-          color: C.ink,
-          background: C.bg,
-          border: `1px solid ${C.panelEdge}`,
-          borderRadius: 10,
-          padding: "10px 12px",
-          outline: "none",
-        }}
+        style={{ ...inputStyle, fontFamily: type === "number" ? mono : sans }}
       />
     </div>
   );
@@ -270,20 +239,7 @@ function Btn({ children, onClick, color = C.amber, ghost, disabled, style, title
       onClick={onClick}
       disabled={disabled}
       title={title}
-      style={{
-        fontFamily: sans,
-        fontSize: 13,
-        fontWeight: 700,
-        letterSpacing: "0.06em",
-        padding: "10px 16px",
-        borderRadius: 10,
-        border: ghost ? `1px solid ${C.panelEdge}` : "none",
-        background: ghost ? "transparent" : disabled ? C.panelEdge : color,
-        color: ghost ? C.muted : "#141a12",
-        opacity: disabled ? 0.5 : 1,
-        cursor: disabled ? "default" : "pointer",
-        ...style,
-      }}
+      style={{ fontFamily: sans, fontSize: 13, fontWeight: 700, letterSpacing: "0.06em", padding: "10px 16px", borderRadius: 10, border: ghost ? `1px solid ${C.panelEdge}` : "none", background: ghost ? "transparent" : disabled ? C.panelEdge : color, color: ghost ? C.muted : "#141a12", opacity: disabled ? 0.5 : 1, cursor: disabled ? "default" : "pointer", ...style }}
     >
       {children}
     </button>
@@ -294,17 +250,7 @@ function Panel({ title, children, style }) {
   return (
     <div style={{ minWidth: 0, ...style }}>
       {title && (
-        <div
-          style={{
-            fontFamily: mono,
-            fontSize: 11,
-            letterSpacing: "0.28em",
-            color: C.amber,
-            margin: "0 2px 10px",
-          }}
-        >
-          {title}
-        </div>
+        <div style={{ fontFamily: mono, fontSize: 11, letterSpacing: "0.28em", color: C.amber, margin: "0 2px 10px" }}>{title}</div>
       )}
       {children}
     </div>
@@ -321,6 +267,7 @@ export default function FlightDeck() {
   const [syncModal, setSyncModal] = useState(false);
   const [toast, setToast] = useState("");
   const [syncStatus, setSyncStatus] = useState("local");
+  const [pipeFilter, setPipeFilter] = useState("active");
   const [coachLoading, setCoachLoading] = useState(null);
   const [coachError, setCoachError] = useState("");
   const [isDesktop, setIsDesktop] = useState(
@@ -338,8 +285,7 @@ export default function FlightDeck() {
     const mq = window.matchMedia("(min-width: 1024px)");
     const fn = (e) => setIsDesktop(e.matches);
     mq.addEventListener ? mq.addEventListener("change", fn) : mq.addListener(fn);
-    return () =>
-      mq.removeEventListener ? mq.removeEventListener("change", fn) : mq.removeListener(fn);
+    return () => (mq.removeEventListener ? mq.removeEventListener("change", fn) : mq.removeListener(fn));
   }, []);
 
   /* load: local cache first, then remote (remote wins on first load) */
@@ -348,15 +294,17 @@ export default function FlightDeck() {
     try {
       key = localStorage.getItem("fd-sync-key");
       if (!key) {
-        key = newSyncKey();
+        key =
+          "fd_" +
+          (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
         localStorage.setItem("fd-sync-key", key);
       }
       const ls = localStorage.getItem("fd-state");
-      if (ls) setState({ ...DEFAULT_STATE, ...JSON.parse(ls) });
+      if (ls) setState(migrate(JSON.parse(ls)));
       const lc = localStorage.getItem("fd-coach");
       if (lc) setCoach({ ...DEFAULT_COACH, ...JSON.parse(lc) });
     } catch (e) {
-      key = key || newSyncKey();
+      key = key || "fd_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
     }
     syncKeyRef.current = key;
     setLoaded(true);
@@ -364,7 +312,7 @@ export default function FlightDeck() {
       try {
         const remote = await rpc("fd_get", { k: key });
         if (remote) {
-          if (remote.data) setState({ ...DEFAULT_STATE, ...remote.data });
+          if (remote.data) setState(migrate(remote.data));
           if (remote.coach) setCoach({ ...DEFAULT_COACH, ...remote.coach });
         }
         setSyncStatus("synced");
@@ -434,18 +382,69 @@ export default function FlightDeck() {
     }
   };
 
-  /* derived */
-  const totals = state.funnel.reduce(
-    (a, w) => ({
-      apps: a.apps + (+w.apps || 0),
-      outreach: a.outreach + (+w.outreach || 0),
-      replies: a.replies + (+w.replies || 0),
-      screens: a.screens + (+w.screens || 0),
-      interviews: a.interviews + (+w.interviews || 0),
-      offers: a.offers + (+w.offers || 0),
-    }),
-    { apps: 0, outreach: 0, replies: 0, screens: 0, interviews: 0, offers: 0 }
-  );
+  /* ============ DERIVED: everything communicates ============ */
+  const apps = state.applications;
+  const dueList = useMemo(() => apps.filter(isDue), [apps]);
+
+  /* weekly rows: derived from pipeline + manual outreach logs (+ legacy counts) */
+  const weekRows = useMemo(() => {
+    const map = new Map();
+    const ensure = (label, start) => {
+      if (!map.has(label))
+        map.set(label, {
+          id: null,
+          week: label,
+          weekStart: start || null,
+          outreach: 0,
+          legacy: { apps: 0, replies: 0, screens: 0, interviews: 0, offers: 0 },
+          d: { apps: 0, replies: 0, screens: 0, interviews: 0, offers: 0 },
+          due: 0,
+        });
+      return map.get(label);
+    };
+    (state.funnel || []).forEach((w) => {
+      const row = ensure(w.week || "Unlabeled", w.weekStart);
+      row.id = w.id;
+      row.weekStart = row.weekStart || w.weekStart || null;
+      row.outreach += +w.outreach || 0;
+      row.legacy.apps += +w.apps || 0;
+      row.legacy.replies += +w.replies || 0;
+      row.legacy.screens += +w.screens || 0;
+      row.legacy.interviews += +w.interviews || 0;
+      row.legacy.offers += +w.offers || 0;
+    });
+    apps.forEach((a) => {
+      const ws = weekStartOfDate(a.contacted);
+      const label = ws ? weekLabel(new Date(ws + "T00:00:00")) : "No date set";
+      const row = ensure(label, ws);
+      row.d.apps += 1;
+      if (reached(a, "replied")) row.d.replies += 1;
+      if (reached(a, "screening")) row.d.screens += 1;
+      if (reached(a, "interview")) row.d.interviews += 1;
+      if (a.status === "offer") row.d.offers += 1;
+      if (isDue(a)) row.due += 1;
+    });
+    return Array.from(map.values()).sort((x, y) => {
+      if (x.weekStart && y.weekStart) return y.weekStart.localeCompare(x.weekStart);
+      if (x.weekStart) return -1;
+      if (y.weekStart) return 1;
+      return 0;
+    });
+  }, [state.funnel, apps]);
+
+  const totals = useMemo(() => {
+    const t = { apps: 0, outreach: 0, replies: 0, screens: 0, interviews: 0, offers: 0 };
+    weekRows.forEach((r) => {
+      t.apps += r.d.apps + r.legacy.apps;
+      t.outreach += r.outreach;
+      t.replies += r.d.replies + r.legacy.replies;
+      t.screens += r.d.screens + r.legacy.screens;
+      t.interviews += r.d.interviews + r.legacy.interviews;
+      t.offers += r.d.offers + r.legacy.offers;
+    });
+    return t;
+  }, [weekRows]);
+
   const months = state.runway.expenses > 0 ? state.runway.fund / state.runway.expenses : 0;
   const zone =
     months >= 12
@@ -458,27 +457,24 @@ export default function FlightDeck() {
 
   /* ---------- coach ---------- */
   const buildContext = () => {
-    const weeks = state.funnel
+    const weekLines = weekRows
       .slice(0, 8)
       .map(
-        (w) =>
-          `${w.week || "wk"}: apps ${w.apps || 0}, outreach ${w.outreach || 0}, replies ${w.replies || 0}, screens ${w.screens || 0}, interviews ${w.interviews || 0}, offers ${w.offers || 0}`
+        (r) =>
+          `${r.week}: apps ${r.d.apps + r.legacy.apps}, outreach ${r.outreach}, replies ${r.d.replies + r.legacy.replies}, screens ${r.d.screens + r.legacy.screens}, interviews ${r.d.interviews + r.legacy.interviews}, offers ${r.d.offers + r.legacy.offers}`
       );
+    const byStatus = APP_STATUSES.map((s) => `${s}: ${apps.filter((a) => a.status === s).length}`).join(", ");
     const emos = state.emotions
       .slice(0, 6)
-      .map(
-        (x) =>
-          `${x.date} ${x.name || "?"} (${x.intensity || "?"}/10) claim:"${x.claim || ""}" action:"${x.action || "none"}"`
-      );
-    const allApps = state.funnel.flatMap((w) => w.applications || []);
-    const due = state.funnel.flatMap((w) => dueApps(w));
+      .map((x) => `${x.date} ${x.name || "?"} (${x.intensity || "?"}/10) claim:"${x.claim || ""}" action:"${x.action || "none"}"`);
     const now = new Date();
     return [
       `Today: ${now.toDateString()}.`,
       `Runway: ${months.toFixed(1)} months (zone: ${zone.name}). Fund P${state.runway.fund}, expenses P${state.runway.expenses}/mo.`,
-      `Funnel totals: apps ${totals.apps}, outreach ${totals.outreach}, replies ${totals.replies}, screens ${totals.screens}, interviews ${totals.interviews}, offers ${totals.offers}.`,
-      `Tracked applications: ${allApps.length} total. Follow-ups DUE today or overdue: ${due.length}${due.length ? " — " + due.slice(0, 5).map((a) => `${a.company || "unnamed"} (contacted ${a.contacted}, status ${a.status})`).join("; ") : ""}.`,
-      `Recent weeks (newest first):\n${weeks.join("\n") || "none logged yet"}`,
+      `Funnel totals (derived live from pipeline): apps ${totals.apps}, outreach ${totals.outreach}, replies ${totals.replies}, screens ${totals.screens}, interviews ${totals.interviews}, offers ${totals.offers}.`,
+      `Pipeline by status: ${byStatus}.`,
+      `Follow-ups DUE today or overdue: ${dueList.length}${dueList.length ? " — " + dueList.slice(0, 6).map((a) => `${a.company || "unnamed"} (contacted ${a.contacted}, status ${a.status})`).join("; ") : ""}.`,
+      `Recent weeks (newest first):\n${weekLines.join("\n") || "none yet"}`,
       `Recent emotion-protocol entries (newest first):\n${emos.join("\n") || "none logged yet"}`,
     ].join("\n\n");
   };
@@ -488,9 +484,10 @@ Non-negotiable playbook rules you must coach within:
 - The P95,000/month salary floor holds. NEVER suggest lowering it unless runway is under 3 months, and even then only as a written deliberate decision.
 - Weekly benchmarks: 8-10 tailored applications + 20-25 warm outreaches. Warm/referral channels convert 4-10x better than cold applications.
 - Funnel diagnosis: no replies = fix resume/portfolio layer; screens but no interviews = fix screening-call prep; interviews but no offers = fix interview stage.
+- Follow-ups that are due should usually be today's first action items - name the specific companies.
 - Rejection at ~95% of cold applications is the statistical norm, not a verdict. Decisions come from tracker numbers, never from moods.
 - Emotions: each logged emotion should convert to exactly ONE small action. High intensity (8+) = body regulation first.
-Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference their actual numbers.`;
+Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference their actual numbers and company names.`;
 
   const callClaude = async (task, format) => {
     const res = await fetch("/api/coach", {
@@ -514,7 +511,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     setCoachError("");
     try {
       const daily = await callClaude(
-        "Give today's briefing: the 2-3 most leveraged things to do TODAY (specific and finishable today, sized to where the funnel actually leaks and any unfinished emotion-log actions), one sentence on why based on the numbers, one thing to watch (emotional or strategic risk visible in the data, or empty string), and one grounding reminder in evidence-file style.",
+        "Give today's briefing: the 2-3 most leveraged things to do TODAY (specific and finishable today; due follow-ups by company name usually come first, then volume/quality work sized to where the funnel leaks, then any unfinished emotion-log action), one sentence on why based on the numbers, one thing to watch (emotional or strategic risk visible in the data, or empty string), and one grounding reminder in evidence-file style.",
         `{"focus": ["item1", "item2"], "why": "...", "watch": "...", "reminder": "..."}`
       );
       setCoach((p) => ({ ...p, daily, dailyDate: today(), dailyDone: [] }));
@@ -529,8 +526,8 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     setCoachError("");
     try {
       const weekly = await callClaude(
-        "Run the Friday weekly review: a one-line verdict (on-track / off-track and why), funnel diagnosis (which stage leaks most vs benchmarks and the fix), emotional pattern analysis from the protocol log (recurring feelings, whether actions are being completed), 2-4 priorities for next week, and a floor check (does P95K hold given runway - it should unless runway is critically low).",
-        `{"verdict": "...", "funnel": "...", "emotions": "...", "next_week": ["..."], "floor": "..."}`
+        "Run the Friday weekly review: a one-line verdict (on-track / off-track and why), funnel diagnosis (which stage leaks most vs benchmarks and the fix), pipeline hygiene (stale applications, follow-up discipline, status mix), emotional pattern analysis from the protocol log, 2-4 priorities for next week, and a floor check (does P95K hold given runway - it should unless runway is critically low).",
+        `{"verdict": "...", "funnel": "...", "pipeline": "...", "emotions": "...", "next_week": ["..."], "floor": "..."}`
       );
       setCoach((p) => ({ ...p, weekly, weeklyDate: today() }));
     } catch (e) {
@@ -542,7 +539,6 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
   useEffect(() => {
     if (!loaded || autoRan.current) return;
     autoRan.current = true;
-    /* wait a beat so a remote coach cache can land first */
     setTimeout(() => {
       setCoach((p) => {
         if (p.dailyDate !== today()) runDaily();
@@ -552,43 +548,35 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
-  /* ---------- modal save ---------- */
+  /* ---------- mutations ---------- */
+  const setAppStatus = (id, status) =>
+    mutate(
+      (s) => ({ ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, status } : a)) }),
+      "Status updated — funnel recalculated"
+    );
+
   const saveModal = (data) => {
     const { kind, entry } = modal;
-    if (kind === "funnel") {
-      const manage = data.__manageApps;
-      delete data.__manageApps;
-      const id = entry?.id || uid();
+    if (kind === "week") {
       mutate(
         (s) => ({
           ...s,
           funnel: entry
             ? s.funnel.map((w) => (w.id === entry.id ? { ...w, ...data } : w))
-            : [{ id, applications: [], ...data }, ...s.funnel],
+            : [{ id: uid(), ...data }, ...s.funnel],
         }),
-        entry ? "Week updated" : "Week logged"
+        entry ? "Outreach updated" : "Outreach logged"
       );
-      setModal(manage ? { kind: "apps", weekId: id } : null);
-      return;
     } else if (kind === "application") {
       mutate(
         (s) => ({
           ...s,
-          funnel: s.funnel.map((w) =>
-            w.id === modal.weekId
-              ? {
-                  ...w,
-                  applications: entry
-                    ? (w.applications || []).map((a) => (a.id === entry.id ? { ...a, ...data } : a))
-                    : [{ id: uid(), ...data }, ...(w.applications || [])],
-                }
-              : w
-          ),
+          applications: entry
+            ? s.applications.map((a) => (a.id === entry.id ? { ...a, ...data } : a))
+            : [{ id: uid(), ...data }, ...s.applications],
         }),
-        entry ? "Application updated" : "Application added"
+        entry ? "Application updated" : "Application added — funnel updated"
       );
-      setModal({ kind: "apps", weekId: modal.weekId });
-      return;
     } else if (kind === "emotion") {
       mutate(
         (s) => ({
@@ -610,10 +598,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
         entry ? "Decision updated" : "Decision logged"
       );
     } else if (kind === "runway") {
-      mutate(
-        (s) => ({ ...s, runway: { fund: +data.fund || 0, expenses: +data.expenses || 0 } }),
-        "Runway recalculated"
-      );
+      mutate((s) => ({ ...s, runway: { fund: +data.fund || 0, expenses: +data.expenses || 0 } }), "Runway recalculated");
     }
     setModal(null);
   };
@@ -629,7 +614,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
       syncKeyRef.current = key;
       localStorage.setItem("fd-sync-key", key);
       if (remote) {
-        if (remote.data) setState({ ...DEFAULT_STATE, ...remote.data });
+        if (remote.data) setState(migrate(remote.data));
         if (remote.coach) setCoach({ ...DEFAULT_COACH, ...remote.coach });
         flash("Synced from that code");
       } else {
@@ -641,10 +626,34 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     }
   };
 
-  /* ============ SECTION RENDERERS (shared mobile/desktop) ============ */
+  /* ============ SECTION RENDERERS ============ */
 
   const renderBriefing = () => (
     <>
+      {/* deterministic action queue: due follow-ups, always accurate */}
+      {dueList.length > 0 && (
+        <div style={{ background: "rgba(248,113,113,0.07)", border: `1px solid ${C.red}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
+          <Label>⚑ Follow-ups due — clear these first</Label>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 6 }}>
+            {dueList.slice(0, 6).map((a) => (
+              <div
+                key={a.id}
+                onClick={() => setModal({ kind: "application", entry: a })}
+                style={{ display: "flex", justifyContent: "space-between", gap: 8, cursor: "pointer", fontSize: 13 }}
+              >
+                <span style={{ fontWeight: 700 }}>{a.company || "Unnamed"}</span>
+                <span style={{ fontFamily: mono, fontSize: 11, color: C.red, flexShrink: 0 }}>
+                  due {followUpOf(a)}
+                </span>
+              </div>
+            ))}
+            {dueList.length > 6 && (
+              <div style={{ fontSize: 11, color: C.muted }}>+ {dueList.length - 6} more in the Pipeline</div>
+            )}
+          </div>
+        </div>
+      )}
+
       <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <Label>Today's focus — {new Date().toDateString()}</Label>
@@ -668,28 +677,12 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
                   <div
                     key={i}
                     onClick={() =>
-                      setCoach((p) => ({
-                        ...p,
-                        dailyDone: done ? p.dailyDone.filter((d) => d !== i) : [...p.dailyDone, i],
-                      }))
+                      setCoach((p) => ({ ...p, dailyDone: done ? p.dailyDone.filter((d) => d !== i) : [...p.dailyDone, i] }))
                     }
-                    style={{
-                      display: "flex",
-                      gap: 10,
-                      alignItems: "flex-start",
-                      background: C.bg,
-                      border: `1px solid ${done ? C.green : C.panelEdge}`,
-                      borderRadius: 10,
-                      padding: "10px 12px",
-                      cursor: "pointer",
-                    }}
+                    style={{ display: "flex", gap: 10, alignItems: "flex-start", background: C.bg, border: `1px solid ${done ? C.green : C.panelEdge}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer" }}
                   >
-                    <div style={{ fontFamily: mono, fontSize: 14, color: done ? C.green : C.amber, lineHeight: 1.4 }}>
-                      {done ? "◉" : "○"}
-                    </div>
-                    <div style={{ fontSize: 14, lineHeight: 1.45, textDecoration: done ? "line-through" : "none", color: done ? C.muted : C.ink }}>
-                      {f}
-                    </div>
+                    <div style={{ fontFamily: mono, fontSize: 14, color: done ? C.green : C.amber, lineHeight: 1.4 }}>{done ? "◉" : "○"}</div>
+                    <div style={{ fontSize: 14, lineHeight: 1.45, textDecoration: done ? "line-through" : "none", color: done ? C.muted : C.ink }}>{f}</div>
                   </div>
                 );
               })}
@@ -705,9 +698,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
         )}
 
         {!coachLoading && !coach.daily && !coachError && (
-          <div style={{ color: C.muted, fontSize: 13, padding: "14px 0" }}>
-            Open the app each morning and today's focus appears here automatically.
-          </div>
+          <div style={{ color: C.muted, fontSize: 13, padding: "14px 0" }}>Open the app each morning and today's focus appears here automatically.</div>
         )}
       </div>
 
@@ -724,6 +715,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
             <div style={{ fontSize: 14, fontWeight: 700, color: C.amber, lineHeight: 1.45 }}>{coach.weekly.verdict}</div>
             {[
               ["FUNNEL", coach.weekly.funnel],
+              ["PIPELINE", coach.weekly.pipeline],
               ["EMOTIONS", coach.weekly.emotions],
               ["FLOOR CHECK", coach.weekly.floor],
             ].map(
@@ -757,6 +749,126 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     </>
   );
 
+  const renderPipeline = () => {
+    const filters = [
+      { key: "active", label: `Active (${apps.filter(isOpenApp).length})` },
+      { key: "due", label: `⚑ Due (${dueList.length})` },
+      { key: "closed", label: `Closed (${apps.filter((a) => !isOpenApp(a)).length})` },
+      { key: "all", label: `All (${apps.length})` },
+    ];
+    const shown = apps
+      .filter((a) => (pipeFilter === "due" ? isDue(a) : pipeFilter === "active" ? isOpenApp(a) : pipeFilter === "closed" ? !isOpenApp(a) : true))
+      .slice()
+      .sort((a, b) => (b.contacted || "").localeCompare(a.contacted || ""));
+
+    const th = { textAlign: "left", fontFamily: sans, fontSize: 10, letterSpacing: "0.14em", color: C.muted, textTransform: "uppercase", padding: "8px 10px", borderBottom: `1px solid ${C.panelEdge}`, whiteSpace: "nowrap" };
+    const td = { padding: "10px 10px", borderBottom: `1px solid ${C.panelEdge}`, fontSize: 13, verticalAlign: "middle" };
+
+    return (
+      <>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {filters.map((f) => (
+              <button
+                key={f.key}
+                onClick={() => setPipeFilter(f.key)}
+                style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${pipeFilter === f.key ? C.amber : C.panelEdge}`, background: pipeFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: pipeFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+          <Btn onClick={() => setModal({ kind: "application", entry: null })}>+ Track application</Btn>
+        </div>
+
+        {shown.length === 0 && (
+          <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
+            {apps.length === 0
+              ? "No applications tracked yet. Every company you add here updates the funnel numbers automatically."
+              : "Nothing matches this filter."}
+          </div>
+        )}
+
+        {shown.length > 0 && (
+          <div
+            onTouchStart={(e) => e.stopPropagation()}
+            onTouchMove={(e) => e.stopPropagation()}
+            onTouchEnd={(e) => e.stopPropagation()}
+            style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}
+          >
+            <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 720 }}>
+              <thead>
+                <tr>
+                  <th style={th}>Company</th>
+                  <th style={th}>Contact</th>
+                  <th style={th}>Status</th>
+                  <th style={th}>Contacted</th>
+                  <th style={th}>Follow-up</th>
+                  <th style={th}>Info</th>
+                  <th style={{ ...th, width: 34 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((a) => {
+                  const fu = followUpOf(a);
+                  const due = isDue(a);
+                  return (
+                    <tr
+                      key={a.id}
+                      onClick={() => setModal({ kind: "application", entry: a })}
+                      style={{ cursor: "pointer", background: due ? "rgba(248,113,113,0.06)" : "transparent" }}
+                    >
+                      <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent" }}>
+                        {a.company || "Unnamed"}
+                      </td>
+                      <td style={{ ...td, color: C.muted }}>
+                        {a.contact || "—"}
+                        {a.email ? <div style={{ fontFamily: mono, fontSize: 11 }}>{a.email}</div> : null}
+                      </td>
+                      <td style={td} onClick={(e) => e.stopPropagation()}>
+                        <select
+                          value={a.status || "applied"}
+                          onChange={(e) => setAppStatus(a.id, e.target.value)}
+                          style={{ fontSize: 16, fontFamily: mono, background: C.bg, color: statusColor(a.status), border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "4px 6px", outline: "none" }}
+                        >
+                          {APP_STATUSES.map((s) => (
+                            <option key={s} value={s}>
+                              {s}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td style={{ ...td, fontFamily: mono, fontSize: 12, color: C.muted, whiteSpace: "nowrap" }}>{a.contacted || "—"}</td>
+                      <td style={{ ...td, fontFamily: mono, fontSize: 12, whiteSpace: "nowrap", color: due ? C.red : C.muted }}>
+                        {fu || "—"}
+                        {due ? " ⚑" : ""}
+                      </td>
+                      <td style={{ ...td, fontSize: 11, color: C.muted, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {[a.notes, ...(a.custom || []).map((c) => `${c.k}: ${c.v}`)].filter(Boolean).join(" · ") || "—"}
+                      </td>
+                      <td style={td} onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => mutate((s) => ({ ...s, applications: s.applications.filter((x) => x.id !== a.id) }), "Application deleted")}
+                          title="Delete"
+                          style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
+                        >
+                          ×
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
+          Changing a status here updates the Funnel numbers and weekly rows instantly.
+        </div>
+      </>
+    );
+  };
+
   const renderFunnel = () => (
     <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 14 }}>
@@ -774,53 +886,59 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
           </div>
         ))}
       </div>
-
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-        <Label>{isDesktop ? "Weekly logs — click to edit, × to delete" : "Weekly logs — tap to edit, swipe left to delete"}</Label>
-        <Btn onClick={() => setModal({ kind: "funnel", entry: null })}>+ Log week</Btn>
+      <div style={{ fontSize: 11, color: C.muted, margin: "-6px 0 12px" }}>
+        Auto-computed from the Pipeline. Only outreach is logged manually.
       </div>
 
-      {state.funnel.length === 0 && (
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <Label>Weeks (Mon–Sat)</Label>
+        <Btn onClick={() => setModal({ kind: "week", entry: null })}>+ Log outreach</Btn>
+      </div>
+
+      {weekRows.length === 0 && (
         <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
-          No weeks logged yet. Log your first week — the benchmark is 8–10 apps and 20–25 outreaches.
+          Track applications in the Pipeline and log weekly outreach — the funnel builds itself.
         </div>
       )}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {state.funnel.map((w) => {
-          const onPace = (+w.apps || 0) >= 8 && (+w.outreach || 0) >= 20;
-          const tracked = (w.applications || []).length;
-          const due = dueApps(w).length;
+        {weekRows.map((r) => {
+          const a = r.d.apps + r.legacy.apps;
+          const onPace = a >= 8 && r.outreach >= 20;
+          const manualLog = r.id ? state.funnel.find((w) => w.id === r.id) : null;
           return (
             <SwipeRow
-              key={w.id}
-              showX={isDesktop}
-              onTap={() => setModal({ kind: "funnel", entry: w })}
-              onDelete={() => mutate((s) => ({ ...s, funnel: s.funnel.filter((x) => x.id !== w.id) }), "Week deleted")}
+              key={r.week}
+              showX={isDesktop && !!manualLog}
+              onTap={() =>
+                manualLog
+                  ? setModal({ kind: "week", entry: manualLog })
+                  : setModal({ kind: "week", entry: null, presetWeek: { week: r.week, weekStart: r.weekStart } })
+              }
+              onDelete={() =>
+                manualLog
+                  ? mutate((s) => ({ ...s, funnel: s.funnel.filter((x) => x.id !== manualLog.id) }), "Outreach log deleted")
+                  : flash("This row is derived from the Pipeline")
+              }
             >
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div style={{ fontWeight: 700, fontSize: 14 }}>{w.week || "Week"}</div>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{r.week}</div>
                 <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.1em", color: onPace ? C.green : C.amber }}>
                   {onPace ? "● ON PACE" : "○ BELOW PACE"}
                 </div>
               </div>
               <div style={{ fontFamily: mono, fontSize: 12, color: C.muted, marginTop: 6 }}>
-                A {w.apps || 0} · O {w.outreach || 0} · R {w.replies || 0} · S {w.screens || 0} · I {w.interviews || 0} · OF {w.offers || 0}
+                A {a} · O {r.outreach} · R {r.d.replies + r.legacy.replies} · S {r.d.screens + r.legacy.screens} · I{" "}
+                {r.d.interviews + r.legacy.interviews} · OF {r.d.offers + r.legacy.offers}
               </div>
-              {(tracked > 0 || due > 0) && (
-                <div style={{ display: "flex", gap: 10, marginTop: 6, alignItems: "center" }}>
-                  {tracked > 0 && (
-                    <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.blue }}>
-                      ▸ {tracked} APPLICATION{tracked === 1 ? "" : "S"} TRACKED
-                    </div>
-                  )}
-                  {due > 0 && (
-                    <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.red }}>
-                      ⚑ {due} FOLLOW-UP{due === 1 ? "" : "S"} DUE
-                    </div>
-                  )}
-                </div>
-              )}
+              <div style={{ display: "flex", gap: 10, marginTop: 6, alignItems: "center" }}>
+                <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.blue }}>▸ AUTO FROM PIPELINE</div>
+                {r.due > 0 && (
+                  <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.red }}>
+                    ⚑ {r.due} FOLLOW-UP{r.due === 1 ? "" : "S"} DUE
+                  </div>
+                )}
+              </div>
             </SwipeRow>
           );
         })}
@@ -922,7 +1040,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     </>
   );
 
-  const SECTIONS = { BRIEFING: renderBriefing, FUNNEL: renderFunnel, EMOTIONS: renderEmotions, RUNWAY: renderRunway };
+  const SECTIONS = { BRIEFING: renderBriefing, PIPELINE: renderPipeline, FUNNEL: renderFunnel, EMOTIONS: renderEmotions, RUNWAY: renderRunway };
 
   if (!loaded)
     return (
@@ -957,6 +1075,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
         button { -webkit-tap-highlight-color: transparent; }
         @media (hover: hover) {
           button:hover { filter: brightness(1.12); }
+          tbody tr:hover { background: rgba(125,176,247,0.05) !important; }
         }
       `}</style>
 
@@ -997,6 +1116,9 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, alignItems: "start", marginTop: 18, flex: 1 }}>
             <Panel title="◈ DAILY BRIEFING">{renderBriefing()}</Panel>
             <Panel title="◈ FUNNEL TRACKER">{renderFunnel()}</Panel>
+            <Panel title="◈ PIPELINE — ALL APPLICATIONS" style={{ gridColumn: "1 / -1" }}>
+              {renderPipeline()}
+            </Panel>
             <Panel title="◈ EMOTION PROTOCOL">{renderEmotions()}</Panel>
             <Panel title="◈ RUNWAY GAUGE">{renderRunway()}</Panel>
           </div>
@@ -1006,9 +1128,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
 
         {/* footer */}
         <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center", marginTop: 16 }}>
-          {!isDesktop && (
-            <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.2em", color: C.muted }}>← SWIPE TO SWITCH MODE →</div>
-          )}
+          {!isDesktop && <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.2em", color: C.muted }}>← SWIPE TO SWITCH MODE →</div>}
           <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.15em", color: syncStatus === "synced" ? C.green : syncStatus === "saving" ? C.amber : C.muted }}>
             {syncStatus === "synced" ? "● SYNCED" : syncStatus === "saving" ? "◌ SAVING" : "○ LOCAL ONLY"}
           </div>
@@ -1022,64 +1142,31 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
         </div>
       )}
 
-      {modal && modal.kind === "apps" && (
-        <AppsModal
-          week={state.funnel.find((w) => w.id === modal.weekId)}
-          onClose={() => setModal(null)}
-          onAdd={() => setModal({ kind: "application", weekId: modal.weekId, entry: null })}
-          onEdit={(a) => setModal({ kind: "application", weekId: modal.weekId, entry: a })}
-          onDelete={(appId) =>
-            mutate(
-              (s) => ({
-                ...s,
-                funnel: s.funnel.map((w) =>
-                  w.id === modal.weekId
-                    ? { ...w, applications: (w.applications || []).filter((a) => a.id !== appId) }
-                    : w
-                ),
-              }),
-              "Application deleted"
-            )
-          }
-        />
-      )}
-      {modal && modal.kind !== "apps" && (
+      {modal && (
         <Modal
-          key={modal.kind + "-" + (modal.entry?.id || "new") + "-" + (modal.weekId || "")}
+          key={modal.kind + "-" + (modal.entry?.id || "new")}
           modal={modal}
           onClose={() => setModal(null)}
           onSave={saveModal}
         />
       )}
-      {syncModal && (
-        <SyncModal
-          currentKey={syncKeyRef.current}
-          onClose={() => setSyncModal(false)}
-          onSwitch={switchSyncKey}
-          flash={flash}
-        />
-      )}
+      {syncModal && <SyncModal currentKey={syncKeyRef.current} onClose={() => setSyncModal(false)} onSwitch={switchSyncKey} flash={flash} />}
     </div>
   );
 }
 
 /* ---------- edit modal (centered) ---------- */
 function Modal({ modal, onClose, onSave }) {
-  const { kind, entry } = modal;
+  const { kind, entry, presetWeek } = modal;
   const opts = weekOptions();
-  const [customWeek, setCustomWeek] = useState(
-    () => kind === "funnel" && entry?.week && !opts.includes(entry.week)
-  );
+  const initialWeek = entry?.week || presetWeek?.week || opts[1]?.label || opts[0].label;
+  const [customWeek, setCustomWeek] = useState(() => kind === "week" && initialWeek && !opts.some((o) => o.label === initialWeek));
   const [f, setF] = useState(() => {
-    if (kind === "funnel")
+    if (kind === "week")
       return {
-        week: entry?.week || weekLabel(mondayOf(new Date())),
-        apps: entry?.apps ?? "",
+        week: initialWeek,
+        weekStart: entry?.weekStart || presetWeek?.weekStart || opts.find((o) => o.label === initialWeek)?.start || null,
         outreach: entry?.outreach ?? "",
-        replies: entry?.replies ?? "",
-        screens: entry?.screens ?? "",
-        interviews: entry?.interviews ?? "",
-        offers: entry?.offers ?? "",
       };
     if (kind === "application")
       return {
@@ -1099,22 +1186,10 @@ function Modal({ modal, onClose, onSave }) {
   });
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
 
-  const selectStyle = {
-    width: "100%",
-    boxSizing: "border-box",
-    fontSize: 16,
-    fontFamily: sans,
-    color: C.ink,
-    background: C.bg,
-    border: `1px solid ${C.panelEdge}`,
-    borderRadius: 10,
-    padding: "10px 12px",
-    outline: "none",
-    appearance: "none",
-  };
+  const selectStyle = { ...inputStyle, appearance: "none" };
 
   const titles = {
-    funnel: entry ? "Edit week" : "Log a week",
+    week: entry ? "Edit weekly outreach" : "Log weekly outreach",
     application: entry ? "Edit application" : "Track an application",
     emotion: entry ? "Edit protocol entry" : "Run the protocol",
     decision: entry ? "Edit decision" : "Written decision",
@@ -1123,9 +1198,12 @@ function Modal({ modal, onClose, onSave }) {
 
   const followUpDate = kind === "application" ? addDays(f.contacted, f.followUpDays) : "";
 
-  const saveApplication = () => {
-    const clean = { ...f, custom: (f.custom || []).filter((c) => c.k || c.v) };
-    onSave(clean);
+  const save = () => {
+    if (kind === "application") {
+      onSave({ ...f, custom: (f.custom || []).filter((c) => c.k || c.v) });
+    } else {
+      onSave(f);
+    }
   };
 
   return (
@@ -1141,22 +1219,25 @@ function Modal({ modal, onClose, onSave }) {
       >
         <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 14 }}>{titles[kind]}</div>
 
-        {kind === "funnel" && (
+        {kind === "week" && (
           <>
             <div style={{ marginBottom: 12 }}>
               <Label>Week (Monday – Saturday)</Label>
               {!customWeek ? (
                 <select
-                  value={opts.includes(f.week) ? f.week : "__custom__"}
+                  value={opts.some((o) => o.label === f.week) ? f.week : "__custom__"}
                   onChange={(e) => {
                     if (e.target.value === "__custom__") setCustomWeek(true);
-                    else set("week")(e.target.value);
+                    else {
+                      const o = opts.find((x) => x.label === e.target.value);
+                      setF((p) => ({ ...p, week: o.label, weekStart: o.start }));
+                    }
                   }}
                   style={selectStyle}
                 >
                   {opts.map((o) => (
-                    <option key={o} value={o}>
-                      {o}
+                    <option key={o.label} value={o.label}>
+                      {o.label}
                     </option>
                   ))}
                   <option value="__custom__">Custom…</option>
@@ -1166,8 +1247,8 @@ function Modal({ modal, onClose, onSave }) {
                   <input
                     value={f.week}
                     placeholder="e.g. Jul 6 – Jul 11"
-                    onChange={(e) => set("week")(e.target.value)}
-                    style={{ ...selectStyle, flex: 1 }}
+                    onChange={(e) => setF((p) => ({ ...p, week: e.target.value, weekStart: null }))}
+                    style={{ ...inputStyle, flex: 1 }}
                   />
                   <Btn ghost onClick={() => setCustomWeek(false)} style={{ padding: "10px 12px" }}>
                     List
@@ -1175,33 +1256,10 @@ function Modal({ modal, onClose, onSave }) {
                 </div>
               )}
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <Field label="Applications" type="number" value={f.apps} onChange={set("apps")} />
-              <Field label="Outreaches" type="number" value={f.outreach} onChange={set("outreach")} />
-              <Field label="Replies" type="number" value={f.replies} onChange={set("replies")} />
-              <Field label="Screens" type="number" value={f.screens} onChange={set("screens")} />
-              <Field label="Interviews" type="number" value={f.interviews} onChange={set("interviews")} />
-              <Field label="Offers" type="number" value={f.offers} onChange={set("offers")} />
+            <Field label="Warm outreaches this week (target 20–25)" type="number" value={f.outreach} onChange={set("outreach")} />
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+              Applications, replies, screens, interviews, and offers are counted automatically from the Pipeline — track each company there.
             </div>
-            <button
-              onClick={() => onSave({ ...f, __manageApps: true })}
-              style={{
-                width: "100%",
-                boxSizing: "border-box",
-                background: C.bg,
-                border: `1px dashed ${C.blue}`,
-                color: C.blue,
-                borderRadius: 10,
-                padding: "11px 12px",
-                fontSize: 13,
-                fontWeight: 700,
-                letterSpacing: "0.04em",
-                cursor: "pointer",
-                marginBottom: 12,
-              }}
-            >
-              ▸ Applications ({(entry?.applications || []).length}) — track companies & follow-ups
-            </button>
           </>
         )}
 
@@ -1215,20 +1273,13 @@ function Modal({ modal, onClose, onSave }) {
               <Field label="Follow up in (days)" type="number" value={f.followUpDays} onChange={set("followUpDays")} />
             </div>
             {followUpDate && (
-              <div
-                style={{
-                  fontFamily: mono,
-                  fontSize: 12,
-                  color: followUpDate <= today() ? C.red : C.green,
-                  margin: "-4px 0 12px",
-                }}
-              >
+              <div style={{ fontFamily: mono, fontSize: 12, color: followUpDate <= today() ? C.red : C.green, margin: "-4px 0 12px" }}>
                 ⚑ Follow-up date: {followUpDate}
                 {followUpDate <= today() ? " — DUE" : ""}
               </div>
             )}
             <div style={{ marginBottom: 12 }}>
-              <Label>Status</Label>
+              <Label>Status (drives the funnel numbers)</Label>
               <select value={f.status} onChange={(e) => set("status")(e.target.value)} style={selectStyle}>
                 {APP_STATUSES.map((s) => (
                   <option key={s} value={s}>
@@ -1245,18 +1296,14 @@ function Modal({ modal, onClose, onSave }) {
                 <input
                   value={c.k}
                   placeholder="Label (e.g. Portfolio sent)"
-                  onChange={(e) =>
-                    setF((p) => ({ ...p, custom: p.custom.map((x, j) => (j === i ? { ...x, k: e.target.value } : x)) }))
-                  }
-                  style={{ ...selectStyle, flex: 1, fontSize: 16 }}
+                  onChange={(e) => setF((p) => ({ ...p, custom: p.custom.map((x, j) => (j === i ? { ...x, k: e.target.value } : x)) }))}
+                  style={{ ...inputStyle, flex: 1 }}
                 />
                 <input
                   value={c.v}
                   placeholder="Value"
-                  onChange={(e) =>
-                    setF((p) => ({ ...p, custom: p.custom.map((x, j) => (j === i ? { ...x, v: e.target.value } : x)) }))
-                  }
-                  style={{ ...selectStyle, flex: 1, fontSize: 16 }}
+                  onChange={(e) => setF((p) => ({ ...p, custom: p.custom.map((x, j) => (j === i ? { ...x, v: e.target.value } : x)) }))}
+                  style={{ ...inputStyle, flex: 1 }}
                 />
                 <button
                   onClick={() => setF((p) => ({ ...p, custom: p.custom.filter((_, j) => j !== i) }))}
@@ -1297,84 +1344,7 @@ function Modal({ modal, onClose, onSave }) {
 
         <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
           <Btn ghost onClick={onClose} style={{ flex: 1 }}>Cancel</Btn>
-          <Btn onClick={() => (kind === "application" ? saveApplication() : onSave(f))} style={{ flex: 2 }}>Save</Btn>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ---------- applications list modal (centered) ---------- */
-function AppsModal({ week, onClose, onAdd, onEdit, onDelete }) {
-  if (!week) return null;
-  const apps = week.applications || [];
-  return (
-    <div
-      onClick={onClose}
-      onTouchStart={(e) => e.stopPropagation()}
-      onTouchEnd={(e) => e.stopPropagation()}
-      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{ width: "100%", maxWidth: 460, maxHeight: "80vh", overflowY: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-          <div style={{ fontSize: 16, fontWeight: 800 }}>Applications — {week.week || "Week"}</div>
-          <Btn onClick={onAdd} style={{ padding: "8px 12px", fontSize: 12 }}>+ Add</Btn>
-        </div>
-
-        {apps.length === 0 && (
-          <div style={{ color: C.muted, fontSize: 13, padding: "18px 0", textAlign: "center" }}>
-            No applications tracked yet for this week. Add each company you applied to and Flight Deck will watch the follow-up dates.
-          </div>
-        )}
-
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {apps.map((a) => {
-            const fu = a.contacted ? addDays(a.contacted, a.followUpDays ?? 7) : "";
-            const due = fu && isOpenApp(a) && fu <= today();
-            return (
-              <div
-                key={a.id}
-                onClick={() => onEdit(a)}
-                style={{ background: C.bg, border: `1px solid ${due ? C.red : C.panelEdge}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer", position: "relative", paddingRight: 38 }}
-              >
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onDelete(a.id);
-                  }}
-                  title="Delete application"
-                  style={{ position: "absolute", top: 8, right: 8, width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
-                >
-                  ×
-                </button>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-                  <div style={{ fontWeight: 700, fontSize: 14 }}>{a.company || "Unnamed company"}</div>
-                  <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: statusColor(a.status), textTransform: "uppercase", flexShrink: 0 }}>
-                    {a.status || "applied"}
-                  </div>
-                </div>
-                <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>
-                  {[a.contact, a.email].filter(Boolean).join(" · ") || "no contact yet"}
-                </div>
-                <div style={{ fontFamily: mono, fontSize: 11, marginTop: 6, color: due ? C.red : C.muted }}>
-                  {a.contacted ? `contacted ${a.contacted}` : "no contact date"}
-                  {fu ? ` → follow up ${fu}${due ? " ⚑ DUE" : ""}` : ""}
-                </div>
-                {(a.custom || []).length > 0 && (
-                  <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
-                    {a.custom.map((c) => `${c.k}: ${c.v}`).join(" · ")}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        <div style={{ marginTop: 14 }}>
-          <Btn ghost onClick={onClose} style={{ width: "100%" }}>Close</Btn>
+          <Btn onClick={save} style={{ flex: 2 }}>Save</Btn>
         </div>
       </div>
     </div>
@@ -1416,7 +1386,10 @@ function SyncModal({ currentKey, onClose, onSwitch, flash }) {
           {currentKey}
         </div>
 
-        <Field label="Use a code from another device" value={input} onChange={setInput} placeholder="fd_…" />
+        <div style={{ marginBottom: 12 }}>
+          <Label>Use a code from another device</Label>
+          <input value={input} placeholder="fd_…" onChange={(e) => setInput(e.target.value)} style={inputStyle} />
+        </div>
 
         <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
           <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
