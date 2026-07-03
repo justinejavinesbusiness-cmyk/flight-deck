@@ -153,6 +153,58 @@ function migrate(saved) {
   return s;
 }
 
+/* ---------- merge (two-way sync without data loss) ---------- */
+/* union entry lists by id — remote order first, local-only appended; remote wins id collisions */
+function unionById(localArr = [], remoteArr = []) {
+  const remoteIds = new Set(remoteArr.map((x) => x && x.id));
+  return [...remoteArr, ...localArr.filter((x) => x && !remoteIds.has(x.id))];
+}
+function mergeStates(localS, remoteS) {
+  if (!remoteS) return localS;
+  if (!localS) return remoteS;
+  return {
+    ...remoteS,
+    applications: unionById(localS.applications, remoteS.applications),
+    funnel: unionById(localS.funnel, remoteS.funnel),
+    emotions: unionById(localS.emotions, remoteS.emotions),
+    decisions: unionById(localS.decisions, remoteS.decisions),
+    accomplishments: unionById(localS.accomplishments, remoteS.accomplishments),
+    runway: remoteS.runway || localS.runway,
+    settings: { ...localS.settings, ...remoteS.settings },
+    lastCheckinMonth:
+      (remoteS.lastCheckinMonth || "") > (localS.lastCheckinMonth || "")
+        ? remoteS.lastCheckinMonth
+        : localS.lastCheckinMonth,
+  };
+}
+function mergeCoach(localC, remoteC) {
+  if (!remoteC) return localC;
+  if (!localC) return remoteC;
+  const out = { ...localC };
+  const ld = localC.dailyDate || "";
+  const rd = remoteC.dailyDate || "";
+  if (rd > ld) {
+    out.daily = remoteC.daily;
+    out.dailyDate = remoteC.dailyDate;
+    out.dailyDone = remoteC.dailyDone || [];
+  } else if (rd === ld && rd) {
+    /* same day on both: one shared list (remote copy), checkmarks united */
+    out.daily = remoteC.daily || localC.daily;
+    const lLen = normFocus(localC.daily?.focus).length;
+    const rLen = normFocus(remoteC.daily?.focus).length;
+    out.dailyDone =
+      lLen === rLen
+        ? Array.from(new Set([...(localC.dailyDone || []), ...(remoteC.dailyDone || [])]))
+        : remoteC.dailyDone || [];
+    out.dailyDate = rd;
+  }
+  if ((remoteC.weeklyDate || "") > (localC.weeklyDate || "")) {
+    out.weekly = remoteC.weekly;
+    out.weeklyDate = remoteC.weeklyDate;
+  }
+  return out;
+}
+
 /* ---------- supabase rpc ---------- */
 async function rpc(fn, args, timeoutMs = 6000) {
   const ctrl = new AbortController();
@@ -322,6 +374,8 @@ export default function FlightDeck() {
   const swipe = useRef(null);
   const syncKeyRef = useRef(null);
   const saveTimer = useRef(null);
+  const dirtyRef = useRef(false);
+  const pullingRef = useRef(false);
   const runDailyRef = useRef(null);
 
   /* responsive listener */
@@ -365,8 +419,8 @@ export default function FlightDeck() {
         const remote = await rpc("fd_get", { k: key });
         remoteOk = true;
         if (remote) {
-          if (remote.data) mergedState = migrate(remote.data);
-          if (remote.coach) mergedCoach = { ...DEFAULT_COACH, ...remote.coach };
+          if (remote.data) mergedState = mergeStates(localState, migrate(remote.data));
+          if (remote.coach) mergedCoach = mergeCoach(localCoach, { ...DEFAULT_COACH, ...remote.coach });
         }
         setSyncStatus("synced");
       } catch (e) {
@@ -391,6 +445,7 @@ export default function FlightDeck() {
   /* save: local immediately, remote debounced */
   useEffect(() => {
     if (!loaded) return;
+    dirtyRef.current = true;
     try {
       localStorage.setItem("fd-state", JSON.stringify(state));
       localStorage.setItem("fd-coach", JSON.stringify(coach));
@@ -400,6 +455,7 @@ export default function FlightDeck() {
       try {
         setSyncStatus("saving");
         await rpc("fd_set", { k: syncKeyRef.current, d: state, c: coach });
+        dirtyRef.current = false;
         setSyncStatus("synced");
       } catch (e) {
         setSyncStatus("offline");
@@ -407,6 +463,48 @@ export default function FlightDeck() {
     }, 1200);
     return () => saveTimer.current && clearTimeout(saveTimer.current);
   }, [state, coach, loaded]);
+
+  /* LIVE RE-SYNC: when the tab regains focus (and every 60s), pull remote
+     changes made on other devices and merge them in. Skipped while local
+     changes are still unsaved, so nothing gets stomped mid-edit. */
+  const pullRemote = useCallback(async () => {
+    if (!loaded || dirtyRef.current || pullingRef.current) return;
+    if (typeof document !== "undefined" && document.hidden) return;
+    pullingRef.current = true;
+    try {
+      const remote = await rpc("fd_get", { k: syncKeyRef.current });
+      if (remote && !dirtyRef.current) {
+        setState((prev) => {
+          const merged = remote.data ? mergeStates(prev, migrate(remote.data)) : prev;
+          return JSON.stringify(merged) === JSON.stringify(prev) ? prev : merged;
+        });
+        setCoach((prev) => {
+          const merged = remote.coach ? mergeCoach(prev, { ...DEFAULT_COACH, ...remote.coach }) : prev;
+          return JSON.stringify(merged) === JSON.stringify(prev) ? prev : merged;
+        });
+        setSyncStatus("synced");
+      }
+    } catch (e) {
+      /* stay quiet — next cycle will retry */
+    }
+    pullingRef.current = false;
+  }, [loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const onFocus = () => pullRemote();
+    const onVis = () => {
+      if (!document.hidden) pullRemote();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVis);
+    const t = setInterval(pullRemote, 60000);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVis);
+      clearInterval(t);
+    };
+  }, [loaded, pullRemote]);
 
   const flash = (msg) => {
     setToast(msg);
@@ -711,17 +809,26 @@ If their words suggest crisis, self-harm, or hopelessness beyond normal job-sear
       const remote = await rpc("fd_get", { k: key });
       syncKeyRef.current = key;
       localStorage.setItem("fd-sync-key", key);
+      /* MERGE this device's data with the other device's — nothing is lost */
+      let nextState = state;
+      let nextCoach = coach;
       if (remote) {
-        if (remote.data) setState(migrate(remote.data));
+        if (remote.data) nextState = mergeStates(state, migrate(remote.data));
         if (remote.coach) {
-          const { coach: rolled, archived } = rolloverCoach({ ...DEFAULT_COACH, ...remote.coach });
-          setCoach(rolled);
-          if (archived.length) setState((s) => ({ ...s, accomplishments: [...archived, ...(s.accomplishments || [])] }));
+          const { coach: rolled, archived } = rolloverCoach(mergeCoach(coach, { ...DEFAULT_COACH, ...remote.coach }));
+          nextCoach = rolled;
+          if (archived.length) nextState = { ...nextState, accomplishments: [...archived, ...(nextState.accomplishments || [])] };
         }
-        flash("Synced from that code");
-      } else {
-        flash("New code — current data will save to it");
       }
+      setState(nextState);
+      setCoach(nextCoach);
+      /* push the merged result right away so BOTH devices converge */
+      try {
+        await rpc("fd_set", { k: key, d: nextState, c: nextCoach });
+        dirtyRef.current = false;
+        setSyncStatus("synced");
+      } catch (e) {}
+      flash(remote ? "Devices merged & synced" : "New code — current data will save to it");
       setSyncModal(false);
     } catch (e) {
       flash("Couldn't reach sync server");
@@ -1635,7 +1742,7 @@ function SyncModal({ currentKey, onClose, onSwitch, flash }) {
       >
         <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 6 }}>Sync across devices</div>
         <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 14 }}>
-          Your data is stored under this private sync code. Enter the same code on another device (phone ↔ desktop) to see the same data. Treat it like a password.
+          Your data lives under this private sync code. <span style={{ color: C.amber }}>If two devices show different data or different daily advice, they're on different codes</span> — copy the code from one device and enter it on the other. Everything from both devices merges; nothing is lost. Treat the code like a password.
         </div>
 
         <Label>This device's sync code</Label>
