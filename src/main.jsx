@@ -2,13 +2,14 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 
 /* ============================================================
-   FLIGHT DECK v2 — Job Search Operating System
-   ARCHITECTURE: the Pipeline (CRM) is the source of truth.
-   - Applications are individual records with status + follow-up
-   - Weekly funnel numbers DERIVE from the pipeline automatically
-   - Outreach is the only manually logged weekly number
-   - Due follow-ups surface as action items in the Briefing
-   - The Claude coach reads the whole pipeline
+   FLIGHT DECK v3 — Job Search Operating System
+   - DASHBOARD first: focus, check-ins, due follow-ups, support
+   - Focus carryover: no new daily focus until yesterday's is done
+   - Completed focus archives to HISTORY (accomplishments, editable)
+   - Monthly runway check-in (day editable)
+   - Emotional Support on demand (de-escalate -> reconnect -> 1 action)
+   - Sync-first boot: daily check-ins are shared across devices and
+     never regenerated per device
    ============================================================ */
 
 const SUPA_URL = "https://ywzvhloswottkasvhzfv.supabase.co";
@@ -26,21 +27,23 @@ const C = {
   blue: "#7DB0F7",
 };
 
-const MODES = ["BRIEFING", "PIPELINE", "FUNNEL", "EMOTIONS", "RUNWAY"];
+const MODES = ["DASHBOARD", "PIPELINE", "FUNNEL", "EMOTIONS", "RUNWAY", "HISTORY"];
 const TITLES = {
-  BRIEFING: "Daily Briefing",
+  DASHBOARD: "Dashboard",
   PIPELINE: "Pipeline (CRM)",
   FUNNEL: "Funnel Tracker",
   EMOTIONS: "Emotion Protocol",
   RUNWAY: "Runway Gauge",
+  HISTORY: "Accomplishments",
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
 const today = () => new Date().toISOString().slice(0, 10);
+const thisMonth = () => today().slice(0, 7);
 
 /* ---- week + follow-up helpers ---- */
 const mondayOf = (d) => {
   const x = new Date(d);
-  const day = (x.getDay() + 6) % 7; /* Mon=0 … Sun=6 */
+  const day = (x.getDay() + 6) % 7;
   x.setDate(x.getDate() - day);
   x.setHours(0, 0, 0, 0);
   return x;
@@ -52,7 +55,7 @@ const iso = (d) => {
 const fmtShort = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 const weekLabel = (mon) => {
   const sat = new Date(mon);
-  sat.setDate(sat.getDate() + 5); /* Monday → Saturday */
+  sat.setDate(sat.getDate() + 5);
   return `${fmtShort(mon)} – ${fmtShort(sat)}`;
 };
 const weekOptions = () => {
@@ -92,22 +95,54 @@ const isDue = (a) => {
   return fu && isOpenApp(a) && fu <= today();
 };
 
+/* ---- daily focus model ---- */
+const normFocus = (arr) =>
+  (arr || []).map((f) => (typeof f === "string" ? { text: f, key: false } : { text: f?.text || "", key: !!f?.key }));
+
+/* Day rollover: archive done items, carry over unfinished ones.
+   Returns { coach, archived, shouldGenerate }. Pure function. */
+function rolloverCoach(c, todayStr) {
+  const t = todayStr || today();
+  if (!c || !c.daily || !c.dailyDate) return { coach: { ...(c || {}), daily: null, dailyDate: null, dailyDone: [] }, archived: [], shouldGenerate: true };
+  if (c.dailyDate === t) return { coach: c, archived: [], shouldGenerate: false };
+  const items = normFocus(c.daily.focus);
+  const doneIdx = new Set(c.dailyDone || []);
+  const archived = items
+    .filter((_, i) => doneIdx.has(i))
+    .map((it) => ({ id: uid(), date: c.dailyDate, text: it.text, category: it.key ? "Key focus" : "Daily focus" }));
+  const remaining = items.filter((_, i) => !doneIdx.has(i));
+  if (remaining.length === 0) {
+    return { coach: { ...c, daily: null, dailyDate: null, dailyDone: [] }, archived, shouldGenerate: true };
+  }
+  return {
+    coach: { ...c, daily: { ...c.daily, focus: remaining, carried: true }, dailyDate: t, dailyDone: [] },
+    archived,
+    shouldGenerate: false,
+  };
+}
+
 const DEFAULT_STATE = {
   applications: [],
-  funnel: [], /* weekly logs: {id, week, weekStart, outreach} + legacy manual counts */
+  funnel: [],
   emotions: [],
   decisions: [],
+  accomplishments: [],
   runway: { fund: 1200000, expenses: 50000 },
+  settings: { checkinDay: 1 },
+  lastCheckinMonth: null,
 };
 const DEFAULT_COACH = { dailyDate: null, daily: null, dailyDone: [], weeklyDate: null, weekly: null };
 
 const mono = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 const sans = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 
-/* migrate v1 data (nested week.applications, manual counts) into v2 shape */
+/* migrate older saved shapes into v3 */
 function migrate(saved) {
   const s = { ...DEFAULT_STATE, ...saved };
   if (!Array.isArray(s.applications)) s.applications = [];
+  if (!Array.isArray(s.accomplishments)) s.accomplishments = [];
+  if (!s.settings || typeof s.settings !== "object") s.settings = { checkinDay: 1 };
+  if (!s.settings.checkinDay) s.settings.checkinDay = 1;
   s.funnel = (s.funnel || []).map((w) => {
     if (Array.isArray(w.applications) && w.applications.length) {
       s.applications = [...w.applications.map((a) => ({ ...a })), ...s.applications];
@@ -119,16 +154,22 @@ function migrate(saved) {
 }
 
 /* ---------- supabase rpc ---------- */
-async function rpc(fn, args) {
-  const r = await fetch(`${SUPA_URL}/rest/v1/rpc/${fn}`, {
-    method: "POST",
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "content-type": "application/json" },
-    body: JSON.stringify(args),
-  });
-  if (!r.ok) throw new Error(`supabase ${r.status}`);
-  return r.json();
+async function rpc(fn, args, timeoutMs = 6000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(`${SUPA_URL}/rest/v1/rpc/${fn}`, {
+      method: "POST",
+      headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify(args),
+      signal: ctrl.signal,
+    });
+    if (!r.ok) throw new Error(`supabase ${r.status}`);
+    return await r.json();
+  } finally {
+    clearTimeout(t);
+  }
 }
-
 /* ---------- swipe-to-delete / tap-to-edit row ---------- */
 function SwipeRow({ onDelete, onTap, showX, children }) {
   const [dx, setDx] = useState(0);
@@ -265,11 +306,14 @@ export default function FlightDeck() {
   const [loaded, setLoaded] = useState(false);
   const [modal, setModal] = useState(null);
   const [syncModal, setSyncModal] = useState(false);
+  const [supportOpen, setSupportOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [syncStatus, setSyncStatus] = useState("local");
   const [pipeFilter, setPipeFilter] = useState("active");
+  const [historyGroup, setHistoryGroup] = useState("date");
   const [coachLoading, setCoachLoading] = useState(null);
   const [coachError, setCoachError] = useState("");
+  const [canAutoGen, setCanAutoGen] = useState(false);
   const [isDesktop, setIsDesktop] = useState(
     () => typeof window !== "undefined" && window.matchMedia("(min-width: 1024px)").matches
   );
@@ -278,7 +322,7 @@ export default function FlightDeck() {
   const swipe = useRef(null);
   const syncKeyRef = useRef(null);
   const saveTimer = useRef(null);
-  const autoRan = useRef(false);
+  const runDailyRef = useRef(null);
 
   /* responsive listener */
   useEffect(() => {
@@ -288,36 +332,58 @@ export default function FlightDeck() {
     return () => (mq.removeEventListener ? mq.removeEventListener("change", fn) : mq.removeListener(fn));
   }, []);
 
-  /* load: local cache first, then remote (remote wins on first load) */
+  /* ---- SYNC-FIRST BOOT ----
+     1) read local cache  2) fetch remote (remote wins)
+     3) run day rollover (archive done / carry unfinished)
+     4) only THEN, and only if remote was reachable, allow auto-generation */
   useEffect(() => {
-    let key = null;
-    try {
-      key = localStorage.getItem("fd-sync-key");
-      if (!key) {
-        key =
-          "fd_" +
-          (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
-        localStorage.setItem("fd-sync-key", key);
-      }
-      const ls = localStorage.getItem("fd-state");
-      if (ls) setState(migrate(JSON.parse(ls)));
-      const lc = localStorage.getItem("fd-coach");
-      if (lc) setCoach({ ...DEFAULT_COACH, ...JSON.parse(lc) });
-    } catch (e) {
-      key = key || "fd_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-    }
-    syncKeyRef.current = key;
-    setLoaded(true);
     (async () => {
+      let key = null;
+      let localState = DEFAULT_STATE;
+      let localCoach = DEFAULT_COACH;
+      try {
+        key = localStorage.getItem("fd-sync-key");
+        if (!key) {
+          key =
+            "fd_" +
+            (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
+          localStorage.setItem("fd-sync-key", key);
+        }
+        const ls = localStorage.getItem("fd-state");
+        if (ls) localState = migrate(JSON.parse(ls));
+        const lc = localStorage.getItem("fd-coach");
+        if (lc) localCoach = { ...DEFAULT_COACH, ...JSON.parse(lc) };
+      } catch (e) {
+        key = key || "fd_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+      }
+      syncKeyRef.current = key;
+
+      let mergedState = localState;
+      let mergedCoach = localCoach;
+      let remoteOk = false;
       try {
         const remote = await rpc("fd_get", { k: key });
+        remoteOk = true;
         if (remote) {
-          if (remote.data) setState(migrate(remote.data));
-          if (remote.coach) setCoach({ ...DEFAULT_COACH, ...remote.coach });
+          if (remote.data) mergedState = migrate(remote.data);
+          if (remote.coach) mergedCoach = { ...DEFAULT_COACH, ...remote.coach };
         }
         setSyncStatus("synced");
       } catch (e) {
         setSyncStatus("offline");
+      }
+
+      const { coach: rolled, archived, shouldGenerate } = rolloverCoach(mergedCoach);
+      if (archived.length) {
+        mergedState = { ...mergedState, accomplishments: [...archived, ...(mergedState.accomplishments || [])] };
+      }
+      setState(mergedState);
+      setCoach(rolled);
+      setLoaded(true);
+      setCanAutoGen(remoteOk);
+      if (shouldGenerate && remoteOk) {
+        /* one generation for the whole account today — synced to every device */
+        setTimeout(() => runDailyRef.current && runDailyRef.current(), 400);
       }
     })();
   }, []);
@@ -382,11 +448,10 @@ export default function FlightDeck() {
     }
   };
 
-  /* ============ DERIVED: everything communicates ============ */
+  /* ============ DERIVED ============ */
   const apps = state.applications;
   const dueList = useMemo(() => apps.filter(isDue), [apps]);
 
-  /* weekly rows: derived from pipeline + manual outreach logs (+ legacy counts) */
   const weekRows = useMemo(() => {
     const map = new Map();
     const ensure = (label, start) => {
@@ -455,6 +520,14 @@ export default function FlightDeck() {
       ? { name: "TIMELINE COMPRESSES", color: "#FB923C", note: "Floor holds. Accept strong at-floor offers faster. Add interim income." }
       : { name: "DELIBERATE DECISION ZONE", color: C.red, note: "Only zone where lowering the floor is legitimate — written, dated, numbers attached." };
 
+  /* monthly runway check-in */
+  const checkinDay = +state.settings?.checkinDay || 1;
+  const checkinDue = new Date().getDate() >= checkinDay && state.lastCheckinMonth !== thisMonth();
+
+  /* focus state */
+  const focusItems = normFocus(coach.daily?.focus);
+  const allFocusDone = focusItems.length > 0 && focusItems.every((_, i) => (coach.dailyDone || []).includes(i));
+
   /* ---------- coach ---------- */
   const buildContext = () => {
     const weekLines = weekRows
@@ -467,6 +540,9 @@ export default function FlightDeck() {
     const emos = state.emotions
       .slice(0, 6)
       .map((x) => `${x.date} ${x.name || "?"} (${x.intensity || "?"}/10) claim:"${x.claim || ""}" action:"${x.action || "none"}"`);
+    const wins = (state.accomplishments || [])
+      .slice(0, 10)
+      .map((a) => `${a.date}: ${a.text}${a.category ? ` [${a.category}]` : ""}`);
     const now = new Date();
     return [
       `Today: ${now.toDateString()}.`,
@@ -474,6 +550,7 @@ export default function FlightDeck() {
       `Funnel totals (derived live from pipeline): apps ${totals.apps}, outreach ${totals.outreach}, replies ${totals.replies}, screens ${totals.screens}, interviews ${totals.interviews}, offers ${totals.offers}.`,
       `Pipeline by status: ${byStatus}.`,
       `Follow-ups DUE today or overdue: ${dueList.length}${dueList.length ? " — " + dueList.slice(0, 6).map((a) => `${a.company || "unnamed"} (contacted ${a.contacted}, status ${a.status})`).join("; ") : ""}.`,
+      `Recent accomplishments (completed focus items — acknowledge momentum):\n${wins.join("\n") || "none yet"}`,
       `Recent weeks (newest first):\n${weekLines.join("\n") || "none yet"}`,
       `Recent emotion-protocol entries (newest first):\n${emos.join("\n") || "none logged yet"}`,
     ].join("\n\n");
@@ -511,22 +588,25 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     setCoachError("");
     try {
       const daily = await callClaude(
-        "Give today's briefing: the 2-3 most leveraged things to do TODAY (specific and finishable today; due follow-ups by company name usually come first, then volume/quality work sized to where the funnel leaks, then any unfinished emotion-log action), one sentence on why based on the numbers, one thing to watch (emotional or strategic risk visible in the data, or empty string), and one grounding reminder in evidence-file style.",
-        `{"focus": ["item1", "item2"], "why": "...", "watch": "...", "reminder": "..."}`
+        "Give today's focus: a MAXIMUM of 3 things to do TODAY (specific and finishable today; due follow-ups by company name usually come first, then volume/quality work sized to where the funnel leaks, then any unfinished emotion-log action). EXACTLY ONE item must have key=true - the single highest-leverage action that most significantly boosts the chance of landing the job. Also give one sentence on why based on the numbers, one thing to watch (or empty string), and one grounding reminder in evidence-file style.",
+        `{"focus": [{"text": "...", "key": false}, {"text": "...", "key": true}], "why": "...", "watch": "...", "reminder": "..."}`
       );
-      setCoach((p) => ({ ...p, daily, dailyDate: today(), dailyDone: [] }));
+      const items = normFocus(daily.focus).slice(0, 3);
+      if (items.length && !items.some((i) => i.key)) items[0].key = true;
+      setCoach((p) => ({ ...p, daily: { ...daily, focus: items, carried: false }, dailyDate: today(), dailyDone: [] }));
     } catch (e) {
       setCoachError(e.message && e.message.includes("ANTHROPIC") ? e.message : "Couldn't reach the coach. Check connection (or the ANTHROPIC_API_KEY on Netlify) and retry.");
     }
     setCoachLoading(null);
   };
+  runDailyRef.current = runDaily;
 
   const runWeekly = async () => {
     setCoachLoading("weekly");
     setCoachError("");
     try {
       const weekly = await callClaude(
-        "Run the Friday weekly review: a one-line verdict (on-track / off-track and why), funnel diagnosis (which stage leaks most vs benchmarks and the fix), pipeline hygiene (stale applications, follow-up discipline, status mix), emotional pattern analysis from the protocol log, 2-4 priorities for next week, and a floor check (does P95K hold given runway - it should unless runway is critically low).",
+        "Run the Friday weekly review: a one-line verdict (on-track / off-track and why), funnel diagnosis (which stage leaks most vs benchmarks and the fix), pipeline hygiene (stale applications, follow-up discipline, status mix), emotional pattern analysis from the protocol log, acknowledgment of accomplishments, 2-4 priorities for next week, and a floor check (does P95K hold given runway - it should unless runway is critically low).",
         `{"verdict": "...", "funnel": "...", "pipeline": "...", "emotions": "...", "next_week": ["..."], "floor": "..."}`
       );
       setCoach((p) => ({ ...p, weekly, weeklyDate: today() }));
@@ -536,17 +616,15 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     setCoachLoading(null);
   };
 
-  useEffect(() => {
-    if (!loaded || autoRan.current) return;
-    autoRan.current = true;
-    setTimeout(() => {
-      setCoach((p) => {
-        if (p.dailyDate !== today()) runDaily();
-        return p;
-      });
-    }, 1500);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded]);
+  /* emotional support: de-escalate -> reconnect -> one action */
+  const runSupport = async (feeling, intensity) => {
+    const task = `The user pressed the Emotional Support button. They wrote: "${(feeling || "").replace(/"/g, "'")}" with intensity ${intensity || "?"}/10.
+First DE-ESCALATE: validate the feeling briefly and ground them in the body (slow 4-in/6-out breathing; the wave passes in minutes if not re-fed) - no judgment, no rushing.
+Then RECONNECT: bring them back to the goal using their actual numbers as evidence (runway months, pipeline, benchmarks) - steady and factual, not cheerleading.
+Then give exactly ONE small regulating action doable in the next 10 minutes.
+If their words suggest crisis, self-harm, or hopelessness beyond normal job-search stress, make the one_action reaching out to a trusted person or professional support, keep everything gentle, and skip the goal talk.`;
+    return callClaude(task, `{"deescalate": "...", "reconnect": "...", "one_action": "..."}`);
+  };
 
   /* ---------- mutations ---------- */
   const setAppStatus = (id, status) =>
@@ -561,9 +639,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
       mutate(
         (s) => ({
           ...s,
-          funnel: entry
-            ? s.funnel.map((w) => (w.id === entry.id ? { ...w, ...data } : w))
-            : [{ id: uid(), ...data }, ...s.funnel],
+          funnel: entry ? s.funnel.map((w) => (w.id === entry.id ? { ...w, ...data } : w)) : [{ id: uid(), ...data }, ...s.funnel],
         }),
         entry ? "Outreach updated" : "Outreach logged"
       );
@@ -597,8 +673,30 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
         }),
         entry ? "Decision updated" : "Decision logged"
       );
+    } else if (kind === "accomplishment") {
+      mutate(
+        (s) => ({
+          ...s,
+          accomplishments: entry
+            ? s.accomplishments.map((x) => (x.id === entry.id ? { ...x, ...data } : x))
+            : [{ id: uid(), ...data }, ...s.accomplishments],
+        }),
+        entry ? "Accomplishment updated" : "Accomplishment logged"
+      );
     } else if (kind === "runway") {
-      mutate((s) => ({ ...s, runway: { fund: +data.fund || 0, expenses: +data.expenses || 0 } }), "Runway recalculated");
+      mutate(
+        (s) => ({
+          ...s,
+          runway: { fund: +data.fund || 0, expenses: +data.expenses || 0 },
+          lastCheckinMonth: thisMonth(),
+        }),
+        "Runway recalculated — check-in recorded"
+      );
+    } else if (kind === "checkinDay") {
+      mutate(
+        (s) => ({ ...s, settings: { ...s.settings, checkinDay: Math.min(28, Math.max(1, +data.day || 1)) } }),
+        "Check-in day updated"
+      );
     }
     setModal(null);
   };
@@ -615,7 +713,11 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
       localStorage.setItem("fd-sync-key", key);
       if (remote) {
         if (remote.data) setState(migrate(remote.data));
-        if (remote.coach) setCoach({ ...DEFAULT_COACH, ...remote.coach });
+        if (remote.coach) {
+          const { coach: rolled, archived } = rolloverCoach({ ...DEFAULT_COACH, ...remote.coach });
+          setCoach(rolled);
+          if (archived.length) setState((s) => ({ ...s, accomplishments: [...archived, ...(s.accomplishments || [])] }));
+        }
         flash("Synced from that code");
       } else {
         flash("New code — current data will save to it");
@@ -628,65 +730,112 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
 
   /* ============ SECTION RENDERERS ============ */
 
-  const renderBriefing = () => (
+  const renderDashboard = () => (
     <>
-      {/* deterministic action queue: due follow-ups, always accurate */}
+      {/* instrument strip */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 14 }}>
+        {[
+          ["ACTIVE", apps.filter(isOpenApp).length, C.ink],
+          ["DUE ⚑", dueList.length, dueList.length ? C.red : C.ink],
+          ["OFFERS", totals.offers, totals.offers > 0 ? C.green : C.ink],
+          ["RUNWAY", months.toFixed(1) + "mo", zone.color],
+        ].map(([k, v, col]) => (
+          <div key={k} style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
+            <div style={{ fontSize: 9, letterSpacing: "0.16em", color: C.muted }}>{k}</div>
+            <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 700, color: col }}>{v}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* monthly runway check-in banner */}
+      {checkinDue && (
+        <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontWeight: 800, fontSize: 14, color: C.amber }}>Monthly runway check-in</div>
+              <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
+                Recalculate fund ÷ expenses. The floor decision runs on this number — not on mood.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Btn onClick={() => setModal({ kind: "runway", entry: { fund: state.runway.fund, expenses: state.runway.expenses } })} style={{ padding: "8px 12px", fontSize: 12 }}>
+                Update numbers
+              </Btn>
+              <Btn ghost onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay } })} style={{ padding: "8px 10px", fontSize: 12 }} title="Change check-in day">
+                Day: {checkinDay}
+              </Btn>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* due follow-ups queue */}
       {dueList.length > 0 && (
         <div style={{ background: "rgba(248,113,113,0.07)", border: `1px solid ${C.red}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
           <Label>⚑ Follow-ups due — clear these first</Label>
           <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 6 }}>
             {dueList.slice(0, 6).map((a) => (
-              <div
-                key={a.id}
-                onClick={() => setModal({ kind: "application", entry: a })}
-                style={{ display: "flex", justifyContent: "space-between", gap: 8, cursor: "pointer", fontSize: 13 }}
-              >
+              <div key={a.id} onClick={() => setModal({ kind: "application", entry: a })} style={{ display: "flex", justifyContent: "space-between", gap: 8, cursor: "pointer", fontSize: 13 }}>
                 <span style={{ fontWeight: 700 }}>{a.company || "Unnamed"}</span>
-                <span style={{ fontFamily: mono, fontSize: 11, color: C.red, flexShrink: 0 }}>
-                  due {followUpOf(a)}
-                </span>
+                <span style={{ fontFamily: mono, fontSize: 11, color: C.red, flexShrink: 0 }}>due {followUpOf(a)}</span>
               </div>
             ))}
-            {dueList.length > 6 && (
-              <div style={{ fontSize: 11, color: C.muted }}>+ {dueList.length - 6} more in the Pipeline</div>
-            )}
+            {dueList.length > 6 && <div style={{ fontSize: 11, color: C.muted }}>+ {dueList.length - 6} more in the Pipeline</div>}
           </div>
         </div>
       )}
 
+      {/* today's focus */}
       <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <Label>Today's focus — {new Date().toDateString()}</Label>
-          <Btn ghost onClick={runDaily} disabled={coachLoading === "daily"} style={{ padding: "6px 10px", fontSize: 11 }}>
-            {coachLoading === "daily" ? "…" : "↻ Refresh"}
-          </Btn>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+          <Label>
+            Today's focus — {new Date().toDateString()}
+            {coach.daily?.carried ? "  ·  CARRIED OVER" : ""}
+          </Label>
+          {coach.daily && (
+            <Btn ghost onClick={runDaily} disabled={coachLoading === "daily"} style={{ padding: "6px 10px", fontSize: 11 }} title="Regenerate (replaces the current list)">
+              {coachLoading === "daily" ? "…" : "↻"}
+            </Btn>
+          )}
         </div>
 
-        {coachLoading === "daily" && (
-          <div style={{ color: C.muted, fontFamily: mono, fontSize: 12, padding: "18px 0", letterSpacing: "0.15em" }}>
-            READING YOUR INSTRUMENTS…
+        {coach.daily?.carried && (
+          <div style={{ fontSize: 12, color: C.amber, margin: "6px 0 2px", lineHeight: 1.5 }}>
+            Yesterday's unfinished items carried over. Finish these to unlock a fresh focus tomorrow — completed ones are already in your History.
           </div>
+        )}
+
+        {coachLoading === "daily" && (
+          <div style={{ color: C.muted, fontFamily: mono, fontSize: 12, padding: "18px 0", letterSpacing: "0.15em" }}>READING YOUR INSTRUMENTS…</div>
         )}
 
         {!coachLoading && coach.daily && (
           <>
             <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
-              {(coach.daily.focus || []).map((f, i) => {
-                const done = coach.dailyDone.includes(i);
+              {focusItems.map((f, i) => {
+                const done = (coach.dailyDone || []).includes(i);
                 return (
                   <div
                     key={i}
-                    onClick={() =>
-                      setCoach((p) => ({ ...p, dailyDone: done ? p.dailyDone.filter((d) => d !== i) : [...p.dailyDone, i] }))
-                    }
-                    style={{ display: "flex", gap: 10, alignItems: "flex-start", background: C.bg, border: `1px solid ${done ? C.green : C.panelEdge}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer" }}
+                    onClick={() => setCoach((p) => ({ ...p, dailyDone: done ? p.dailyDone.filter((d) => d !== i) : [...p.dailyDone, i] }))}
+                    style={{ display: "flex", gap: 10, alignItems: "flex-start", background: C.bg, border: `1px solid ${done ? C.green : f.key ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer" }}
                   >
                     <div style={{ fontFamily: mono, fontSize: 14, color: done ? C.green : C.amber, lineHeight: 1.4 }}>{done ? "◉" : "○"}</div>
-                    <div style={{ fontSize: 14, lineHeight: 1.45, textDecoration: done ? "line-through" : "none", color: done ? C.muted : C.ink }}>{f}</div>
+                    <div style={{ minWidth: 0 }}>
+                      {f.key && (
+                        <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.18em", color: C.amber, marginBottom: 2 }}>★ HIGHEST LEVERAGE</div>
+                      )}
+                      <div style={{ fontSize: 14, lineHeight: 1.45, textDecoration: done ? "line-through" : "none", color: done ? C.muted : C.ink }}>{f.text}</div>
+                    </div>
                   </div>
                 );
               })}
             </div>
+            {allFocusDone && (
+              <div style={{ fontSize: 13, color: C.green, marginTop: 10, fontWeight: 700 }}>
+                ✓ All done — these archive to History tonight, and a fresh focus arrives tomorrow.
+              </div>
+            )}
             {coach.daily.why && <div style={{ fontSize: 12, color: C.muted, marginTop: 10, lineHeight: 1.5 }}>{coach.daily.why}</div>}
             {coach.daily.watch && <div style={{ fontSize: 12, color: C.amber, marginTop: 8, lineHeight: 1.5 }}>⚠ {coach.daily.watch}</div>}
             {coach.daily.reminder && (
@@ -697,11 +846,24 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
           </>
         )}
 
-        {!coachLoading && !coach.daily && !coachError && (
-          <div style={{ color: C.muted, fontSize: 13, padding: "14px 0" }}>Open the app each morning and today's focus appears here automatically.</div>
+        {!coachLoading && !coach.daily && (
+          <div style={{ padding: "10px 0" }}>
+            <div style={{ color: C.muted, fontSize: 13, marginBottom: 10 }}>
+              {canAutoGen ? "No focus set for today yet." : "Waiting for sync — generate manually if needed."}
+            </div>
+            <Btn onClick={runDaily} disabled={coachLoading === "daily"}>Generate today's focus</Btn>
+          </div>
         )}
       </div>
 
+      {/* emotional support — only on request */}
+      <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+        <Btn onClick={() => setSupportOpen(true)} color={C.blue} style={{ flex: 1 }}>
+          🛟 Emotional support
+        </Btn>
+      </div>
+
+      {/* weekly review */}
       <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <Label>Weekly review{coach.weeklyDate ? ` — last run ${coach.weeklyDate}` : " — run every Friday"}</Label>
@@ -710,7 +872,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
           </Btn>
         </div>
 
-        {coach.weekly && !coachLoading && (
+        {coach.weekly && coachLoading !== "weekly" && (
           <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
             <div style={{ fontSize: 14, fontWeight: 700, color: C.amber, lineHeight: 1.45 }}>{coach.weekly.verdict}</div>
             {[
@@ -749,6 +911,71 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     </>
   );
 
+  const renderHistory = () => {
+    const items = (state.accomplishments || []).slice().sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+    const groups = new Map();
+    items.forEach((a) => {
+      const key = historyGroup === "category" ? a.category || "Uncategorized" : a.date || "No date";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(a);
+    });
+    return (
+      <>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[
+              ["date", "By date"],
+              ["category", "By category"],
+            ].map(([k, l]) => (
+              <button
+                key={k}
+                onClick={() => setHistoryGroup(k)}
+                style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${historyGroup === k ? C.amber : C.panelEdge}`, background: historyGroup === k ? "rgba(245,185,66,0.12)" : "transparent", color: historyGroup === k ? C.amber : C.muted, cursor: "pointer" }}
+              >
+                {l}
+              </button>
+            ))}
+          </div>
+          <Btn onClick={() => setModal({ kind: "accomplishment", entry: null })}>+ Log a win</Btn>
+        </div>
+
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
+          Completed focus items land here automatically at the start of the next day. The coach remembers these — your evidence file of momentum. Read this list when the belief resurfaces.
+        </div>
+
+        {items.length === 0 && (
+          <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
+            Nothing archived yet. Check off today's focus items — they become permanent accomplishments here tomorrow.
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {Array.from(groups.entries()).map(([g, list]) => (
+            <div key={g}>
+              <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.2em", color: C.amber, marginBottom: 6, textTransform: "uppercase" }}>{g}</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {list.map((a) => (
+                  <SwipeRow
+                    key={a.id}
+                    showX={isDesktop}
+                    onTap={() => setModal({ kind: "accomplishment", entry: a })}
+                    onDelete={() => mutate((s) => ({ ...s, accomplishments: s.accomplishments.filter((x) => x.id !== a.id) }), "Accomplishment deleted")}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <div style={{ fontSize: 13, lineHeight: 1.5 }}>✓ {a.text}</div>
+                      <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>
+                        {historyGroup === "category" ? a.date : a.category}
+                      </div>
+                    </div>
+                  </SwipeRow>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </>
+    );
+  };
   const renderPipeline = () => {
     const filters = [
       { key: "active", label: `Active (${apps.filter(isOpenApp).length})` },
@@ -1013,6 +1240,16 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
         <div style={{ fontSize: 13, color: C.muted, marginTop: 4, lineHeight: 1.5 }}>{zone.note}</div>
       </div>
 
+      <div
+        onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay } })}
+        style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 14px", marginBottom: 14, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+      >
+        <div style={{ fontSize: 13, color: C.muted }}>Monthly check-in day ({isDesktop ? "click" : "tap"} to change)</div>
+        <div style={{ fontFamily: mono, fontSize: 14, color: C.amber, fontWeight: 700 }}>
+          Day {checkinDay}{state.lastCheckinMonth === thisMonth() ? " · ✓ done this month" : checkinDue ? " · ⚠ due" : ""}
+        </div>
+      </div>
+
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
         <Label>{isDesktop ? "Written decisions — click to edit, × to delete" : "Written decisions — tap to edit, swipe left to delete"}</Label>
         <Btn onClick={() => setModal({ kind: "decision", entry: null })}>+ Log decision</Btn>
@@ -1040,12 +1277,12 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     </>
   );
 
-  const SECTIONS = { BRIEFING: renderBriefing, PIPELINE: renderPipeline, FUNNEL: renderFunnel, EMOTIONS: renderEmotions, RUNWAY: renderRunway };
+  const SECTIONS = { DASHBOARD: renderDashboard, PIPELINE: renderPipeline, FUNNEL: renderFunnel, EMOTIONS: renderEmotions, RUNWAY: renderRunway, HISTORY: renderHistory };
 
   if (!loaded)
     return (
       <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", color: C.muted, fontFamily: mono, fontSize: 13, letterSpacing: "0.2em" }}>
-        LOADING INSTRUMENTS…
+        SYNCING INSTRUMENTS…
       </div>
     );
 
@@ -1114,13 +1351,16 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
         {/* content */}
         {isDesktop ? (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, alignItems: "start", marginTop: 18, flex: 1 }}>
-            <Panel title="◈ DAILY BRIEFING">{renderBriefing()}</Panel>
+            <Panel title="◈ DASHBOARD">{renderDashboard()}</Panel>
             <Panel title="◈ FUNNEL TRACKER">{renderFunnel()}</Panel>
             <Panel title="◈ PIPELINE — ALL APPLICATIONS" style={{ gridColumn: "1 / -1" }}>
               {renderPipeline()}
             </Panel>
             <Panel title="◈ EMOTION PROTOCOL">{renderEmotions()}</Panel>
             <Panel title="◈ RUNWAY GAUGE">{renderRunway()}</Panel>
+            <Panel title="◈ HISTORY — ACCOMPLISHMENTS" style={{ gridColumn: "1 / -1" }}>
+              {renderHistory()}
+            </Panel>
           </div>
         ) : (
           <div style={{ flex: 1 }}>{SECTIONS[MODES[mode]]()}</div>
@@ -1143,18 +1383,22 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
       )}
 
       {modal && (
-        <Modal
-          key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={modal}
-          onClose={() => setModal(null)}
-          onSave={saveModal}
-        />
+        <Modal key={modal.kind + "-" + (modal.entry?.id || "new")} modal={modal} onClose={() => setModal(null)} onSave={saveModal} />
       )}
       {syncModal && <SyncModal currentKey={syncKeyRef.current} onClose={() => setSyncModal(false)} onSwitch={switchSyncKey} flash={flash} />}
+      {supportOpen && (
+        <SupportModal
+          onClose={() => setSupportOpen(false)}
+          runSupport={runSupport}
+          onLog={(entry) => {
+            mutate((s) => ({ ...s, emotions: [{ id: uid(), date: today(), ...entry }, ...s.emotions] }), "Logged to Emotion Protocol");
+            setSupportOpen(false);
+          }}
+        />
+      )}
     </div>
   );
 }
-
 /* ---------- edit modal (centered) ---------- */
 function Modal({ modal, onClose, onSave }) {
   const { kind, entry, presetWeek } = modal;
@@ -1182,6 +1426,9 @@ function Modal({ modal, onClose, onSave }) {
     if (kind === "emotion")
       return { name: entry?.name || "", intensity: entry?.intensity ?? "", claim: entry?.claim || "", action: entry?.action || "" };
     if (kind === "decision") return { note: entry?.note || "" };
+    if (kind === "accomplishment")
+      return { text: entry?.text || "", date: entry?.date || today(), category: entry?.category || "Daily focus" };
+    if (kind === "checkinDay") return { day: entry?.day ?? 1 };
     return { fund: entry?.fund ?? "", expenses: entry?.expenses ?? "" };
   });
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
@@ -1193,6 +1440,8 @@ function Modal({ modal, onClose, onSave }) {
     application: entry ? "Edit application" : "Track an application",
     emotion: entry ? "Edit protocol entry" : "Run the protocol",
     decision: entry ? "Edit decision" : "Written decision",
+    accomplishment: entry ? "Edit accomplishment" : "Log a win",
+    checkinDay: "Monthly check-in day",
     runway: "Update runway numbers",
   };
 
@@ -1335,6 +1584,25 @@ function Modal({ modal, onClose, onSave }) {
           <Field label="Decision, with the numbers behind it" value={f.note} onChange={set("note")} placeholder="e.g. Runway 14.2 mo — floor holds at P95K" />
         )}
 
+        {kind === "accomplishment" && (
+          <>
+            <Field label="What you accomplished" value={f.text} onChange={set("text")} placeholder="e.g. Sent 3 warm outreaches to fintech design leads" />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <Field label="Date" type="date" value={f.date} onChange={set("date")} />
+              <Field label="Category" value={f.category} onChange={set("category")} placeholder="e.g. Pipeline, Portfolio" />
+            </div>
+          </>
+        )}
+
+        {kind === "checkinDay" && (
+          <>
+            <Field label="Day of the month for the runway check-in (1–28)" type="number" value={f.day} onChange={set("day")} />
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+              On or after this day each month, the Dashboard will remind you to recalculate fund ÷ expenses. Saving new runway numbers marks the month as done.
+            </div>
+          </>
+        )}
+
         {kind === "runway" && (
           <>
             <Field label="Emergency fund (₱)" type="number" value={f.fund} onChange={set("fund")} />
@@ -1397,6 +1665,103 @@ function SyncModal({ currentKey, onClose, onSwitch, flash }) {
             Switch to this code
           </Btn>
         </div>
+      </div>
+    </div>
+  );
+}
+
+
+/* ---------- emotional support modal (centered, on demand) ---------- */
+function SupportModal({ onClose, runSupport, onLog }) {
+  const [feeling, setFeeling] = useState("");
+  const [intensity, setIntensity] = useState("");
+  const [result, setResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const FALLBACK = {
+    deescalate:
+      "Pause. Breathe in for 4, out for 6 — five times. The long exhale is what tells your nervous system the threat is not physical. This wave crests and passes within minutes if you don't re-feed it with new anxious thoughts. Let it crest.",
+    reconnect:
+      "Nothing about the numbers changed in the last hour. The runway is what it was this morning. The pipeline is what the tracker says — not what the fear says. Rejection at ~95% of cold applications is the statistical default for everyone, including excellent candidates.",
+    one_action:
+      "Write the feeling and the claim it's making in your Emotion Protocol — one sentence each. That's the whole task for the next 10 minutes.",
+  };
+
+  const go = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await runSupport(feeling, intensity);
+      setResult(r && r.deescalate ? r : FALLBACK);
+    } catch (e) {
+      setResult(FALLBACK);
+      setErr("Coach unreachable — showing the built-in protocol instead.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.82)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 440, maxHeight: "82vh", overflowY: "auto", background: C.panel, border: `1px solid ${C.blue}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+      >
+        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 4 }}>🛟 Emotional support</div>
+
+        {!result && (
+          <>
+            <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 14 }}>
+              First we settle the feeling, then we come back to the goal, then one small step. No judgment here.
+            </div>
+            <Field label="What's happening / what are you feeling?" value={feeling} onChange={setFeeling} placeholder="e.g. Got a rejection and the old belief is back" />
+            <Field label="Intensity 1–10" type="number" value={intensity} onChange={setIntensity} />
+            {+intensity >= 8 && (
+              <div style={{ fontSize: 12, color: C.amber, lineHeight: 1.5, marginBottom: 12 }}>
+                Intensity 8+: before anything else — stand up, walk for a few minutes, long exhales. Come back when it's under 7. This window will wait.
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
+              <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
+              <Btn onClick={go} disabled={busy || !feeling.trim()} color={C.blue} style={{ flex: 2 }}>
+                {busy ? "…" : "Get support"}
+              </Btn>
+            </div>
+          </>
+        )}
+
+        {result && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 8 }}>
+            {err && <div style={{ fontSize: 11, color: C.muted }}>{err}</div>}
+            <div>
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.blue, marginBottom: 4 }}>1 · SETTLE THE FEELING</div>
+              <div style={{ fontSize: 13, lineHeight: 1.6 }}>{result.deescalate}</div>
+            </div>
+            <div>
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.amber, marginBottom: 4 }}>2 · BACK TO THE GOAL</div>
+              <div style={{ fontSize: 13, lineHeight: 1.6 }}>{result.reconnect}</div>
+            </div>
+            <div style={{ background: C.bg, border: `1px solid ${C.green}`, borderRadius: 10, padding: "10px 12px" }}>
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.green, marginBottom: 4 }}>3 · ONE THING TO REGULATE — NEXT 10 MINUTES</div>
+              <div style={{ fontSize: 13, lineHeight: 1.6, fontWeight: 700 }}>{result.one_action}</div>
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
+              <Btn
+                onClick={() => onLog({ name: feeling.slice(0, 60) || "Support session", intensity: intensity || "", claim: feeling, action: result.one_action })}
+                color={C.green}
+                style={{ flex: 2 }}
+              >
+                Log to Emotion Protocol
+              </Btn>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
