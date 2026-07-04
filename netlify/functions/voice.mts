@@ -37,8 +37,36 @@ export default async (req: Request, context: Context) => {
     });
   }
 
-  /* calm, steady default voice; override with ELEVENLABS_VOICE_ID */
-  const voiceId = Netlify.env.get("ELEVENLABS_VOICE_ID") || "21m00Tcm4TlvDq8ikWAM";
+  /* Voice resolution (free-tier safe):
+     1. ELEVENLABS_VOICE_ID env var if set
+     2. otherwise, the first voice in YOUR account's "My Voices" —
+        free API accounts can only use voices from their own account */
+  let voiceId = Netlify.env.get("ELEVENLABS_VOICE_ID") || "";
+  if (!voiceId) {
+    try {
+      const vr = await fetch("https://api.elevenlabs.io/v1/voices", {
+        headers: { "xi-api-key": apiKey },
+      });
+      if (vr.ok) {
+        const vj = await vr.json();
+        const voices = Array.isArray(vj.voices) ? vj.voices : [];
+        /* prefer a calm premade voice if present, else first available */
+        const preferred = voices.find((v: any) => /rachel|sarah|matilda|alice|lily/i.test(v.name || ""));
+        voiceId = (preferred || voices[0])?.voice_id || "";
+      }
+    } catch (e) {
+      /* fall through to error below */
+    }
+  }
+  if (!voiceId) {
+    return new Response(
+      JSON.stringify({
+        error:
+          "No usable ElevenLabs voice found on this account. In ElevenLabs: open Voices → add any voice to My Voices, or set ELEVENLABS_VOICE_ID in Netlify env vars.",
+      }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
 
   const upstream = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_64`,
