@@ -235,6 +235,54 @@ async function deleteAudio(path) {
 }
 const isExpiredAudio = (s) => !!(s.audioPath && s.audioCreated && addDays(s.audioCreated, AUDIO_TTL_DAYS) <= today());
 
+/* local audio vault (IndexedDB): holds recordings that couldn't reach the
+   cloud yet, so re-listening NEVER re-synthesizes (never spends credits) */
+function idb() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open("flightdeck-audio", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("audio");
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+async function idbPut(id, blob) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("audio", "readwrite");
+    tx.objectStore("audio").put(blob, id);
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function idbGet(id) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const rq = db.transaction("audio", "readonly").objectStore("audio").get(id);
+    rq.onsuccess = () => res(rq.result || null);
+    rq.onerror = () => rej(rq.error);
+  });
+}
+async function idbDelete(id) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("audio", "readwrite");
+    tx.objectStore("audio").delete(id);
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function uploadAudioWithRetry(path, blob, attempts = 3) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await uploadAudio(path, blob);
+      return true;
+    } catch (e) {
+      await new Promise((r) => setTimeout(r, 800 * (i + 1)));
+    }
+  }
+  return false;
+}
+
 /* ---------- supabase rpc ---------- */
 async function rpc(fn, args, timeoutMs = 6000) {
   const ctrl = new AbortController();
@@ -830,15 +878,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       setVoiceUrl(url);
       setVoiceScript(script);
       setCoach((p) => ({ ...p, voiceDate: today() }));
-      /* save audio to cloud (12-month retention, then you'll be asked) */
+      /* save audio: cloud first (with retries); if unreachable, keep it in the
+         on-device vault and auto-upload later — NEVER re-synthesize */
       const sessionId = uid();
       const path = `${syncKeyRef.current}/${sessionId}.mp3`;
       let audioFields = {};
-      try {
-        await uploadAudio(path, blob);
+      if (await uploadAudioWithRetry(path, blob)) {
         audioFields = { audioPath: path, audioCreated: today() };
-      } catch (e) {
-        /* session still saves with transcript; audio just wasn't archived */
+      } else {
+        try {
+          await idbPut(sessionId, blob);
+          audioFields = { audioLocal: true, audioCreated: today() };
+        } catch (e) {}
       }
       mutate(
         (s) => ({
@@ -848,7 +899,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             ...(s.supportSessions || []),
           ],
         }),
-        audioFields.audioPath ? "Voice check-in saved — audio archived to cloud" : "Voice check-in saved (audio not archived)"
+        audioFields.audioPath
+          ? "Voice check-in saved — audio archived to cloud"
+          : audioFields.audioLocal
+          ? "Saved — audio kept on this device, will upload when online"
+          : "Voice check-in saved (transcript only)"
       );
     } catch (e) {
       setVoiceErr(e.message || "Couldn't create the voice session.");
@@ -856,88 +911,43 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     setVoiceBusy(false);
   };
 
-  /* replay a saved transcript as audio (no new Claude call) */
-  const speakScript = async (script) => {
-    setVoiceBusy(true);
-    setVoiceErr("");
+  /* auto-upload any vaulted audio once the cloud is reachable again */
+  const retryingRef = useRef(false);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const retryPendingAudio = useCallback(async () => {
+    if (retryingRef.current) return;
+    retryingRef.current = true;
     try {
-      const res = await fetch("/api/voice", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: script }),
-      });
-      if (!res.ok) {
-        let msg = "Voice synthesis failed.";
-        try {
-          const j = await res.json();
-          if (j.error) msg = j.error;
-        } catch (e) {}
-        throw new Error(msg);
+      const pending = (stateRef.current.supportSessions || []).filter((s) => s.audioLocal && !s.audioPath);
+      for (const s of pending) {
+        const blob = await idbGet(s.id).catch(() => null);
+        if (!blob) continue;
+        const path = `${syncKeyRef.current}/${s.id}.mp3`;
+        if (await uploadAudioWithRetry(path, blob, 1)) {
+          setState((prev) => ({
+            ...prev,
+            supportSessions: prev.supportSessions.map((x) =>
+              x.id === s.id ? { ...x, audioPath: path, audioLocal: undefined } : x
+            ),
+          }));
+          await idbDelete(s.id).catch(() => {});
+        }
       }
-      const blob = await res.blob();
-      if (voiceUrlRef.current) URL.revokeObjectURL(voiceUrlRef.current);
-      const url = URL.createObjectURL(blob);
-      voiceUrlRef.current = url;
-      setVoiceUrl(url);
-      setVoiceScript(script);
-    } catch (e) {
-      setVoiceErr(e.message || "Couldn't create the voice session.");
-    }
-    setVoiceBusy(false);
-  };
-
-  /* 12-MONTH AUDIO RETENTION: on open, find archived audio past its
-     retention date and ASK — download or delete. Nothing is removed silently. */
-  const [expiryOpen, setExpiryOpen] = useState(false);
-  const expiryChecked = useRef(false);
-  useEffect(() => {
-    if (!loaded || expiryChecked.current) return;
-    expiryChecked.current = true;
-    if ((state.supportSessions || []).some(isExpiredAudio)) setExpiryOpen(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded]);
-
-  const clearAudioFields = (id) =>
-    mutate(
-      (s) => ({
-        ...s,
-        supportSessions: s.supportSessions.map((x) => {
-          if (x.id !== id) return x;
-          const { audioPath, audioCreated, ...rest } = x;
-          return rest;
-        }),
-      })
-    );
-
-  const expiryDelete = async (session) => {
-    try {
-      await deleteAudio(session.audioPath);
     } catch (e) {}
-    clearAudioFields(session.id);
-    flash("Audio deleted — transcript kept");
-  };
-
-  const expiryDownload = async (session) => {
-    try {
-      const r = await fetch(audioPublicUrl(session.audioPath));
-      if (!r.ok) throw new Error("fetch failed");
-      const blob = await r.blob();
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `voice-checkin-${session.date || "session"}.mp3`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-      try {
-        await deleteAudio(session.audioPath);
-      } catch (e) {}
-      clearAudioFields(session.id);
-      flash("Downloaded — removed from cloud");
-    } catch (e) {
-      flash("Download failed — audio kept in cloud");
-    }
-  };
+    retryingRef.current = false;
+  }, []);
+  useEffect(() => {
+    if (!loaded) return;
+    retryPendingAudio();
+    const t = setInterval(retryPendingAudio, 120000);
+    const onFocus = () => retryPendingAudio();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(t);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [loaded, retryPendingAudio]);
 
   /* ---------- mutations ---------- */
   const setAppStatus = (id, status) =>
@@ -1603,7 +1613,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <SwipeRow
             key={s.id}
             showX={isDesktop}
-            onTap={() => setModal({ kind: "session", entry: s })}
+            onTap={async () => {
+              let localUrl = null;
+              if (!s.audioPath && s.audioLocal) {
+                const blob = await idbGet(s.id).catch(() => null);
+                if (blob) localUrl = URL.createObjectURL(blob);
+              }
+              setModal({ kind: "session", entry: s, localUrl });
+            }}
             onDelete={() => mutate((st) => ({ ...st, supportSessions: st.supportSessions.filter((y) => y.id !== s.id) }), "Session deleted")}
           >
             <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
@@ -1800,11 +1817,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           modal={modal}
           onClose={() => setModal(null)}
           onSave={saveModal}
-          onSpeak={(script) => {
-            setModal(null);
-            setMode(0);
-            speakScript(script);
-          }}
         />
       )}
       {syncModal && <SyncModal currentKey={syncKeyRef.current} onClose={() => setSyncModal(false)} onSwitch={switchSyncKey} flash={flash} />}
@@ -1833,7 +1845,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave, onSpeak }) {
+function Modal({ modal, onClose, onSave }) {
   const { kind, entry, presetWeek } = modal;
   const opts = weekOptions();
   const initialWeek = entry?.week || presetWeek?.week || opts[1]?.label || opts[0].label;
@@ -2053,12 +2065,17 @@ function Modal({ modal, onClose, onSave, onSpeak }) {
                       Original recording · archived {entry.audioCreated} · kept until {addDays(entry.audioCreated, AUDIO_TTL_DAYS)}
                     </div>
                   </div>
+                ) : modal.localUrl ? (
+                  <div style={{ marginTop: 10 }}>
+                    <audio controls src={modal.localUrl} style={{ width: "100%" }} />
+                    <div style={{ fontFamily: mono, fontSize: 10, color: C.amber, marginTop: 4 }}>
+                      Original recording · on this device · uploads to cloud automatically when online
+                    </div>
+                  </div>
                 ) : (
-                  onSpeak && (
-                    <Btn onClick={() => onSpeak(entry.script)} color={C.blue} style={{ marginTop: 10, width: "100%" }}>
-                      🔊 Listen again (audio appears on Dashboard)
-                    </Btn>
-                  )
+                  <div style={{ fontSize: 12, color: C.muted, marginTop: 10, lineHeight: 1.5 }}>
+                    Audio wasn't archived for this session — the transcript above is the record. (New sessions save their audio automatically.)
+                  </div>
                 )}
               </div>
             )}
