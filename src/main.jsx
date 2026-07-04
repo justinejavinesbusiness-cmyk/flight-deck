@@ -209,8 +209,31 @@ function mergeCoach(localC, remoteC) {
     out.weekly = remoteC.weekly;
     out.weeklyDate = remoteC.weeklyDate;
   }
+  if ((remoteC.voiceDate || "") > (localC.voiceDate || "")) {
+    out.voiceDate = remoteC.voiceDate;
+  }
   return out;
 }
+
+/* ---------- voice audio storage (Supabase Storage) ---------- */
+const AUDIO_TTL_DAYS = 365; /* audio kept 12 months from creation, then user is asked */
+const audioPublicUrl = (path) => `${SUPA_URL}/storage/v1/object/public/voice-sessions/${path}`;
+async function uploadAudio(path, blob) {
+  const r = await fetch(`${SUPA_URL}/storage/v1/object/voice-sessions/${path}`, {
+    method: "POST",
+    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "content-type": "audio/mpeg", "x-upsert": "true" },
+    body: blob,
+  });
+  if (!r.ok) throw new Error(`storage upload ${r.status}`);
+}
+async function deleteAudio(path) {
+  const r = await fetch(`${SUPA_URL}/storage/v1/object/voice-sessions/${path}`, {
+    method: "DELETE",
+    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` },
+  });
+  if (!r.ok && r.status !== 404) throw new Error(`storage delete ${r.status}`);
+}
+const isExpiredAudio = (s) => !!(s.audioPath && s.audioCreated && addDays(s.audioCreated, AUDIO_TTL_DAYS) <= today());
 
 /* ---------- supabase rpc ---------- */
 async function rpc(fn, args, timeoutMs = 6000) {
@@ -372,6 +395,11 @@ export default function FlightDeck() {
   const [historyGroup, setHistoryGroup] = useState("date");
   const [coachLoading, setCoachLoading] = useState(null);
   const [coachError, setCoachError] = useState("");
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [voiceErr, setVoiceErr] = useState("");
+  const [voiceUrl, setVoiceUrl] = useState("");
+  const [voiceScript, setVoiceScript] = useState("");
+  const voiceUrlRef = useRef(null);
   const [canAutoGen, setCanAutoGen] = useState(false);
   const [isDesktop, setIsDesktop] = useState(
     () => typeof window !== "undefined" && window.matchMedia("(min-width: 1024px)").matches
@@ -766,6 +794,151 @@ If their words suggest crisis, self-harm, or hopelessness beyond normal job-sear
     return callClaude(task, `{"deescalate": "...", "reality": "...", "achievements": "...", "forward": "...", "one_action": "..."}`);
   };
 
+  /* weekly VOICE check-in: coach writes a spoken script from real context,
+     ElevenLabs speaks it; transcript saved to the support diary */
+  const runVoiceCheckin = async () => {
+    setVoiceBusy(true);
+    setVoiceErr("");
+    try {
+      const out = await callClaude(
+        `Write a WEEKLY EMOTIONAL CHECK-IN as a spoken-word script (it will be converted to voice audio). 250-350 words. Written for the ear: short sentences, warm steady tone, no lists, no headers, no markdown, no stage directions — just flowing speech.
+Structure the arc: (1) a brief settling opening — one slow breath together; (2) the week in reality — their actual numbers this week vs benchmarks, honestly but kindly; (3) their track record — name 2-3 specific recent accomplishments or pipeline wins from the data; (4) acknowledge their emotional pattern this week from the sessions/protocol entries, normalizing it; (5) the will and the better future — every tracked action is compounding, grounded in their trajectory; (6) close with exactly one small action for the coming week and a calm sign-off.`,
+        `{"script": "..."}`
+      );
+      const script = (out.script || "").trim();
+      if (!script) throw new Error("empty script");
+      /* synthesize */
+      const res = await fetch("/api/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: script }),
+      });
+      if (!res.ok) {
+        let msg = "Voice synthesis failed.";
+        try {
+          const j = await res.json();
+          if (j.error) msg = j.error;
+        } catch (e) {}
+        /* keep the script even if audio fails */
+        setVoiceScript(script);
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      if (voiceUrlRef.current) URL.revokeObjectURL(voiceUrlRef.current);
+      const url = URL.createObjectURL(blob);
+      voiceUrlRef.current = url;
+      setVoiceUrl(url);
+      setVoiceScript(script);
+      setCoach((p) => ({ ...p, voiceDate: today() }));
+      /* save audio to cloud (12-month retention, then you'll be asked) */
+      const sessionId = uid();
+      const path = `${syncKeyRef.current}/${sessionId}.mp3`;
+      let audioFields = {};
+      try {
+        await uploadAudio(path, blob);
+        audioFields = { audioPath: path, audioCreated: today() };
+      } catch (e) {
+        /* session still saves with transcript; audio just wasn't archived */
+      }
+      mutate(
+        (s) => ({
+          ...s,
+          supportSessions: [
+            { id: sessionId, date: today(), feeling: "🎙 Weekly voice check-in", intensity: "", script, ...audioFields },
+            ...(s.supportSessions || []),
+          ],
+        }),
+        audioFields.audioPath ? "Voice check-in saved — audio archived to cloud" : "Voice check-in saved (audio not archived)"
+      );
+    } catch (e) {
+      setVoiceErr(e.message || "Couldn't create the voice session.");
+    }
+    setVoiceBusy(false);
+  };
+
+  /* replay a saved transcript as audio (no new Claude call) */
+  const speakScript = async (script) => {
+    setVoiceBusy(true);
+    setVoiceErr("");
+    try {
+      const res = await fetch("/api/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: script }),
+      });
+      if (!res.ok) {
+        let msg = "Voice synthesis failed.";
+        try {
+          const j = await res.json();
+          if (j.error) msg = j.error;
+        } catch (e) {}
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      if (voiceUrlRef.current) URL.revokeObjectURL(voiceUrlRef.current);
+      const url = URL.createObjectURL(blob);
+      voiceUrlRef.current = url;
+      setVoiceUrl(url);
+      setVoiceScript(script);
+    } catch (e) {
+      setVoiceErr(e.message || "Couldn't create the voice session.");
+    }
+    setVoiceBusy(false);
+  };
+
+  /* 12-MONTH AUDIO RETENTION: on open, find archived audio past its
+     retention date and ASK — download or delete. Nothing is removed silently. */
+  const [expiryOpen, setExpiryOpen] = useState(false);
+  const expiryChecked = useRef(false);
+  useEffect(() => {
+    if (!loaded || expiryChecked.current) return;
+    expiryChecked.current = true;
+    if ((state.supportSessions || []).some(isExpiredAudio)) setExpiryOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  const clearAudioFields = (id) =>
+    mutate(
+      (s) => ({
+        ...s,
+        supportSessions: s.supportSessions.map((x) => {
+          if (x.id !== id) return x;
+          const { audioPath, audioCreated, ...rest } = x;
+          return rest;
+        }),
+      })
+    );
+
+  const expiryDelete = async (session) => {
+    try {
+      await deleteAudio(session.audioPath);
+    } catch (e) {}
+    clearAudioFields(session.id);
+    flash("Audio deleted — transcript kept");
+  };
+
+  const expiryDownload = async (session) => {
+    try {
+      const r = await fetch(audioPublicUrl(session.audioPath));
+      if (!r.ok) throw new Error("fetch failed");
+      const blob = await r.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `voice-checkin-${session.date || "session"}.mp3`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      try {
+        await deleteAudio(session.audioPath);
+      } catch (e) {}
+      clearAudioFields(session.id);
+      flash("Downloaded — removed from cloud");
+    } catch (e) {
+      flash("Download failed — audio kept in cloud");
+    }
+  };
+
   /* ---------- mutations ---------- */
   const setAppStatus = (id, status) =>
     mutate(
@@ -1016,6 +1189,40 @@ If their words suggest crisis, self-harm, or hopelessness beyond normal job-sear
         <Btn onClick={() => setSupportOpen(true)} color={C.blue} style={{ flex: 1 }}>
           🛟 Emotional support
         </Btn>
+      </div>
+
+      {/* weekly VOICE check-in */}
+      <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <Label>
+            🎙 Weekly voice check-in
+            {coach.voiceDate ? ` — last ${coach.voiceDate}` : ""}
+            {!coach.voiceDate || addDays(coach.voiceDate, 7) <= today() ? "  ·  DUE" : ""}
+          </Label>
+          <Btn onClick={runVoiceCheckin} disabled={voiceBusy} color={C.blue} style={{ padding: "6px 12px", fontSize: 11 }}>
+            {voiceBusy ? "Creating…" : "Create session"}
+          </Btn>
+        </div>
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+          A spoken session built from your actual week — numbers, wins, emotional patterns — settle, reality, track record, forward, one action. Transcript saves to your diary.
+        </div>
+        {voiceBusy && (
+          <div style={{ color: C.muted, fontFamily: mono, fontSize: 12, padding: "12px 0 0", letterSpacing: "0.15em" }}>
+            WRITING & RECORDING YOUR SESSION…
+          </div>
+        )}
+        {voiceUrl && !voiceBusy && (
+          <audio controls src={voiceUrl} style={{ width: "100%", marginTop: 12 }} />
+        )}
+        {voiceScript && !voiceBusy && (
+          <details style={{ marginTop: 8 }}>
+            <summary style={{ fontSize: 12, color: C.muted, cursor: "pointer" }}>Transcript</summary>
+            <div style={{ fontSize: 13, lineHeight: 1.6, color: C.ink, marginTop: 6, whiteSpace: "pre-wrap" }}>{voiceScript}</div>
+          </details>
+        )}
+        {voiceErr && (
+          <div style={{ marginTop: 10, fontSize: 12, color: C.red, lineHeight: 1.5 }}>{voiceErr}</div>
+        )}
       </div>
 
       {/* weekly review */}
@@ -1588,9 +1795,27 @@ If their words suggest crisis, self-harm, or hopelessness beyond normal job-sear
       )}
 
       {modal && (
-        <Modal key={modal.kind + "-" + (modal.entry?.id || "new")} modal={modal} onClose={() => setModal(null)} onSave={saveModal} />
+        <Modal
+          key={modal.kind + "-" + (modal.entry?.id || "new")}
+          modal={modal}
+          onClose={() => setModal(null)}
+          onSave={saveModal}
+          onSpeak={(script) => {
+            setModal(null);
+            setMode(0);
+            speakScript(script);
+          }}
+        />
       )}
       {syncModal && <SyncModal currentKey={syncKeyRef.current} onClose={() => setSyncModal(false)} onSwitch={switchSyncKey} flash={flash} />}
+      {expiryOpen && (
+        <AudioExpiryModal
+          sessions={(state.supportSessions || []).filter(isExpiredAudio)}
+          onDownload={expiryDownload}
+          onDelete={expiryDelete}
+          onClose={() => setExpiryOpen(false)}
+        />
+      )}
       {supportOpen && (
         <SupportModal
           onClose={() => setSupportOpen(false)}
@@ -1608,7 +1833,7 @@ If their words suggest crisis, self-harm, or hopelessness beyond normal job-sear
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave }) {
+function Modal({ modal, onClose, onSave, onSpeak }) {
   const { kind, entry, presetWeek } = modal;
   const opts = weekOptions();
   const initialWeek = entry?.week || presetWeek?.week || opts[1]?.label || opts[0].label;
@@ -1816,6 +2041,26 @@ function Modal({ modal, onClose, onSave }) {
                     <div style={{ fontSize: 13, lineHeight: 1.6 }}>{entry[k]}</div>
                   </div>
                 )
+            )}
+            {entry.script && (
+              <div>
+                <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.blue, marginBottom: 4 }}>TRANSCRIPT</div>
+                <div style={{ fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{entry.script}</div>
+                {entry.audioPath ? (
+                  <div style={{ marginTop: 10 }}>
+                    <audio controls src={audioPublicUrl(entry.audioPath)} style={{ width: "100%" }} />
+                    <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>
+                      Original recording · archived {entry.audioCreated} · kept until {addDays(entry.audioCreated, AUDIO_TTL_DAYS)}
+                    </div>
+                  </div>
+                ) : (
+                  onSpeak && (
+                    <Btn onClick={() => onSpeak(entry.script)} color={C.blue} style={{ marginTop: 10, width: "100%" }}>
+                      🔊 Listen again (audio appears on Dashboard)
+                    </Btn>
+                  )
+                )}
+              </div>
             )}
             {entry.one_action && (
               <div style={{ background: C.bg, border: `1px solid ${C.green}`, borderRadius: 10, padding: "10px 12px" }}>
@@ -2032,6 +2277,77 @@ function SupportModal({ onClose, runSupport, onLog, onSaveSession }) {
             </div>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- audio retention modal (centered) ---------- */
+function AudioExpiryModal({ sessions, onDownload, onDelete, onClose }) {
+  const [busyId, setBusyId] = useState(null);
+  if (!sessions.length) {
+    onClose();
+    return null;
+  }
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.82)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 55, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 440, maxHeight: "80vh", overflowY: "auto", background: C.panel, border: `1px solid ${C.amber}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+      >
+        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 6 }}>🎙 Audio retention — 12 months reached</div>
+        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 14 }}>
+          These voice recordings have reached their 12-month retention date. Choose for each: download a copy (then it's removed from the cloud) or delete it. Transcripts are always kept in your diary either way.
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {sessions.map((s) => (
+            <div key={s.id} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                <div style={{ fontWeight: 700, fontSize: 13 }}>{s.feeling || "Voice session"}</div>
+                <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, flexShrink: 0 }}>created {s.audioCreated}</div>
+              </div>
+              <audio controls src={audioPublicUrl(s.audioPath)} style={{ width: "100%", marginTop: 8 }} />
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <Btn
+                  onClick={async () => {
+                    setBusyId(s.id);
+                    await onDownload(s);
+                    setBusyId(null);
+                  }}
+                  disabled={busyId === s.id}
+                  color={C.green}
+                  style={{ flex: 2, padding: "8px 10px", fontSize: 12 }}
+                >
+                  {busyId === s.id ? "…" : "⬇ Download & remove"}
+                </Btn>
+                <Btn
+                  onClick={async () => {
+                    setBusyId(s.id);
+                    await onDelete(s);
+                    setBusyId(null);
+                  }}
+                  disabled={busyId === s.id}
+                  color={C.red}
+                  style={{ flex: 1, padding: "8px 10px", fontSize: 12 }}
+                >
+                  Delete
+                </Btn>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ marginTop: 14 }}>
+          <Btn ghost onClick={onClose} style={{ width: "100%" }}>
+            Decide later (will ask again next time)
+          </Btn>
+        </div>
       </div>
     </div>
   );
