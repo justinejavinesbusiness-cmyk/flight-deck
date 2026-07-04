@@ -911,6 +911,59 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     setVoiceBusy(false);
   };
 
+  /* 12-MONTH AUDIO RETENTION: on open, find archived audio past its
+     retention date and ASK — download or delete. Nothing is removed silently. */
+  const [expiryOpen, setExpiryOpen] = useState(false);
+  const expiryChecked = useRef(false);
+  useEffect(() => {
+    if (!loaded || expiryChecked.current) return;
+    expiryChecked.current = true;
+    if ((state.supportSessions || []).some(isExpiredAudio)) setExpiryOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  const clearAudioFields = (id) =>
+    mutate(
+      (s) => ({
+        ...s,
+        supportSessions: s.supportSessions.map((x) => {
+          if (x.id !== id) return x;
+          const { audioPath, audioCreated, audioLocal, ...rest } = x;
+          return rest;
+        }),
+      })
+    );
+
+  const expiryDelete = async (session) => {
+    try {
+      await deleteAudio(session.audioPath);
+    } catch (e) {}
+    clearAudioFields(session.id);
+    flash("Audio deleted — transcript kept");
+  };
+
+  const expiryDownload = async (session) => {
+    try {
+      const r = await fetch(audioPublicUrl(session.audioPath));
+      if (!r.ok) throw new Error("fetch failed");
+      const blob = await r.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `voice-checkin-${session.date || "session"}.mp3`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      try {
+        await deleteAudio(session.audioPath);
+      } catch (e) {}
+      clearAudioFields(session.id);
+      flash("Downloaded — removed from cloud");
+    } catch (e) {
+      flash("Download failed — audio kept in cloud");
+    }
+  };
+
   /* auto-upload any vaulted audio once the cloud is reachable again */
   const retryingRef = useRef(false);
   const stateRef = useRef(state);
