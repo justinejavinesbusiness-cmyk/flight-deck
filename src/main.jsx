@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createRoot } from "react-dom/client";
+import { createClient } from "@supabase/supabase-js";
 
 /* ============================================================
    FLIGHT DECK v3 — Job Search Operating System
@@ -14,6 +15,9 @@ import { createRoot } from "react-dom/client";
 
 const SUPA_URL = "https://ywzvhloswottkasvhzfv.supabase.co";
 const SUPA_KEY = "sb_publishable_YyQQvJHwJh3B0c6ZJCcuhQ__gCrN_ld";
+/* realtime broadcast client — used only for "something changed" pings between
+   devices on the same sync code; data itself still flows through the RPCs */
+const supa = createClient(SUPA_URL, SUPA_KEY, { realtime: { params: { eventsPerSecond: 2 } } });
 
 const C = {
   bg: "#0E1420",
@@ -127,6 +131,7 @@ const DEFAULT_STATE = {
   emotions: [],
   decisions: [],
   accomplishments: [],
+  supportSessions: [],
   runway: { fund: 1200000, expenses: 50000 },
   settings: { checkinDay: 1 },
   lastCheckinMonth: null,
@@ -141,6 +146,7 @@ function migrate(saved) {
   const s = { ...DEFAULT_STATE, ...saved };
   if (!Array.isArray(s.applications)) s.applications = [];
   if (!Array.isArray(s.accomplishments)) s.accomplishments = [];
+  if (!Array.isArray(s.supportSessions)) s.supportSessions = [];
   if (!s.settings || typeof s.settings !== "object") s.settings = { checkinDay: 1 };
   if (!s.settings.checkinDay) s.settings.checkinDay = 1;
   s.funnel = (s.funnel || []).map((w) => {
@@ -169,6 +175,7 @@ function mergeStates(localS, remoteS) {
     emotions: unionById(localS.emotions, remoteS.emotions),
     decisions: unionById(localS.decisions, remoteS.decisions),
     accomplishments: unionById(localS.accomplishments, remoteS.accomplishments),
+    supportSessions: unionById(localS.supportSessions, remoteS.supportSessions),
     runway: remoteS.runway || localS.runway,
     settings: { ...localS.settings, ...remoteS.settings },
     lastCheckinMonth:
@@ -376,6 +383,8 @@ export default function FlightDeck() {
   const saveTimer = useRef(null);
   const dirtyRef = useRef(false);
   const pullingRef = useRef(false);
+  const channelRef = useRef(null);
+  const [keyVersion, setKeyVersion] = useState(0);
   const runDailyRef = useRef(null);
 
   /* responsive listener */
@@ -457,10 +466,14 @@ export default function FlightDeck() {
         await rpc("fd_set", { k: syncKeyRef.current, d: state, c: coach });
         dirtyRef.current = false;
         setSyncStatus("synced");
+        /* tell the other devices to pull right now */
+        try {
+          channelRef.current?.send({ type: "broadcast", event: "changed", payload: { t: Date.now() } });
+        } catch (e) {}
       } catch (e) {
         setSyncStatus("offline");
       }
-    }, 1200);
+    }, 800);
     return () => saveTimer.current && clearTimeout(saveTimer.current);
   }, [state, coach, loaded]);
 
@@ -505,6 +518,28 @@ export default function FlightDeck() {
       clearInterval(t);
     };
   }, [loaded, pullRemote]);
+
+  /* REALTIME: private broadcast channel named by the secret sync code.
+     Any device that saves sends a ping; every other device pulls within ~1s.
+     The 60s poll and focus pull above remain as fallbacks. */
+  useEffect(() => {
+    if (!loaded || !syncKeyRef.current) return;
+    const ch = supa.channel("fd-" + syncKeyRef.current, { config: { broadcast: { self: false } } });
+    ch.on("broadcast", { event: "changed" }, () => {
+      if (dirtyRef.current) {
+        /* mid-edit here — retry shortly after our own save lands */
+        setTimeout(pullRemote, 2500);
+      } else {
+        pullRemote();
+      }
+    });
+    ch.subscribe();
+    channelRef.current = ch;
+    return () => {
+      channelRef.current = null;
+      supa.removeChannel(ch);
+    };
+  }, [loaded, keyVersion, pullRemote]);
 
   const flash = (msg) => {
     setToast(msg);
@@ -641,6 +676,9 @@ export default function FlightDeck() {
     const wins = (state.accomplishments || [])
       .slice(0, 10)
       .map((a) => `${a.date}: ${a.text}${a.category ? ` [${a.category}]` : ""}`);
+    const sessions = (state.supportSessions || [])
+      .slice(0, 6)
+      .map((s) => `${s.date} "${s.feeling || "?"}" intensity ${s.intensity || "?"}/10`);
     const now = new Date();
     return [
       `Today: ${now.toDateString()}.`,
@@ -649,6 +687,7 @@ export default function FlightDeck() {
       `Pipeline by status: ${byStatus}.`,
       `Follow-ups DUE today or overdue: ${dueList.length}${dueList.length ? " — " + dueList.slice(0, 6).map((a) => `${a.company || "unnamed"} (contacted ${a.contacted}, status ${a.status})`).join("; ") : ""}.`,
       `Recent accomplishments (completed focus items — acknowledge momentum):\n${wins.join("\n") || "none yet"}`,
+      `Emotional support sessions (date, feeling, intensity — watch for patterns/trends):\n${sessions.join("\n") || "none yet"}`,
       `Recent weeks (newest first):\n${weekLines.join("\n") || "none yet"}`,
       `Recent emotion-protocol entries (newest first):\n${emos.join("\n") || "none logged yet"}`,
     ].join("\n\n");
@@ -714,14 +753,17 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     setCoachLoading(null);
   };
 
-  /* emotional support: de-escalate -> reconnect -> one action */
+  /* emotional support: settle -> reality -> achievements -> forward -> one action */
   const runSupport = async (feeling, intensity) => {
     const task = `The user pressed the Emotional Support button. They wrote: "${(feeling || "").replace(/"/g, "'")}" with intensity ${intensity || "?"}/10.
-First DE-ESCALATE: validate the feeling briefly and ground them in the body (slow 4-in/6-out breathing; the wave passes in minutes if not re-fed) - no judgment, no rushing.
-Then RECONNECT: bring them back to the goal using their actual numbers as evidence (runway months, pipeline, benchmarks) - steady and factual, not cheerleading.
-Then give exactly ONE small regulating action doable in the next 10 minutes.
-If their words suggest crisis, self-harm, or hopelessness beyond normal job-search stress, make the one_action reaching out to a trusted person or professional support, keep everything gentle, and skip the goal talk.`;
-    return callClaude(task, `{"deescalate": "...", "reconnect": "...", "one_action": "..."}`);
+Respond in five parts:
+1. deescalate — Validate the feeling briefly and ground them in the body (slow 4-in/6-out breathing; the wave passes in minutes if not re-fed). No judgment, no rushing, no problem-solving yet.
+2. reality — Bring them back to reality with LOGICAL, EVIDENCE-BACKED reasoning: contrast what the feeling is claiming against what the actual numbers say (runway months, pipeline counts, benchmark conversion rates). Name the specific numbers. The feeling is real; its claims are testable and usually false.
+3. achievements — Remind them of their SPECIFIC achievements from the accomplishments list and pipeline progress above (name real items/companies). This is their own documented track record, proof of capability — not flattery.
+4. forward — Speak to the importance of their will to get out of this situation and the better future it is building toward: every application, follow-up, and completed focus item is compounding evidence and skill. Ground it in their trajectory data, not wishful thinking. Convince with sound reasoning, not cheerleading.
+5. one_action — Exactly ONE small regulating action doable in the next 10 minutes.
+If their words suggest crisis, self-harm, or hopelessness beyond normal job-search stress: keep everything gentle, skip parts 2-4 (put a caring sentence in each instead), and make one_action reaching out to a trusted person or professional support.`;
+    return callClaude(task, `{"deescalate": "...", "reality": "...", "achievements": "...", "forward": "...", "one_action": "..."}`);
   };
 
   /* ---------- mutations ---------- */
@@ -828,6 +870,12 @@ If their words suggest crisis, self-harm, or hopelessness beyond normal job-sear
         dirtyRef.current = false;
         setSyncStatus("synced");
       } catch (e) {}
+      setKeyVersion((v) => v + 1); /* rejoin realtime channel under the new code */
+      setTimeout(() => {
+        try {
+          channelRef.current?.send({ type: "broadcast", event: "changed", payload: { t: Date.now() } });
+        } catch (e) {}
+      }, 1000);
       flash(remote ? "Devices merged & synced" : "New code — current data will save to it");
       setSyncModal(false);
     } catch (e) {
@@ -1316,6 +1364,56 @@ If their words suggest crisis, self-harm, or hopelessness beyond normal job-sear
           </SwipeRow>
         ))}
       </div>
+
+      {/* support diary */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "18px 0 10px" }}>
+        <Label>🛟 Support diary — {isDesktop ? "click" : "tap"} a session to reread the advice</Label>
+        {(() => {
+          const withI = (state.supportSessions || []).map((s) => +s.intensity).filter((n) => n > 0);
+          if (withI.length < 2) return null;
+          const recent = withI.slice(0, 3);
+          const prior = withI.slice(3, 6);
+          const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+          const r = avg(recent);
+          const trend = prior.length ? (r < avg(prior) - 0.4 ? "▼ easing" : r > avg(prior) + 0.4 ? "▲ rising" : "▬ steady") : "▬";
+          const col = trend.startsWith("▼") ? C.green : trend.startsWith("▲") ? C.red : C.muted;
+          return (
+            <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: col }}>
+              AVG {r.toFixed(1)}/10 · {trend}
+            </div>
+          );
+        })()}
+      </div>
+
+      {(state.supportSessions || []).length === 0 && (
+        <div style={{ color: C.muted, fontSize: 13, padding: "12px 4px", textAlign: "center" }}>
+          No sessions yet. Every 🛟 Emotional support session saves here automatically — a diary of advice you can reread anytime.
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {(state.supportSessions || []).map((s) => (
+          <SwipeRow
+            key={s.id}
+            showX={isDesktop}
+            onTap={() => setModal({ kind: "session", entry: s })}
+            onDelete={() => mutate((st) => ({ ...st, supportSessions: st.supportSessions.filter((y) => y.id !== s.id) }), "Session deleted")}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                🛟 {s.feeling || "Support session"}
+              </div>
+              <div style={{ fontFamily: mono, fontSize: 12, color: (+s.intensity || 0) >= 8 ? C.red : C.amber, flexShrink: 0 }}>
+                {s.intensity || "–"}/10
+              </div>
+            </div>
+            <div style={{ fontSize: 12, color: C.muted, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {s.one_action || ""}
+            </div>
+            <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{s.date}</div>
+          </SwipeRow>
+        ))}
+      </div>
     </>
   );
 
@@ -1497,6 +1595,9 @@ If their words suggest crisis, self-harm, or hopelessness beyond normal job-sear
         <SupportModal
           onClose={() => setSupportOpen(false)}
           runSupport={runSupport}
+          onSaveSession={(session) =>
+            mutate((s) => ({ ...s, supportSessions: [{ id: uid(), date: today(), ...session }, ...(s.supportSessions || [])] }), "Session saved to diary")
+          }
           onLog={(entry) => {
             mutate((s) => ({ ...s, emotions: [{ id: uid(), date: today(), ...entry }, ...s.emotions] }), "Logged to Emotion Protocol");
             setSupportOpen(false);
@@ -1533,6 +1634,7 @@ function Modal({ modal, onClose, onSave }) {
     if (kind === "emotion")
       return { name: entry?.name || "", intensity: entry?.intensity ?? "", claim: entry?.claim || "", action: entry?.action || "" };
     if (kind === "decision") return { note: entry?.note || "" };
+    if (kind === "session") return {};
     if (kind === "accomplishment")
       return { text: entry?.text || "", date: entry?.date || today(), category: entry?.category || "Daily focus" };
     if (kind === "checkinDay") return { day: entry?.day ?? 1 };
@@ -1547,6 +1649,7 @@ function Modal({ modal, onClose, onSave }) {
     application: entry ? "Edit application" : "Track an application",
     emotion: entry ? "Edit protocol entry" : "Run the protocol",
     decision: entry ? "Edit decision" : "Written decision",
+    session: "Support session — reread",
     accomplishment: entry ? "Edit accomplishment" : "Log a win",
     checkinDay: "Monthly check-in day",
     runway: "Update runway numbers",
@@ -1691,6 +1794,38 @@ function Modal({ modal, onClose, onSave }) {
           <Field label="Decision, with the numbers behind it" value={f.note} onChange={set("note")} placeholder="e.g. Runway 14.2 mo — floor holds at P95K" />
         )}
 
+        {kind === "session" && entry && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+              <div style={{ fontSize: 13, color: C.muted, fontStyle: "italic", lineHeight: 1.5 }}>"{entry.feeling || "Support session"}"</div>
+              <div style={{ fontFamily: mono, fontSize: 12, color: (+entry.intensity || 0) >= 8 ? C.red : C.amber, flexShrink: 0 }}>
+                {entry.intensity || "–"}/10 · {entry.date}
+              </div>
+            </div>
+            {[
+              ["deescalate", "1 · SETTLE THE FEELING", C.blue],
+              ["reality", "2 · BACK TO REALITY — THE EVIDENCE", C.amber],
+              ["reconnect", "2 · BACK TO THE GOAL", C.amber],
+              ["achievements", "3 · YOUR TRACK RECORD", C.green],
+              ["forward", "4 · YOUR WILL, AND THE BETTER FUTURE", C.blue],
+            ].map(
+              ([k, label, col]) =>
+                entry[k] && (
+                  <div key={k}>
+                    <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: col, marginBottom: 4 }}>{label}</div>
+                    <div style={{ fontSize: 13, lineHeight: 1.6 }}>{entry[k]}</div>
+                  </div>
+                )
+            )}
+            {entry.one_action && (
+              <div style={{ background: C.bg, border: `1px solid ${C.green}`, borderRadius: 10, padding: "10px 12px" }}>
+                <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.green, marginBottom: 4 }}>5 · THE ONE ACTION</div>
+                <div style={{ fontSize: 13, lineHeight: 1.6, fontWeight: 700 }}>{entry.one_action}</div>
+              </div>
+            )}
+          </div>
+        )}
+
         {kind === "accomplishment" && (
           <>
             <Field label="What you accomplished" value={f.text} onChange={set("text")} placeholder="e.g. Sent 3 warm outreaches to fintech design leads" />
@@ -1718,8 +1853,14 @@ function Modal({ modal, onClose, onSave }) {
         )}
 
         <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
-          <Btn ghost onClick={onClose} style={{ flex: 1 }}>Cancel</Btn>
-          <Btn onClick={save} style={{ flex: 2 }}>Save</Btn>
+          {kind === "session" ? (
+            <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
+          ) : (
+            <>
+              <Btn ghost onClick={onClose} style={{ flex: 1 }}>Cancel</Btn>
+              <Btn onClick={save} style={{ flex: 2 }}>Save</Btn>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -1779,18 +1920,31 @@ function SyncModal({ currentKey, onClose, onSwitch, flash }) {
 
 
 /* ---------- emotional support modal (centered, on demand) ---------- */
-function SupportModal({ onClose, runSupport, onLog }) {
+const SUPPORT_BLOCKS = [
+  ["deescalate", "1 · SETTLE THE FEELING", C.blue],
+  ["reality", "2 · BACK TO REALITY — THE EVIDENCE", C.amber],
+  ["reconnect", "2 · BACK TO THE GOAL", C.amber] /* legacy sessions */,
+  ["achievements", "3 · YOUR TRACK RECORD", C.green],
+  ["forward", "4 · YOUR WILL, AND THE BETTER FUTURE", C.blue],
+];
+
+function SupportModal({ onClose, runSupport, onLog, onSaveSession }) {
   const [feeling, setFeeling] = useState("");
   const [intensity, setIntensity] = useState("");
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const savedRef = useRef(false);
 
   const FALLBACK = {
     deescalate:
       "Pause. Breathe in for 4, out for 6 — five times. The long exhale is what tells your nervous system the threat is not physical. This wave crests and passes within minutes if you don't re-feed it with new anxious thoughts. Let it crest.",
-    reconnect:
-      "Nothing about the numbers changed in the last hour. The runway is what it was this morning. The pipeline is what the tracker says — not what the fear says. Rejection at ~95% of cold applications is the statistical default for everyone, including excellent candidates.",
+    reality:
+      "Nothing about the numbers changed in the last hour. The runway is what it was this morning. The pipeline is what the tracker says — not what the fear says. Rejection at ~95% of cold applications is the statistical default for everyone, including excellent candidates. The feeling is real; its claim is testable — and the tracker is the test.",
+    achievements:
+      "Open your History tab right now and read three items out loud. Those are documented facts you produced — not opinions, not luck. A person with that list is demonstrably capable of executing this search.",
+    forward:
+      "The way out of this situation is the process you already built: every application, follow-up, and finished focus item compounds. You are not waiting for a better future — you are constructing it in trackable increments, on a runway measured in months, not days.",
     one_action:
       "Write the feeling and the claim it's making in your Emotion Protocol — one sentence each. That's the whole task for the next 10 minutes.",
   };
@@ -1798,12 +1952,19 @@ function SupportModal({ onClose, runSupport, onLog }) {
   const go = async () => {
     setBusy(true);
     setErr("");
+    let r;
     try {
-      const r = await runSupport(feeling, intensity);
-      setResult(r && r.deescalate ? r : FALLBACK);
+      const got = await runSupport(feeling, intensity);
+      r = got && got.deescalate ? got : FALLBACK;
     } catch (e) {
-      setResult(FALLBACK);
+      r = FALLBACK;
       setErr("Coach unreachable — showing the built-in protocol instead.");
+    }
+    setResult(r);
+    /* the diary: every session is saved automatically */
+    if (!savedRef.current) {
+      savedRef.current = true;
+      onSaveSession({ feeling, intensity, ...r });
     }
     setBusy(false);
   };
@@ -1817,14 +1978,14 @@ function SupportModal({ onClose, runSupport, onLog }) {
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        style={{ width: "100%", maxWidth: 440, maxHeight: "82vh", overflowY: "auto", background: C.panel, border: `1px solid ${C.blue}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+        style={{ width: "100%", maxWidth: 460, maxHeight: "84vh", overflowY: "auto", background: C.panel, border: `1px solid ${C.blue}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
       >
         <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 4 }}>🛟 Emotional support</div>
 
         {!result && (
           <>
             <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 14 }}>
-              First we settle the feeling, then we come back to the goal, then one small step. No judgment here.
+              First we settle the feeling, then reality with evidence, your track record, the path forward — then one small step. Every session is saved to your diary in the Emotions tab.
             </div>
             <Field label="What's happening / what are you feeling?" value={feeling} onChange={setFeeling} placeholder="e.g. Got a rejection and the old belief is back" />
             <Field label="Intensity 1–10" type="number" value={intensity} onChange={setIntensity} />
@@ -1845,18 +2006,20 @@ function SupportModal({ onClose, runSupport, onLog }) {
         {result && (
           <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 8 }}>
             {err && <div style={{ fontSize: 11, color: C.muted }}>{err}</div>}
-            <div>
-              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.blue, marginBottom: 4 }}>1 · SETTLE THE FEELING</div>
-              <div style={{ fontSize: 13, lineHeight: 1.6 }}>{result.deescalate}</div>
-            </div>
-            <div>
-              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.amber, marginBottom: 4 }}>2 · BACK TO THE GOAL</div>
-              <div style={{ fontSize: 13, lineHeight: 1.6 }}>{result.reconnect}</div>
-            </div>
+            {SUPPORT_BLOCKS.map(
+              ([k, label, col]) =>
+                result[k] && (
+                  <div key={k}>
+                    <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: col, marginBottom: 4 }}>{label}</div>
+                    <div style={{ fontSize: 13, lineHeight: 1.6 }}>{result[k]}</div>
+                  </div>
+                )
+            )}
             <div style={{ background: C.bg, border: `1px solid ${C.green}`, borderRadius: 10, padding: "10px 12px" }}>
-              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.green, marginBottom: 4 }}>3 · ONE THING TO REGULATE — NEXT 10 MINUTES</div>
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.green, marginBottom: 4 }}>5 · ONE THING TO REGULATE — NEXT 10 MINUTES</div>
               <div style={{ fontSize: 13, lineHeight: 1.6, fontWeight: 700 }}>{result.one_action}</div>
             </div>
+            <div style={{ fontSize: 11, color: C.muted }}>✓ Saved to your support diary (Emotions tab)</div>
             <div style={{ display: "flex", gap: 10 }}>
               <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
               <Btn
