@@ -31,11 +31,10 @@ const C = {
   blue: "#7DB0F7",
 };
 
-const MODES = ["DASHBOARD", "PIPELINE", "FUNNEL", "EMOTIONS", "RUNWAY", "HISTORY"];
+const MODES = ["DASHBOARD", "PIPELINE", "EMOTIONS", "RUNWAY", "HISTORY"];
 const TITLES = {
   DASHBOARD: "Dashboard",
   PIPELINE: "Pipeline (CRM)",
-  FUNNEL: "Funnel Tracker",
   EMOTIONS: "Emotion Protocol",
   RUNWAY: "Runway Gauge",
   HISTORY: "Accomplishments",
@@ -87,16 +86,40 @@ const addDays = (isoDate, n) => {
 };
 
 /* ---- application status model ---- */
-const APP_STATUSES = ["applied", "followed up", "replied", "screening", "interview", "final round", "offer", "rejected"];
-const STAGE_IDX = { applied: 0, "followed up": 1, replied: 2, screening: 3, interview: 4, "final round": 5, offer: 6 };
+const APP_STATUSES = ["", "outreach", "applied", "followed up", "replied", "screening", "interview", "final round", "offer", "rejected"];
+const APP_SOURCES = ["LinkedIn", "Instagram", "Facebook", "Referral", "Job board", "Company site", "X / Twitter", "Other"];
+const OUTREACH_KINDS = ["warm", "cold"];
+const OUTREACH_CHANNELS = ["Email", "Call", "Text", "Other"];
+const STAGE_IDX = { "": -2, outreach: -1, applied: 0, "followed up": 1, replied: 2, screening: 3, interview: 4, "final round": 5, offer: 6 };
+const statusLabel = (s) => (s ? s : "Not applied yet");
+const isOutreach = (a) => a.status === "outreach";
+const isBlankStatus = (a) => !a.status;
 const isOpenApp = (a) => !["offer", "rejected"].includes(a.status);
 const reached = (a, stage) => a.status !== "rejected" && (STAGE_IDX[a.status] ?? 0) >= STAGE_IDX[stage];
 const statusColor = (s) =>
-  s === "offer" ? C.green : s === "rejected" ? C.muted : ["interview", "final round"].includes(s) ? C.amber : ["replied", "screening"].includes(s) ? C.blue : C.ink;
-const followUpOf = (a) => (a.contacted ? addDays(a.contacted, a.followUpDays ?? 7) : "");
+  s === "offer" ? C.green : s === "rejected" ? C.muted : s === "" ? C.muted : s === "outreach" ? C.blue : ["interview", "final round"].includes(s) ? C.amber : ["replied", "screening"].includes(s) ? C.blue : C.ink;
+const outreachKindColor = (k) => (k === "warm" ? C.amber : k === "cold" ? C.blue : C.muted);
+
+/* multi-step follow-ups: a.followUps = [{days, done}] counted from `contacted` */
+const DEFAULT_FOLLOWUPS = [3, 7, 14];
+const normFollowUps = (a) => {
+  if (Array.isArray(a.followUps) && a.followUps.length) return a.followUps;
+  if (a.followUpDays != null) return [{ days: +a.followUpDays || 7, done: false }];
+  return DEFAULT_FOLLOWUPS.map((d) => ({ days: d, done: false }));
+};
+/* next pending follow-up → {date, index, total} or null when all done / no contact date */
+const nextFollowUp = (a) => {
+  if (!a.contacted) return null;
+  const fus = normFollowUps(a);
+  const i = fus.findIndex((f) => !f.done);
+  if (i === -1) return null;
+  return { date: addDays(a.contacted, +fus[i].days || 0), index: i, total: fus.length };
+};
+const followUpOf = (a) => nextFollowUp(a)?.date || "";
 const isDue = (a) => {
-  const fu = followUpOf(a);
-  return fu && isOpenApp(a) && fu <= today();
+  if (isBlankStatus(a)) return false; /* not applied/reached out yet — nothing to follow up on */
+  const n = nextFollowUp(a);
+  return !!(n && isOpenApp(a) && n.date <= today());
 };
 
 /* ---- daily focus model ---- */
@@ -149,6 +172,18 @@ function migrate(saved) {
   if (!Array.isArray(s.supportSessions)) s.supportSessions = [];
   if (!s.settings || typeof s.settings !== "object") s.settings = { checkinDay: 1 };
   if (!s.settings.checkinDay) s.settings.checkinDay = 1;
+  if (!Array.isArray(s.settings.followUpDefaults) || !s.settings.followUpDefaults.length)
+    s.settings.followUpDefaults = [...DEFAULT_FOLLOWUPS];
+  /* legacy single followUpDays → followUps array; records with NO status field
+     at all (saved before this feature existed) default to "applied" so old
+     data isn't silently reclassified — but a deliberate status: "" (saved
+     for later) is left alone */
+  s.applications = s.applications.map((a) => {
+    const withStatus = a.status === undefined ? { ...a, status: "applied" } : a;
+    return Array.isArray(withStatus.followUps) && withStatus.followUps.length
+      ? withStatus
+      : { ...withStatus, followUps: normFollowUps(withStatus) };
+  });
   s.funnel = (s.funnel || []).map((w) => {
     if (Array.isArray(w.applications) && w.applications.length) {
       s.applications = [...w.applications.map((a) => ({ ...a })), ...s.applications];
@@ -281,6 +316,17 @@ async function uploadAudioWithRetry(path, blob, attempts = 3) {
     }
   }
   return false;
+}
+
+/* job-post screenshot storage */
+const shotPublicUrl = (path) => `${SUPA_URL}/storage/v1/object/public/job-posts/${path}`;
+async function uploadShot(path, file) {
+  const r = await fetch(`${SUPA_URL}/storage/v1/object/job-posts/${path}`, {
+    method: "POST",
+    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "content-type": file.type || "image/png", "x-upsert": "true" },
+    body: file,
+  });
+  if (!r.ok) throw new Error(`shot upload ${r.status}`);
 }
 
 /* ---------- supabase rpc ---------- */
@@ -428,6 +474,65 @@ function Panel({ title, children, style }) {
   );
 }
 
+/* ---------- donut analytics (pure SVG) ---------- */
+const DONUT_COLORS = ["#F5B942", "#7DB0F7", "#4ADE80", "#F87171", "#C084FC", "#34D399", "#FB923C", "#7A8699"];
+function Donut({ data, centerLabel }) {
+  const total = data.reduce((a, d) => a + d.value, 0);
+  const R = 52, SW = 22, CIRC = 2 * Math.PI * R;
+  let offset = 0;
+  return (
+    <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+      <svg width="140" height="140" viewBox="0 0 140 140" style={{ flexShrink: 0 }}>
+        <circle cx="70" cy="70" r={R} fill="none" stroke={C.bg} strokeWidth={SW} />
+        {total > 0 &&
+          data.map((d, i) => {
+            const frac = d.value / total;
+            const seg = (
+              <circle
+                key={d.label}
+                cx="70"
+                cy="70"
+                r={R}
+                fill="none"
+                stroke={DONUT_COLORS[i % DONUT_COLORS.length]}
+                strokeWidth={SW}
+                strokeDasharray={`${Math.max(frac * CIRC - 1.5, 0)} ${CIRC}`}
+                strokeDashoffset={-offset * CIRC}
+                transform="rotate(-90 70 70)"
+                style={{ transition: "stroke-dasharray 0.4s ease" }}
+              />
+            );
+            offset += frac;
+            return seg;
+          })}
+        <text x="70" y="66" textAnchor="middle" fill={C.ink} fontFamily={mono} fontSize="24" fontWeight="700">
+          {total}
+        </text>
+        <text x="70" y="84" textAnchor="middle" fill={C.muted} fontFamily={sans} fontSize="9" letterSpacing="0.14em">
+          {centerLabel}
+        </text>
+      </svg>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0, flex: 1 }}>
+        {total === 0 && <div style={{ fontSize: 12, color: C.muted }}>No applications yet — the donut fills as the pipeline grows.</div>}
+        {data
+          .filter((d) => d.value > 0)
+          .map((d) => {
+            const i = data.indexOf(d);
+            return (
+              <div key={d.label} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                <span style={{ width: 10, height: 10, borderRadius: 5, background: DONUT_COLORS[i % DONUT_COLORS.length], flexShrink: 0 }} />
+                <span style={{ color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.label}</span>
+                <span style={{ fontFamily: mono, color: C.muted, marginLeft: "auto" }}>
+                  {d.value} · {Math.round((d.value / total) * 100)}%
+                </span>
+              </div>
+            );
+          })}
+      </div>
+    </div>
+  );
+}
+
 /* ============================================================ */
 export default function FlightDeck() {
   const [state, setState] = useState(DEFAULT_STATE);
@@ -440,6 +545,7 @@ export default function FlightDeck() {
   const [toast, setToast] = useState("");
   const [syncStatus, setSyncStatus] = useState("local");
   const [pipeFilter, setPipeFilter] = useState("active");
+  const [donutMode, setDonutMode] = useState("status");
   const [historyGroup, setHistoryGroup] = useState("date");
   const [coachLoading, setCoachLoading] = useState(null);
   const [coachError, setCoachError] = useState("");
@@ -669,9 +775,9 @@ export default function FlightDeck() {
           id: null,
           week: label,
           weekStart: start || null,
-          outreach: 0,
+          outreach: 0, /* legacy manual logs, kept for old data */
           legacy: { apps: 0, replies: 0, screens: 0, interviews: 0, offers: 0 },
-          d: { apps: 0, replies: 0, screens: 0, interviews: 0, offers: 0 },
+          d: { apps: 0, outreach: 0, replies: 0, screens: 0, interviews: 0, offers: 0 },
           due: 0,
         });
       return map.get(label);
@@ -688,10 +794,13 @@ export default function FlightDeck() {
       row.legacy.offers += +w.offers || 0;
     });
     apps.forEach((a) => {
+      if (isBlankStatus(a)) return; /* saved-for-later leads aren't funnel activity yet */
       const ws = weekStartOfDate(a.contacted);
       const label = ws ? weekLabel(new Date(ws + "T00:00:00")) : "No date set";
       const row = ensure(label, ws);
-      row.d.apps += 1;
+      /* an "outreach" status is a warm outreach, not yet an application */
+      if (isOutreach(a)) row.d.outreach += 1;
+      else row.d.apps += 1;
       if (reached(a, "replied")) row.d.replies += 1;
       if (reached(a, "screening")) row.d.screens += 1;
       if (reached(a, "interview")) row.d.interviews += 1;
@@ -710,7 +819,7 @@ export default function FlightDeck() {
     const t = { apps: 0, outreach: 0, replies: 0, screens: 0, interviews: 0, offers: 0 };
     weekRows.forEach((r) => {
       t.apps += r.d.apps + r.legacy.apps;
-      t.outreach += r.outreach;
+      t.outreach += r.outreach + r.d.outreach;
       t.replies += r.d.replies + r.legacy.replies;
       t.screens += r.d.screens + r.legacy.screens;
       t.interviews += r.d.interviews + r.legacy.interviews;
@@ -735,6 +844,10 @@ export default function FlightDeck() {
 
   /* focus state */
   const focusItems = normFocus(coach.daily?.focus);
+  /* the star is dynamic: it always sits on the highest-impact item that
+     is NOT yet done, in the coach's priority order. Completing an item
+     moves it to the next one automatically. */
+  const nextImportantIdx = focusItems.findIndex((_, i) => !(coach.dailyDone || []).includes(i));
   const allFocusDone = focusItems.length > 0 && focusItems.every((_, i) => (coach.dailyDone || []).includes(i));
 
   /* ---------- coach ---------- */
@@ -745,7 +858,7 @@ export default function FlightDeck() {
         (r) =>
           `${r.week}: apps ${r.d.apps + r.legacy.apps}, outreach ${r.outreach}, replies ${r.d.replies + r.legacy.replies}, screens ${r.d.screens + r.legacy.screens}, interviews ${r.d.interviews + r.legacy.interviews}, offers ${r.d.offers + r.legacy.offers}`
       );
-    const byStatus = APP_STATUSES.map((s) => `${s}: ${apps.filter((a) => a.status === s).length}`).join(", ");
+    const byStatus = APP_STATUSES.map((s) => `${statusLabel(s)}: ${apps.filter((a) => (a.status ?? "") === s).length}`).join(", ");
     const emos = state.emotions
       .slice(0, 6)
       .map((x) => `${x.date} ${x.name || "?"} (${x.intensity || "?"}/10) claim:"${x.claim || ""}" action:"${x.action || "none"}"`);
@@ -760,6 +873,7 @@ export default function FlightDeck() {
       `Today: ${now.toDateString()}.`,
       `Runway: ${months.toFixed(1)} months (zone: ${zone.name}). Fund P${state.runway.fund}, expenses P${state.runway.expenses}/mo.`,
       `Funnel totals (derived live from pipeline): apps ${totals.apps}, outreach ${totals.outreach}, replies ${totals.replies}, screens ${totals.screens}, interviews ${totals.interviews}, offers ${totals.offers}.`,
+      `Outreach split (tags kept even after status advances): warm ${apps.filter((a) => a.outreachKind === "warm").length}, cold ${apps.filter((a) => a.outreachKind === "cold").length}, still-untagged-in-outreach ${apps.filter((a) => isOutreach(a) && !a.outreachKind).length}. Warm converts 4-10x better than cold.`,
       `Pipeline by status: ${byStatus}.`,
       `Follow-ups DUE today or overdue: ${dueList.length}${dueList.length ? " — " + dueList.slice(0, 6).map((a) => `${a.company || "unnamed"} (contacted ${a.contacted}, status ${a.status})`).join("; ") : ""}.`,
       `Recent accomplishments (completed focus items — acknowledge momentum):\n${wins.join("\n") || "none yet"}`,
@@ -801,7 +915,7 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
     setCoachError("");
     try {
       const daily = await callClaude(
-        "Give today's focus: a MAXIMUM of 3 things to do TODAY (specific and finishable today; due follow-ups by company name usually come first, then volume/quality work sized to where the funnel leaks, then any unfinished emotion-log action). EXACTLY ONE item must have key=true - the single highest-leverage action that most significantly boosts the chance of landing the job. Also give one sentence on why based on the numbers, one thing to watch (or empty string), and one grounding reminder in evidence-file style.",
+        "Give today's focus: a MAXIMUM of 3 things to do TODAY (specific and finishable today; due follow-ups by company name usually come first, then volume/quality work sized to where the funnel leaks, then any unfinished emotion-log action). ORDER the items from HIGHEST to LOWEST impact on landing the job — item 1 must be the single highest-leverage action right now. Set key=true on item 1 only. This order matters: as items get completed, the app will highlight whichever remaining item is next in this priority order, so order them exactly by true impact, not by convenience or sequence. Also give one sentence on why based on the numbers, one thing to watch (or empty string), and one grounding reminder in evidence-file style.",
         `{"focus": [{"text": "...", "key": false}, {"text": "...", "key": true}], "why": "...", "watch": "...", "reminder": "..."}`
       );
       const items = normFocus(daily.focus).slice(0, 3);
@@ -1005,21 +1119,24 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   /* ---------- mutations ---------- */
   const setAppStatus = (id, status) =>
     mutate(
-      (s) => ({ ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, status } : a)) }),
+      (s) => ({
+        ...s,
+        applications: s.applications.map((a) => {
+          if (a.id !== id) return a;
+          const wasBlank = !a.status;
+          return { ...a, status, contacted: wasBlank && status && !a.contacted ? today() : a.contacted };
+        }),
+      }),
       "Status updated — funnel recalculated"
     );
 
+  /* excel-style inline cell commit */
+  const updateAppField = (id, field, value) =>
+    mutate((s) => ({ ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
+
   const saveModal = (data) => {
     const { kind, entry } = modal;
-    if (kind === "week") {
-      mutate(
-        (s) => ({
-          ...s,
-          funnel: entry ? s.funnel.map((w) => (w.id === entry.id ? { ...w, ...data } : w)) : [{ id: uid(), ...data }, ...s.funnel],
-        }),
-        entry ? "Outreach updated" : "Outreach logged"
-      );
-    } else if (kind === "application") {
+    if (kind === "application") {
       mutate(
         (s) => ({
           ...s,
@@ -1070,8 +1187,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       );
     } else if (kind === "checkinDay") {
       mutate(
-        (s) => ({ ...s, settings: { ...s.settings, checkinDay: Math.min(28, Math.max(1, +data.day || 1)) } }),
-        "Check-in day updated"
+        (s) => ({
+          ...s,
+          settings: {
+            ...s.settings,
+            checkinDay: Math.min(28, Math.max(1, +data.day || 1)),
+            followUpDefaults: (data.followUpDefaults || [])
+              .map((d) => Math.max(0, +d || 0))
+              .filter((d) => d > 0)
+              .slice(0, 10) || DEFAULT_FOLLOWUPS,
+          },
+        }),
+        "Settings updated"
       );
     }
     setModal(null);
@@ -1136,6 +1263,56 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 700, color: col }}>{v}</div>
           </div>
         ))}
+      </div>
+
+      {/* donut analytics — by status, by source, or warm/cold outreach */}
+      <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 8, flexWrap: "wrap" }}>
+          <Label>Pipeline analytics</Label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {[
+              ["status", "By status"],
+              ["source", "Where found"],
+              ["outreach", "Warm vs cold"],
+            ].map(([k, l]) => (
+              <button
+                key={k}
+                onClick={() => setDonutMode(k)}
+                style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "5px 10px", borderRadius: 20, border: `1px solid ${donutMode === k ? C.amber : C.panelEdge}`, background: donutMode === k ? "rgba(245,185,66,0.12)" : "transparent", color: donutMode === k ? C.amber : C.muted, cursor: "pointer" }}
+              >
+                {l}
+              </button>
+            ))}
+          </div>
+        </div>
+        <Donut
+          centerLabel={donutMode === "status" ? "BY STATUS" : donutMode === "source" ? "BY SOURCE" : "OUTREACH"}
+          data={
+            donutMode === "status"
+              ? APP_STATUSES.map((s) => ({ label: statusLabel(s), value: apps.filter((a) => (a.status ?? "") === s).length }))
+              : donutMode === "source"
+              ? [...APP_SOURCES, ""].map((s) => ({
+                  label: s || "Not set",
+                  value: apps.filter((a) => (s ? a.source === s : !a.source || !APP_SOURCES.includes(a.source))).length,
+                }))
+              : [
+                  { label: "Warm", value: apps.filter((a) => a.outreachKind === "warm").length },
+                  { label: "Cold", value: apps.filter((a) => a.outreachKind === "cold").length },
+                  { label: "Untagged (in outreach)", value: apps.filter((a) => isOutreach(a) && !a.outreachKind).length },
+                ]
+          }
+        />
+        {donutMode === "outreach" && (
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
+            Warm/cold tags are kept even after status moves on (e.g. to applied). "Untagged" is only entries still sitting in outreach status. Warm converts 4–10x better than cold.
+          </div>
+        )}
+      </div>
+
+      {/* funnel tracker — fully derived from the pipeline, lives on the Dashboard now */}
+      <div style={{ marginBottom: 14 }}>
+        <Label>Funnel (auto from Pipeline)</Label>
+        <div style={{ marginTop: 8 }}>{renderFunnelSection()}</div>
       </div>
 
       {/* monthly runway check-in banner */}
@@ -1205,16 +1382,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
               {focusItems.map((f, i) => {
                 const done = (coach.dailyDone || []).includes(i);
+                const isNext = i === nextImportantIdx && !done;
                 return (
                   <div
                     key={i}
                     onClick={() => setCoach((p) => ({ ...p, dailyDone: done ? p.dailyDone.filter((d) => d !== i) : [...p.dailyDone, i] }))}
-                    style={{ display: "flex", gap: 10, alignItems: "flex-start", background: C.bg, border: `1px solid ${done ? C.green : f.key ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer" }}
+                    style={{ display: "flex", gap: 10, alignItems: "flex-start", background: C.bg, border: `1px solid ${done ? C.green : isNext ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer", transition: "border-color 0.25s ease" }}
                   >
-                    <div style={{ fontFamily: mono, fontSize: 14, color: done ? C.green : C.amber, lineHeight: 1.4 }}>{done ? "◉" : "○"}</div>
+                    <div style={{ fontFamily: mono, fontSize: 14, color: done ? C.green : isNext ? C.amber : C.muted, lineHeight: 1.4 }}>{done ? "◉" : "○"}</div>
                     <div style={{ minWidth: 0 }}>
-                      {f.key && (
-                        <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.18em", color: C.amber, marginBottom: 2 }}>★ HIGHEST LEVERAGE</div>
+                      {isNext && (
+                        <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.18em", color: C.amber, marginBottom: 2 }}>★ DO THIS NEXT — HIGHEST IMPACT</div>
                       )}
                       <div style={{ fontSize: 14, lineHeight: 1.45, textDecoration: done ? "line-through" : "none", color: done ? C.muted : C.ink }}>{f.text}</div>
                     </div>
@@ -1404,12 +1582,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   const renderPipeline = () => {
     const filters = [
       { key: "active", label: `Active (${apps.filter(isOpenApp).length})` },
+      { key: "blank", label: `◻ Saved for later (${apps.filter(isBlankStatus).length})` },
       { key: "due", label: `⚑ Due (${dueList.length})` },
       { key: "closed", label: `Closed (${apps.filter((a) => !isOpenApp(a)).length})` },
       { key: "all", label: `All (${apps.length})` },
     ];
     const shown = apps
-      .filter((a) => (pipeFilter === "due" ? isDue(a) : pipeFilter === "active" ? isOpenApp(a) : pipeFilter === "closed" ? !isOpenApp(a) : true))
+      .filter((a) =>
+        pipeFilter === "due"
+          ? isDue(a)
+          : pipeFilter === "blank"
+          ? isBlankStatus(a)
+          : pipeFilter === "active"
+          ? isOpenApp(a)
+          : pipeFilter === "closed"
+          ? !isOpenApp(a)
+          : true
+      )
       .slice()
       .sort((a, b) => (b.contacted || "").localeCompare(a.contacted || ""));
 
@@ -1448,57 +1637,134 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             onTouchEnd={(e) => e.stopPropagation()}
             style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}
           >
-            <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 720 }}>
+            <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 900 }}>
               <thead>
                 <tr>
                   <th style={th}>Company</th>
-                  <th style={th}>Contact</th>
+                  <th style={th}>Source</th>
+                  <th style={th}>Post</th>
+                  <th style={th}>Salary / offer</th>
                   <th style={th}>Status</th>
                   <th style={th}>Contacted</th>
                   <th style={th}>Follow-up</th>
-                  <th style={th}>Info</th>
-                  <th style={{ ...th, width: 34 }}></th>
+                  <th style={{ ...th, width: 66 }}></th>
                 </tr>
               </thead>
               <tbody>
                 {shown.map((a) => {
-                  const fu = followUpOf(a);
+                  const nf = nextFollowUp(a);
                   const due = isDue(a);
+                  const fus = normFollowUps(a);
+                  const doneCount = fus.filter((x) => x.done).length;
+                  /* excel-style inline cell (desktop): uncontrolled, commits on blur/Enter */
+                  const cellInput = (field, opts = {}) => (
+                    <input
+                      key={a.id + field + String(a[field] ?? "")}
+                      defaultValue={a[field] ?? ""}
+                      type={opts.type || "text"}
+                      placeholder={opts.ph || "—"}
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") e.currentTarget.blur();
+                      }}
+                      onBlur={(e) => {
+                        const v = e.target.value;
+                        if (v !== (a[field] ?? "")) updateAppField(a.id, field, v);
+                      }}
+                      style={{ width: "100%", minWidth: opts.w || 90, boxSizing: "border-box", fontSize: 16, fontFamily: opts.mono ? mono : sans, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.ink, padding: "4px 6px", outline: "none" }}
+                      onFocus={(e) => (e.target.style.border = `1px solid ${C.blue}`)}
+                    />
+                  );
                   return (
                     <tr
                       key={a.id}
-                      onClick={() => setModal({ kind: "application", entry: a })}
-                      style={{ cursor: "pointer", background: due ? "rgba(248,113,113,0.06)" : "transparent" }}
+                      onClick={() => (isDesktop ? null : setModal({ kind: "application", entry: a }))}
+                      style={{ cursor: isDesktop ? "default" : "pointer", background: due ? "rgba(248,113,113,0.06)" : "transparent" }}
                     >
-                      <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent" }}>
-                        {a.company || "Unnamed"}
+                      <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 150 }}>
+                        {isDesktop ? cellInput("company", { ph: "Company" }) : a.company || "Unnamed"}
+                        {a.website && (
+                          <a href={a.website.startsWith("http") ? a.website : "https://" + a.website} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} style={{ color: C.blue, fontSize: 11, textDecoration: "none", display: "block", padding: "0 6px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160 }}>
+                            ↗ {a.website.replace(/^https?:\/\//, "")}
+                          </a>
+                        )}
                       </td>
-                      <td style={{ ...td, color: C.muted }}>
-                        {a.contact || "—"}
-                        {a.email ? <div style={{ fontFamily: mono, fontSize: 11 }}>{a.email}</div> : null}
+                      <td style={td} onClick={(e) => e.stopPropagation()}>
+                        {isDesktop ? (
+                          <select
+                            value={a.source || ""}
+                            onChange={(e) => updateAppField(a.id, "source", e.target.value)}
+                            style={{ fontSize: 16, fontFamily: sans, background: "transparent", color: a.source ? C.ink : C.muted, border: `1px solid transparent`, borderRadius: 6, padding: "4px 2px", outline: "none", maxWidth: 120 }}
+                          >
+                            <option value="">—</option>
+                            {APP_SOURCES.map((s) => (
+                              <option key={s} value={s} style={{ background: C.panel }}>
+                                {s}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span style={{ fontSize: 12, color: a.source ? C.ink : C.muted }}>{a.source || "—"}</span>
+                        )}
+                      </td>
+                      <td style={td} onClick={(e) => e.stopPropagation()}>
+                        {a.postLink ? (
+                          <a href={a.postLink.startsWith("http") ? a.postLink : "https://" + a.postLink} target="_blank" rel="noreferrer" style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
+                            🔗 link
+                          </a>
+                        ) : a.postShot ? (
+                          <a href={shotPublicUrl(a.postShot)} target="_blank" rel="noreferrer" style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
+                            🖼 shot
+                          </a>
+                        ) : (
+                          <span style={{ color: C.muted, fontSize: 12 }}>—</span>
+                        )}
+                      </td>
+                      <td style={{ ...td, minWidth: 110 }} onClick={(e) => e.stopPropagation()}>
+                        {isDesktop ? cellInput("salary", { ph: "₱ / $", mono: true, w: 110 }) : <span style={{ fontFamily: mono, fontSize: 12, color: a.salary ? C.ink : C.muted }}>{a.salary || "—"}</span>}
                       </td>
                       <td style={td} onClick={(e) => e.stopPropagation()}>
                         <select
-                          value={a.status || "applied"}
+                          value={a.status ?? ""}
                           onChange={(e) => setAppStatus(a.id, e.target.value)}
                           style={{ fontSize: 16, fontFamily: mono, background: C.bg, color: statusColor(a.status), border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "4px 6px", outline: "none" }}
                         >
                           {APP_STATUSES.map((s) => (
-                            <option key={s} value={s}>
-                              {s}
+                            <option key={s || "blank"} value={s}>
+                              {statusLabel(s)}
                             </option>
                           ))}
                         </select>
+                        {a.outreachKind && (
+                          <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.1em", color: outreachKindColor(a.outreachKind), marginTop: 4, textTransform: "uppercase" }}>
+                            {a.outreachKind}{a.outreachChannel ? ` · ${a.outreachChannel}` : ""}
+                          </div>
+                        )}
                       </td>
-                      <td style={{ ...td, fontFamily: mono, fontSize: 12, color: C.muted, whiteSpace: "nowrap" }}>{a.contacted || "—"}</td>
-                      <td style={{ ...td, fontFamily: mono, fontSize: 12, whiteSpace: "nowrap", color: due ? C.red : C.muted }}>
-                        {fu || "—"}
-                        {due ? " ⚑" : ""}
+                      <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
+                        {isDesktop ? (
+                          <input
+                            key={a.id + "contacted" + (a.contacted || "")}
+                            type="date"
+                            defaultValue={a.contacted || ""}
+                            onChange={(e) => updateAppField(a.id, "contacted", e.target.value)}
+                            style={{ fontSize: 16, fontFamily: mono, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.muted, padding: "4px 2px", outline: "none", colorScheme: "dark" }}
+                          />
+                        ) : (
+                          <span style={{ fontFamily: mono, fontSize: 12, color: C.muted }}>{a.contacted || "—"}</span>
+                        )}
                       </td>
-                      <td style={{ ...td, fontSize: 11, color: C.muted, maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {[a.notes, ...(a.custom || []).map((c) => `${c.k}: ${c.v}`)].filter(Boolean).join(" · ") || "—"}
+                      <td style={{ ...td, fontFamily: mono, fontSize: 12, whiteSpace: "nowrap", color: due ? C.red : nf ? C.muted : C.green }}>
+                        {nf ? `${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}
                       </td>
-                      <td style={td} onClick={(e) => e.stopPropagation()}>
+                      <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => setModal({ kind: "application", entry: a })}
+                          title="Open full editor (notes, follow-ups, screenshot)"
+                          style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.blue, fontSize: 12, lineHeight: "22px", cursor: "pointer", padding: 0, marginRight: 6 }}
+                        >
+                          ▸
+                        </button>
                         <button
                           onClick={() => mutate((s) => ({ ...s, applications: s.applications.filter((x) => x.id !== a.id) }), "Application deleted")}
                           title="Delete"
@@ -1515,13 +1781,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         )}
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
-          Changing a status here updates the Funnel numbers and weekly rows instantly.
+          {isDesktop
+            ? "Edit cells directly like a spreadsheet (Enter or click away to save) · ▸ opens the full editor · status changes update the Funnel instantly."
+            : "Tap a row to edit · status changes update the Funnel instantly."}
         </div>
       </>
     );
   };
 
-  const renderFunnel = () => (
+  const renderFunnelSection = () => (
     <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 14 }}>
         {[
@@ -1539,40 +1807,24 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         ))}
       </div>
       <div style={{ fontSize: 11, color: C.muted, margin: "-6px 0 12px" }}>
-        Auto-computed from the Pipeline. Only outreach is logged manually.
+        Fully automatic from the Pipeline — set an entry's status to "outreach" to count it there instead of Apps.
       </div>
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-        <Label>Weeks (Mon–Sat)</Label>
-        <Btn onClick={() => setModal({ kind: "week", entry: null })}>+ Log outreach</Btn>
-      </div>
+      <Label>Weeks (Mon–Sat)</Label>
 
       {weekRows.length === 0 && (
-        <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
-          Track applications in the Pipeline and log weekly outreach — the funnel builds itself.
+        <div style={{ color: C.muted, fontSize: 14, padding: "20px 4px", textAlign: "center" }}>
+          Track applications and outreach in the Pipeline — the funnel builds itself.
         </div>
       )}
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
         {weekRows.map((r) => {
           const a = r.d.apps + r.legacy.apps;
-          const onPace = a >= 8 && r.outreach >= 20;
-          const manualLog = r.id ? state.funnel.find((w) => w.id === r.id) : null;
+          const o = r.outreach + r.d.outreach;
+          const onPace = a >= 8 && o >= 20;
           return (
-            <SwipeRow
-              key={r.week}
-              showX={isDesktop && !!manualLog}
-              onTap={() =>
-                manualLog
-                  ? setModal({ kind: "week", entry: manualLog })
-                  : setModal({ kind: "week", entry: null, presetWeek: { week: r.week, weekStart: r.weekStart } })
-              }
-              onDelete={() =>
-                manualLog
-                  ? mutate((s) => ({ ...s, funnel: s.funnel.filter((x) => x.id !== manualLog.id) }), "Outreach log deleted")
-                  : flash("This row is derived from the Pipeline")
-              }
-            >
+            <div key={r.week} style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div style={{ fontWeight: 700, fontSize: 14 }}>{r.week}</div>
                 <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.1em", color: onPace ? C.green : C.amber }}>
@@ -1580,18 +1832,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </div>
               </div>
               <div style={{ fontFamily: mono, fontSize: 12, color: C.muted, marginTop: 6 }}>
-                A {a} · O {r.outreach} · R {r.d.replies + r.legacy.replies} · S {r.d.screens + r.legacy.screens} · I{" "}
+                A {a} · O {o} · R {r.d.replies + r.legacy.replies} · S {r.d.screens + r.legacy.screens} · I{" "}
                 {r.d.interviews + r.legacy.interviews} · OF {r.d.offers + r.legacy.offers}
               </div>
-              <div style={{ display: "flex", gap: 10, marginTop: 6, alignItems: "center" }}>
-                <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.blue }}>▸ AUTO FROM PIPELINE</div>
-                {r.due > 0 && (
-                  <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.red }}>
-                    ⚑ {r.due} FOLLOW-UP{r.due === 1 ? "" : "S"} DUE
-                  </div>
-                )}
-              </div>
-            </SwipeRow>
+              {r.due > 0 && (
+                <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.red, marginTop: 6 }}>
+                  ⚑ {r.due} FOLLOW-UP{r.due === 1 ? "" : "S"} DUE
+                </div>
+              )}
+            </div>
           );
         })}
       </div>
@@ -1726,7 +1975,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay } })}
         style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 14px", marginBottom: 14, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
       >
-        <div style={{ fontSize: 13, color: C.muted }}>Monthly check-in day ({isDesktop ? "click" : "tap"} to change)</div>
+        <div style={{ fontSize: 13, color: C.muted }}>Settings: check-in day & follow-up defaults</div>
         <div style={{ fontFamily: mono, fontSize: 14, color: C.amber, fontWeight: 700 }}>
           Day {checkinDay}{state.lastCheckinMonth === thisMonth() ? " · ✓ done this month" : checkinDue ? " · ⚠ due" : ""}
         </div>
@@ -1759,7 +2008,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     </>
   );
 
-  const SECTIONS = { DASHBOARD: renderDashboard, PIPELINE: renderPipeline, FUNNEL: renderFunnel, EMOTIONS: renderEmotions, RUNWAY: renderRunway, HISTORY: renderHistory };
+  const SECTIONS = { DASHBOARD: renderDashboard, PIPELINE: renderPipeline, EMOTIONS: renderEmotions, RUNWAY: renderRunway, HISTORY: renderHistory };
 
   if (!loaded)
     return (
@@ -1808,6 +2057,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
+            <Btn ghost onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay } })} title="Settings" style={{ padding: "10px 12px" }}>
+              ⚙
+            </Btn>
             <Btn ghost onClick={() => setSyncModal(true)} title="Sync across devices" style={{ padding: "10px 12px" }}>
               ⇅
             </Btn>
@@ -1817,24 +2069,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         </div>
 
-        {/* mobile mode dots */}
-        {!isDesktop && (
-          <div style={{ display: "flex", gap: 6, margin: "10px 0 14px" }}>
-            {MODES.map((m, i) => (
-              <div
-                key={m}
-                onClick={() => setMode(i)}
-                style={{ height: 4, flex: 1, borderRadius: 2, background: i === mode ? C.amber : C.panelEdge, transition: "background 0.2s", cursor: "pointer" }}
-              />
-            ))}
-          </div>
-        )}
+        {/* mobile: content area (tab bar is fixed at bottom) */}
+        {!isDesktop && <div style={{ height: 6 }} />}
 
         {/* content */}
         {isDesktop ? (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, alignItems: "start", marginTop: 18, flex: 1 }}>
-            <Panel title="◈ DASHBOARD">{renderDashboard()}</Panel>
-            <Panel title="◈ FUNNEL TRACKER">{renderFunnel()}</Panel>
+            <Panel title="◈ DASHBOARD" style={{ gridColumn: "1 / -1" }}>
+              {renderDashboard()}
+            </Panel>
             <Panel title="◈ PIPELINE — ALL APPLICATIONS" style={{ gridColumn: "1 / -1" }}>
               {renderPipeline()}
             </Panel>
@@ -1849,17 +2092,64 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         )}
 
         {/* footer */}
-        <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center", marginTop: 16 }}>
-          {!isDesktop && <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.2em", color: C.muted }}>← SWIPE TO SWITCH MODE →</div>}
+        <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center", marginTop: 16, paddingBottom: isDesktop ? 0 : 74 }}>
           <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.15em", color: syncStatus === "synced" ? C.green : syncStatus === "saving" ? C.amber : C.muted }}>
             {syncStatus === "synced" ? "● SYNCED" : syncStatus === "saving" ? "◌ SAVING" : "○ LOCAL ONLY"}
           </div>
         </div>
       </div>
 
+      {/* mobile bottom tab bar — tap any mode directly (swipe still works) */}
+      {!isDesktop && (
+        <div
+          style={{
+            position: "fixed",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(14,20,32,0.96)",
+            backdropFilter: "blur(10px)",
+            borderTop: `1px solid ${C.panelEdge}`,
+            display: "flex",
+            paddingBottom: "env(safe-area-inset-bottom, 0px)",
+            zIndex: 40,
+          }}
+        >
+          {[
+            ["⌂", "Home", 0],
+            ["▦", "CRM", 1, dueList.length],
+            ["♡", "Mind", 2],
+            ["⛽", "Fuel", 3],
+            ["★", "Wins", 4],
+          ].map(([icon, label, i, badge]) => (
+            <button
+              key={label}
+              onClick={() => setMode(i)}
+              style={{
+                flex: 1,
+                background: "transparent",
+                border: "none",
+                padding: "9px 0 7px",
+                cursor: "pointer",
+                color: mode === i ? C.amber : C.muted,
+                position: "relative",
+              }}
+            >
+              <div style={{ fontSize: 17, lineHeight: 1 }}>{icon}</div>
+              <div style={{ fontFamily: sans, fontSize: 9, letterSpacing: "0.06em", marginTop: 3, fontWeight: mode === i ? 800 : 600 }}>{label}</div>
+              {badge > 0 && (
+                <div style={{ position: "absolute", top: 4, left: "50%", marginLeft: 8, minWidth: 15, height: 15, borderRadius: 8, background: C.red, color: "#2b0b0b", fontFamily: mono, fontSize: 9, fontWeight: 800, lineHeight: "15px", padding: "0 3px" }}>
+                  {badge}
+                </div>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* toast */}
       {toast && (
-        <div style={{ position: "fixed", bottom: "calc(env(safe-area-inset-bottom, 0px) + 24px)", left: "50%", transform: "translateX(-50%)", background: C.panelEdge, color: C.ink, fontSize: 13, fontWeight: 600, padding: "8px 18px", borderRadius: 20, zIndex: 60 }}>
+        <div style={{ position: "fixed", bottom: `calc(env(safe-area-inset-bottom, 0px) + ${isDesktop ? 24 : 84}px)`, left: "50%", transform: "translateX(-50%)", background: C.panelEdge, color: C.ink, fontSize: 13, fontWeight: 600, padding: "8px 18px", borderRadius: 20, zIndex: 60 }}>
           {toast}
         </div>
       )}
@@ -1867,7 +2157,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={modal}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, syncKey: syncKeyRef.current }}
           onClose={() => setModal(null)}
           onSave={saveModal}
         />
@@ -1899,25 +2189,25 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 }
 /* ---------- edit modal (centered) ---------- */
 function Modal({ modal, onClose, onSave }) {
-  const { kind, entry, presetWeek } = modal;
-  const opts = weekOptions();
-  const initialWeek = entry?.week || presetWeek?.week || opts[1]?.label || opts[0].label;
-  const [customWeek, setCustomWeek] = useState(() => kind === "week" && initialWeek && !opts.some((o) => o.label === initialWeek));
+  const { kind, entry } = modal;
   const [f, setF] = useState(() => {
-    if (kind === "week")
-      return {
-        week: initialWeek,
-        weekStart: entry?.weekStart || presetWeek?.weekStart || opts.find((o) => o.label === initialWeek)?.start || null,
-        outreach: entry?.outreach ?? "",
-      };
     if (kind === "application")
       return {
         company: entry?.company || "",
+        website: entry?.website || "",
+        source: entry?.source || "",
+        postLink: entry?.postLink || "",
+        postShot: entry?.postShot || "",
+        salary: entry?.salary || "",
         contact: entry?.contact || "",
         email: entry?.email || "",
-        contacted: entry?.contacted || today(),
-        followUpDays: entry?.followUpDays ?? 7,
-        status: entry?.status || "applied",
+        contacted: entry?.contacted || "",
+        followUps: entry
+          ? normFollowUps(entry).map((f) => ({ ...f }))
+          : (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map((d) => ({ days: d, done: false })),
+        status: entry ? entry.status || "applied" : "",
+        outreachKind: entry?.outreachKind || "",
+        outreachChannel: entry?.outreachChannel || "",
         notes: entry?.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
       };
@@ -1927,29 +2217,33 @@ function Modal({ modal, onClose, onSave }) {
     if (kind === "session") return {};
     if (kind === "accomplishment")
       return { text: entry?.text || "", date: entry?.date || today(), category: entry?.category || "Daily focus" };
-    if (kind === "checkinDay") return { day: entry?.day ?? 1 };
+    if (kind === "checkinDay")
+      return { day: entry?.day ?? 1, followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String) };
     return { fund: entry?.fund ?? "", expenses: entry?.expenses ?? "" };
   });
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
+  const [shotBusy, setShotBusy] = useState(false);
+  const [shotErr, setShotErr] = useState("");
 
   const selectStyle = { ...inputStyle, appearance: "none" };
 
   const titles = {
-    week: entry ? "Edit weekly outreach" : "Log weekly outreach",
     application: entry ? "Edit application" : "Track an application",
     emotion: entry ? "Edit protocol entry" : "Run the protocol",
     decision: entry ? "Edit decision" : "Written decision",
     session: "Support session — reread",
     accomplishment: entry ? "Edit accomplishment" : "Log a win",
-    checkinDay: "Monthly check-in day",
+    checkinDay: "Settings — check-in & follow-ups",
     runway: "Update runway numbers",
   };
 
-  const followUpDate = kind === "application" ? addDays(f.contacted, f.followUpDays) : "";
-
   const save = () => {
     if (kind === "application") {
-      onSave({ ...f, custom: (f.custom || []).filter((c) => c.k || c.v) });
+      onSave({
+        ...f,
+        followUps: (f.followUps || []).map((x) => ({ days: Math.max(0, +x.days || 0), done: !!x.done })),
+        custom: (f.custom || []).filter((c) => c.k || c.v),
+      });
     } else {
       onSave(f);
     }
@@ -1968,76 +2262,205 @@ function Modal({ modal, onClose, onSave }) {
       >
         <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 14 }}>{titles[kind]}</div>
 
-        {kind === "week" && (
-          <>
-            <div style={{ marginBottom: 12 }}>
-              <Label>Week (Monday – Saturday)</Label>
-              {!customWeek ? (
-                <select
-                  value={opts.some((o) => o.label === f.week) ? f.week : "__custom__"}
-                  onChange={(e) => {
-                    if (e.target.value === "__custom__") setCustomWeek(true);
-                    else {
-                      const o = opts.find((x) => x.label === e.target.value);
-                      setF((p) => ({ ...p, week: o.label, weekStart: o.start }));
-                    }
-                  }}
-                  style={selectStyle}
-                >
-                  {opts.map((o) => (
-                    <option key={o.label} value={o.label}>
-                      {o.label}
-                    </option>
-                  ))}
-                  <option value="__custom__">Custom…</option>
-                </select>
-              ) : (
-                <div style={{ display: "flex", gap: 8 }}>
-                  <input
-                    value={f.week}
-                    placeholder="e.g. Jul 6 – Jul 11"
-                    onChange={(e) => setF((p) => ({ ...p, week: e.target.value, weekStart: null }))}
-                    style={{ ...inputStyle, flex: 1 }}
-                  />
-                  <Btn ghost onClick={() => setCustomWeek(false)} style={{ padding: "10px 12px" }}>
-                    List
-                  </Btn>
-                </div>
-              )}
-            </div>
-            <Field label="Warm outreaches this week (target 20–25)" type="number" value={f.outreach} onChange={set("outreach")} />
-            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
-              Applications, replies, screens, interviews, and offers are counted automatically from the Pipeline — track each company there.
-            </div>
-          </>
-        )}
-
         {kind === "application" && (
           <>
             <Field label="Company name" value={f.company} onChange={set("company")} placeholder="e.g. Acme SaaS Inc." />
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <Field label="Contact person" value={f.contact} onChange={set("contact")} placeholder="e.g. Jane Cruz" />
-              <Field label="Email" value={f.email} onChange={set("email")} placeholder="jane@acme.com" />
-              <Field label="Date contacted" type="date" value={f.contacted} onChange={set("contacted")} />
-              <Field label="Follow up in (days)" type="number" value={f.followUpDays} onChange={set("followUpDays")} />
-            </div>
-            {followUpDate && (
-              <div style={{ fontFamily: mono, fontSize: 12, color: followUpDate <= today() ? C.red : C.green, margin: "-4px 0 12px" }}>
-                ⚑ Follow-up date: {followUpDate}
-                {followUpDate <= today() ? " — DUE" : ""}
-              </div>
-            )}
+            <Field label="Company website" value={f.website} onChange={set("website")} placeholder="https://acme.com" />
             <div style={{ marginBottom: 12 }}>
-              <Label>Status (drives the funnel numbers)</Label>
-              <select value={f.status} onChange={(e) => set("status")(e.target.value)} style={selectStyle}>
-                {APP_STATUSES.map((s) => (
+              <Label>Where did you find the job post?</Label>
+              <select value={f.source} onChange={(e) => set("source")(e.target.value)} style={selectStyle}>
+                <option value="">— select source —</option>
+                {APP_SOURCES.map((s) => (
                   <option key={s} value={s}>
                     {s}
                   </option>
                 ))}
               </select>
             </div>
-            <Field label="Notes" value={f.notes} onChange={set("notes")} placeholder="role, salary range, next step…" />
+            <Field label="Link to the job post" value={f.postLink} onChange={set("postLink")} placeholder="https://linkedin.com/jobs/…" />
+            <div style={{ marginBottom: 12 }}>
+              <Label>…or upload a screenshot of the post</Label>
+              {f.postShot ? (
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <a href={shotPublicUrl(f.postShot)} target="_blank" rel="noreferrer" style={{ flex: 1 }}>
+                    <img src={shotPublicUrl(f.postShot)} alt="job post" style={{ width: "100%", maxHeight: 140, objectFit: "cover", borderRadius: 10, border: `1px solid ${C.panelEdge}` }} />
+                  </a>
+                  <button
+                    onClick={() => set("postShot")("")}
+                    style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, height: 40, cursor: "pointer", flexShrink: 0 }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    disabled={shotBusy}
+                    onChange={async (e) => {
+                      const file = e.target.files && e.target.files[0];
+                      if (!file) return;
+                      if (file.size > 5 * 1024 * 1024) {
+                        setShotErr("Image too large (max 5MB).");
+                        return;
+                      }
+                      setShotBusy(true);
+                      setShotErr("");
+                      try {
+                        const ext = (file.name.split(".").pop() || "png").toLowerCase().slice(0, 5);
+                        const p = `${modal.syncKey || "shared"}/${uid()}-${Date.now()}.${ext}`;
+                        await uploadShot(p, file);
+                        set("postShot")(p);
+                      } catch (err) {
+                        setShotErr("Upload failed — check connection and retry.");
+                      }
+                      setShotBusy(false);
+                    }}
+                    style={{ ...inputStyle, padding: "8px 12px" }}
+                  />
+                  {shotBusy && <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>Uploading…</div>}
+                  {shotErr && <div style={{ fontSize: 12, color: C.red, marginTop: 4 }}>{shotErr}</div>}
+                </>
+              )}
+            </div>
+            <Field label="Salary / offer" value={f.salary} onChange={set("salary")} placeholder="e.g. ₱120K–150K/mo or $1,800/mo" />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <Field label="Contact person" value={f.contact} onChange={set("contact")} placeholder="e.g. Jane Cruz" />
+              <Field label="Email" value={f.email} onChange={set("email")} placeholder="jane@acme.com" />
+            </div>
+            <Field label="Date contacted / applied" type="date" value={f.contacted} onChange={set("contacted")} />
+
+            <Label>Follow-up schedule (days after contact)</Label>
+            {(f.followUps || []).map((fu, i) => {
+              const d = f.contacted ? addDays(f.contacted, +fu.days || 0) : "";
+              const due = d && !fu.done && d <= today();
+              return (
+                <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
+                  <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, width: 78, flexShrink: 0 }}>Follow-up {i + 1}</div>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    value={fu.days}
+                    onChange={(e) =>
+                      setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, days: e.target.value } : x)) }))
+                    }
+                    style={{ ...inputStyle, width: 72, fontFamily: mono, flexShrink: 0, padding: "8px 10px" }}
+                  />
+                  <div style={{ fontFamily: mono, fontSize: 11, color: fu.done ? C.green : due ? C.red : C.muted, flex: 1, overflow: "hidden", whiteSpace: "nowrap" }}>
+                    {d || "—"}
+                    {fu.done ? " ✓" : due ? " ⚑ DUE" : ""}
+                  </div>
+                  <button
+                    onClick={() =>
+                      setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, done: !x.done } : x)) }))
+                    }
+                    title={fu.done ? "Mark not done" : "Mark done"}
+                    style={{ background: "transparent", border: `1px solid ${fu.done ? C.green : C.panelEdge}`, color: fu.done ? C.green : C.muted, borderRadius: 10, width: 34, height: 34, cursor: "pointer", flexShrink: 0 }}
+                  >
+                    ✓
+                  </button>
+                  <button
+                    onClick={() => setF((p) => ({ ...p, followUps: p.followUps.filter((_, j) => j !== i) }))}
+                    style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 34, height: 34, cursor: "pointer", flexShrink: 0 }}
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+            <button
+              onClick={() => setF((p) => ({ ...p, followUps: [...(p.followUps || []), { days: (+(p.followUps?.slice(-1)[0]?.days) || 7) + 7, done: false }] }))}
+              style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 12 }}
+            >
+              + Add follow-up
+            </button>
+
+            <div style={{ marginBottom: 12 }}>
+              <Label>Status ("outreach" counts toward Outreach, not Apps)</Label>
+              <select
+                value={f.status}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setF((p) => ({ ...p, status: v, contacted: !p.status && v && !p.contacted ? today() : p.contacted }));
+                }}
+                style={selectStyle}
+              >
+                {APP_STATUSES.map((s) => (
+                  <option key={s || "blank"} value={s}>
+                    {statusLabel(s)}
+                  </option>
+                ))}
+              </select>
+              {f.status === "" && (
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                  Saved for later — won't count in your funnel or need a contact date until you set a real status.
+                </div>
+              )}
+            </div>
+
+            {(f.status === "outreach" || f.outreachKind || f.outreachChannel) && (
+              <>
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <Label>Warm or cold?</Label>
+                    {(f.outreachKind || f.outreachChannel) && (
+                      <button
+                        onClick={() => {
+                          set("outreachKind")("");
+                          set("outreachChannel")("");
+                        }}
+                        title="Clear outreach tags"
+                        style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 8, width: 22, height: 22, fontSize: 12, lineHeight: "20px", cursor: "pointer", padding: 0, marginBottom: 4 }}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
+                  {f.status !== "outreach" && (f.outreachKind || f.outreachChannel) && (
+                    <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 6 }}>
+                      Kept from when this was tagged as outreach. Tap × above to clear if that was a mistake.
+                    </div>
+                  )}
+                  <div style={{ display: "flex", gap: 8 }}>
+                    {OUTREACH_KINDS.map((k) => (
+                      <button
+                        key={k}
+                        onClick={() => set("outreachKind")(f.outreachKind === k ? "" : k)}
+                        style={{
+                          flex: 1,
+                          textTransform: "capitalize",
+                          fontFamily: sans,
+                          fontSize: 13,
+                          fontWeight: 700,
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          cursor: "pointer",
+                          border: `1px solid ${f.outreachKind === k ? outreachKindColor(k) : C.panelEdge}`,
+                          background: f.outreachKind === k ? `${outreachKindColor(k)}22` : "transparent",
+                          color: f.outreachKind === k ? outreachKindColor(k) : C.muted,
+                        }}
+                      >
+                        {k}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ marginBottom: 12 }}>
+                  <Label>Outreached via</Label>
+                  <select value={f.outreachChannel} onChange={(e) => set("outreachChannel")(e.target.value)} style={selectStyle}>
+                    <option value="">— select channel —</option>
+                    {OUTREACH_CHANNELS.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </>
+            )}
+
+            <Field label="Notes" value={f.notes} onChange={set("notes")} placeholder="role, next step…" />
 
             <Label>Custom fields</Label>
             {(f.custom || []).map((c, i) => (
@@ -2154,9 +2577,43 @@ function Modal({ modal, onClose, onSave }) {
         {kind === "checkinDay" && (
           <>
             <Field label="Day of the month for the runway check-in (1–28)" type="number" value={f.day} onChange={set("day")} />
-            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 16 }}>
               On or after this day each month, the Dashboard will remind you to recalculate fund ÷ expenses. Saving new runway numbers marks the month as done.
             </div>
+
+            <Label>Default follow-up schedule (days after contact)</Label>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+              New applications start with this schedule. Existing applications keep their own.
+            </div>
+            {(f.followUpDefaults || []).map((d, i) => (
+              <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
+                <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, width: 78, flexShrink: 0 }}>Follow-up {i + 1}</div>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  value={d}
+                  onChange={(e) =>
+                    setF((p) => ({ ...p, followUpDefaults: p.followUpDefaults.map((x, j) => (j === i ? e.target.value : x)) }))
+                  }
+                  style={{ ...inputStyle, width: 90, fontFamily: mono, flexShrink: 0, padding: "8px 10px" }}
+                />
+                <div style={{ fontSize: 12, color: C.muted, flex: 1 }}>days</div>
+                <button
+                  onClick={() => setF((p) => ({ ...p, followUpDefaults: p.followUpDefaults.filter((_, j) => j !== i) }))}
+                  style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 34, height: 34, cursor: "pointer", flexShrink: 0 }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            <button
+              onClick={() =>
+                setF((p) => ({ ...p, followUpDefaults: [...(p.followUpDefaults || []), (+(p.followUpDefaults?.slice(-1)[0]) || 7) + 7] }))
+              }
+              style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 12 }}
+            >
+              + Add follow-up
+            </button>
           </>
         )}
 
