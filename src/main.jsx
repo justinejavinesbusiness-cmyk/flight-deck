@@ -15,6 +15,11 @@ import { createClient } from "@supabase/supabase-js";
 
 const SUPA_URL = "https://ywzvhloswottkasvhzfv.supabase.co";
 const SUPA_KEY = "sb_publishable_YyQQvJHwJh3B0c6ZJCcuhQ__gCrN_ld";
+/* Supabase Storage's REST API needs a real JWT for its RLS layer — the newer
+   sb_publishable_ key format isn't a JWT and Storage rejects it with 400.
+   RPC/PostgREST calls work fine with SUPA_KEY, so only Storage uses this. */
+const SUPA_STORAGE_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl3enZobG9zd290dGthc3ZoemZ2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcyNjg4OTQsImV4cCI6MjA5Mjg0NDg5NH0.FBJi4mK6vC_9nf2mW9aAi88BKppX4_FZLHrnZ-LQsEE";
 /* realtime broadcast client — used only for "something changed" pings between
    devices on the same sync code; data itself still flows through the RPCs */
 const supa = createClient(SUPA_URL, SUPA_KEY, { realtime: { params: { eventsPerSecond: 2 } } });
@@ -143,7 +148,10 @@ const countWorkingDays = (startIso, endIso) => {
   }
   return c;
 };
-const goalMatch = (a, metric) => (metric === "outreach" ? isOutreach(a) : !isOutreach(a) && !isBlankStatus(a));
+/* an application/outreach counts toward the goal the moment it's real activity —
+   the ONLY thing that doesn't count is a "saved for later" lead with no status yet.
+   Application and outreach are treated identically: each is worth 1 toward the target. */
+const isGoalActivity = (a) => !isBlankStatus(a);
 /* pure: derive everything about a goal from the goal record + the pipeline */
 function computeGoal(goal, apps) {
   if (!goal || !goal.target || !goal.days) return null;
@@ -152,8 +160,8 @@ function computeGoal(goal, apps) {
   const t = today();
   const elapsedCalendarDays = Math.min(goal.days, Math.max(0, Math.floor((new Date(t) - new Date(goal.startDate)) / 86400000) + 1));
   const expectedByNow = Math.min(goal.target, Math.round((goal.target * elapsedCalendarDays) / goal.days));
-  const actualTotal = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && goalMatch(a, goal.metric)).length;
-  const actualByNow = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && a.contacted <= t && goalMatch(a, goal.metric)).length;
+  const actualTotal = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && isGoalActivity(a)).length;
+  const actualByNow = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && a.contacted <= t && isGoalActivity(a)).length;
   const daysRemaining = Math.max(0, countWorkingDays(t > deadline ? deadline : t, deadline) - (t <= deadline ? 1 : 0));
   const pastDeadline = t > deadline;
 
@@ -171,7 +179,7 @@ function computeGoal(goal, apps) {
     .map((w) => ({
       ...w,
       target: dailyQuota * w.workingDays,
-      actual: apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && goalMatch(a, goal.metric)).length,
+      actual: apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length,
     }));
 
   return {
@@ -348,15 +356,15 @@ const audioPublicUrl = (path) => `${SUPA_URL}/storage/v1/object/public/voice-ses
 async function uploadAudio(path, blob) {
   const r = await fetch(`${SUPA_URL}/storage/v1/object/voice-sessions/${path}`, {
     method: "POST",
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "content-type": "audio/mpeg", "x-upsert": "true" },
+    headers: { apikey: SUPA_STORAGE_KEY, Authorization: `Bearer ${SUPA_STORAGE_KEY}`, "content-type": "audio/mpeg", "x-upsert": "true" },
     body: blob,
   });
-  if (!r.ok) throw new Error(`storage upload ${r.status}`);
+  if (!r.ok) throw new Error(`storage upload ${r.status}: ${await r.text().catch(() => "")}`);
 }
 async function deleteAudio(path) {
   const r = await fetch(`${SUPA_URL}/storage/v1/object/voice-sessions/${path}`, {
     method: "DELETE",
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` },
+    headers: { apikey: SUPA_STORAGE_KEY, Authorization: `Bearer ${SUPA_STORAGE_KEY}` },
   });
   if (!r.ok && r.status !== 404) throw new Error(`storage delete ${r.status}`);
 }
@@ -415,10 +423,10 @@ const shotPublicUrl = (path) => `${SUPA_URL}/storage/v1/object/public/job-posts/
 async function uploadShot(path, file) {
   const r = await fetch(`${SUPA_URL}/storage/v1/object/job-posts/${path}`, {
     method: "POST",
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "content-type": file.type || "image/png", "x-upsert": "true" },
+    headers: { apikey: SUPA_STORAGE_KEY, Authorization: `Bearer ${SUPA_STORAGE_KEY}`, "content-type": file.type || "image/png", "x-upsert": "true" },
     body: file,
   });
-  if (!r.ok) throw new Error(`shot upload ${r.status}`);
+  if (!r.ok) throw new Error(`shot upload ${r.status}: ${await r.text().catch(() => "")}`);
 }
 
 /* ---------- supabase rpc ---------- */
@@ -968,7 +976,7 @@ export default function FlightDeck() {
       if (!state.goal) return "No goal currently set.";
       const g = computeGoal(state.goal, apps);
       if (!g) return "No goal currently set.";
-      return `Active goal: ${state.goal.target} ${state.goal.metric} over ${state.goal.days} days, deadline ${g.deadline}, daily quota ${g.dailyQuota}. Progress: ${g.actualTotal}/${state.goal.target} (${g.pctComplete}%) — ${g.pastDeadline ? "deadline passed" : g.onPace ? "on pace" : `behind, expected ${g.expectedByNow} by now`}.`;
+      return `Active goal: ${state.goal.target} applications+outreach combined (each counts as 1) over ${state.goal.days} days, deadline ${g.deadline}, daily quota ${g.dailyQuota}. Progress: ${g.actualTotal}/${state.goal.target} (${g.pctComplete}%) — ${g.pastDeadline ? "deadline passed" : g.onPace ? "on pace" : `behind, expected ${g.expectedByNow} by now`}.`;
     })();
     const sessions = (state.supportSessions || [])
       .slice(0, 6)
@@ -1332,7 +1340,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       mutate(
         (s) => ({
           ...s,
-          goal: { metric: data.metric === "outreach" ? "outreach" : "apps", target, days, startDate: data.startDate || today() },
+          goal: { target, days, startDate: data.startDate || today() },
         }),
         entry ? "Goal updated" : "Goal set"
       );
@@ -2060,8 +2068,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <div style={{ fontSize: 32, marginBottom: 8 }}>🎯</div>
             <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>No goal set</div>
             <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16 }}>
-              Set a target — e.g. 500 applications over 90 days — and this splits it into a daily quota, a
-              deadline, and a Mon–Sat weekly schedule tracked against what's actually in your Pipeline.
+              Set a target — e.g. 500 applications + outreach over 90 days — and this splits it into a daily
+              quota, a deadline, and a Mon–Sat weekly schedule. Applications and outreach count equally, 1
+              each, toward the same number.
             </div>
             <Btn onClick={() => setModal({ kind: "goal", entry: null })}>+ Set a goal</Btn>
           </div>
@@ -2072,7 +2081,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <Label>
-                  {state.goal.target} {state.goal.metric === "outreach" ? "outreaches" : "applications"} over {state.goal.days} days
+                  {state.goal.target} applications + outreach over {state.goal.days} days
                 </Label>
                 <Btn ghost onClick={() => setModal({ kind: "goal", entry: state.goal })} style={{ padding: "6px 10px", fontSize: 11 }}>
                   Edit
@@ -2542,7 +2551,6 @@ function Modal({ modal, onClose, onSave, totals }) {
       return { day: entry?.day ?? 1, followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String) };
     if (kind === "goal")
       return {
-        metric: entry?.metric || "apps",
         target: entry?.target ?? 500,
         days: entry?.days ?? 90,
         startDate: entry?.startDate || today(),
@@ -2556,6 +2564,50 @@ function Modal({ modal, onClose, onSave, totals }) {
   const [customBoard, setCustomBoard] = useState(
     () => kind === "application" && !!entry?.jobBoardName && !JOB_BOARD_OPTIONS.includes(entry.jobBoardName)
   );
+
+  /* shared upload path for both the file picker AND clipboard paste */
+  const handleShotFile = async (file) => {
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setShotErr("Image too large (max 5MB).");
+      return;
+    }
+    setShotBusy(true);
+    setShotErr("");
+    try {
+      const extFromName = file.name && file.name.includes(".") ? file.name.split(".").pop() : "";
+      const extFromType = file.type && file.type.includes("/") ? file.type.split("/")[1] : "";
+      const ext = (extFromName || extFromType || "png").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 5) || "png";
+      const p = `${modal.syncKey || "shared"}/${uid()}-${Date.now()}.${ext}`;
+      await uploadShot(p, file);
+      set("postShot")(p);
+    } catch (err) {
+      setShotErr(`Upload failed: ${err && err.message ? err.message.slice(0, 120) : "check connection and retry."}`);
+    }
+    setShotBusy(false);
+  };
+
+  /* Ctrl+V anywhere in this modal captures a pasted image (desktop) */
+  useEffect(() => {
+    if (kind !== "application" || f.postShot) return;
+    const onPaste = (e) => {
+      const items = e.clipboardData && e.clipboardData.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type && item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) {
+            e.preventDefault();
+            handleShotFile(file);
+          }
+          break;
+        }
+      }
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  });
+
 
   const selectStyle = { ...inputStyle, appearance: "none" };
 
@@ -2672,27 +2724,10 @@ function Modal({ modal, onClose, onSave, totals }) {
                     type="file"
                     accept="image/*"
                     disabled={shotBusy}
-                    onChange={async (e) => {
-                      const file = e.target.files && e.target.files[0];
-                      if (!file) return;
-                      if (file.size > 5 * 1024 * 1024) {
-                        setShotErr("Image too large (max 5MB).");
-                        return;
-                      }
-                      setShotBusy(true);
-                      setShotErr("");
-                      try {
-                        const ext = (file.name.split(".").pop() || "png").toLowerCase().slice(0, 5);
-                        const p = `${modal.syncKey || "shared"}/${uid()}-${Date.now()}.${ext}`;
-                        await uploadShot(p, file);
-                        set("postShot")(p);
-                      } catch (err) {
-                        setShotErr("Upload failed — check connection and retry.");
-                      }
-                      setShotBusy(false);
-                    }}
+                    onChange={(e) => handleShotFile(e.target.files && e.target.files[0])}
                     style={{ ...inputStyle, padding: "8px 12px" }}
                   />
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>Or press Ctrl+V (⌘V on Mac) anywhere in this window to paste a copied screenshot.</div>
                   {shotBusy && <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>Uploading…</div>}
                   {shotErr && <div style={{ fontSize: 12, color: C.red, marginTop: 4 }}>{shotErr}</div>}
                 </>
@@ -2984,36 +3019,11 @@ function Modal({ modal, onClose, onSave, totals }) {
 
         {kind === "goal" && (
           <>
-            <div style={{ marginBottom: 12 }}>
-              <Label>Track</Label>
-              <div style={{ display: "flex", gap: 8 }}>
-                {[
-                  ["apps", "Applications"],
-                  ["outreach", "Outreach"],
-                ].map(([k, l]) => (
-                  <button
-                    key={k}
-                    onClick={() => set("metric")(k)}
-                    style={{
-                      flex: 1,
-                      fontFamily: sans,
-                      fontSize: 13,
-                      fontWeight: 700,
-                      padding: "10px 12px",
-                      borderRadius: 10,
-                      cursor: "pointer",
-                      border: `1px solid ${f.metric === k ? C.amber : C.panelEdge}`,
-                      background: f.metric === k ? "rgba(245,185,66,0.12)" : "transparent",
-                      color: f.metric === k ? C.amber : C.muted,
-                    }}
-                  >
-                    {l}
-                  </button>
-                ))}
-              </div>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+              Applications and outreach count equally toward this target — each is worth 1, combined into one number. No need to split them out.
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <Field label="Target number" type="number" value={f.target} onChange={set("target")} />
+              <Field label="Target number (apps + outreach combined)" type="number" value={f.target} onChange={set("target")} />
               <Field label="Over how many days" type="number" value={f.days} onChange={set("days")} />
             </div>
             <Field label="Start date" type="date" value={f.startDate} onChange={set("startDate")} />
