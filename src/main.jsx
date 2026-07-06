@@ -15,11 +15,11 @@ import { createClient } from "@supabase/supabase-js";
 
 const SUPA_URL = "https://ywzvhloswottkasvhzfv.supabase.co";
 const SUPA_KEY = "sb_publishable_YyQQvJHwJh3B0c6ZJCcuhQ__gCrN_ld";
-/* Supabase Storage's REST API needs a real JWT for its RLS layer — the newer
-   sb_publishable_ key format isn't a JWT and Storage rejects it with 400.
-   RPC/PostgREST calls work fine with SUPA_KEY, so only Storage uses this. */
-const SUPA_STORAGE_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl3enZobG9zd290dGthc3ZoemZ2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcyNjg4OTQsImV4cCI6MjA5Mjg0NDg5NH0.FBJi4mK6vC_9nf2mW9aAi88BKppX4_FZLHrnZ-LQsEE";
+/* Storage uploads/deletes route through a Supabase Edge Function that uses the
+   service role key server-side (bypasses RLS entirely) — direct client-side
+   anonymous Storage writes proved unreliable regardless of key format or RLS
+   policy content, so the client never touches Storage's REST API directly. */
+const EDGE_UPLOAD_URL = `${SUPA_URL}/functions/v1/upload`;
 /* realtime broadcast client — used only for "something changed" pings between
    devices on the same sync code; data itself still flows through the RPCs */
 const supa = createClient(SUPA_URL, SUPA_KEY, { realtime: { params: { eventsPerSecond: 2 } } });
@@ -350,23 +350,51 @@ function mergeCoach(localC, remoteC) {
   return out;
 }
 
+/* shared blob-to-base64 for the edge function proxy */
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = reader.result || "";
+      const idx = result.indexOf(",");
+      resolve(idx >= 0 ? result.slice(idx + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error || new Error("FileReader failed"));
+    reader.readAsDataURL(blob);
+  });
+}
+async function edgeUpload(bucket, path, blob, contentType) {
+  const dataBase64 = await blobToBase64(blob);
+  const r = await fetch(EDGE_UPLOAD_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "upload", bucket, path, dataBase64, contentType }),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`upload ${r.status}: ${t}`);
+  }
+}
+async function edgeDelete(bucket, path) {
+  const r = await fetch(EDGE_UPLOAD_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "delete", bucket, path }),
+  });
+  if (!r.ok && r.status !== 404) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`delete ${r.status}: ${t}`);
+  }
+}
+
 /* ---------- voice audio storage (Supabase Storage) ---------- */
 const AUDIO_TTL_DAYS = 365; /* audio kept 12 months from creation, then user is asked */
 const audioPublicUrl = (path) => `${SUPA_URL}/storage/v1/object/public/voice-sessions/${path}`;
 async function uploadAudio(path, blob) {
-  const r = await fetch(`${SUPA_URL}/storage/v1/object/voice-sessions/${path}`, {
-    method: "POST",
-    headers: { apikey: SUPA_STORAGE_KEY, Authorization: `Bearer ${SUPA_STORAGE_KEY}`, "content-type": "audio/mpeg", "x-upsert": "true" },
-    body: blob,
-  });
-  if (!r.ok) throw new Error(`storage upload ${r.status}: ${await r.text().catch(() => "")}`);
+  await edgeUpload("voice-sessions", path, blob, "audio/mpeg");
 }
 async function deleteAudio(path) {
-  const r = await fetch(`${SUPA_URL}/storage/v1/object/voice-sessions/${path}`, {
-    method: "DELETE",
-    headers: { apikey: SUPA_STORAGE_KEY, Authorization: `Bearer ${SUPA_STORAGE_KEY}` },
-  });
-  if (!r.ok && r.status !== 404) throw new Error(`storage delete ${r.status}`);
+  await edgeDelete("voice-sessions", path);
 }
 const isExpiredAudio = (s) => !!(s.audioPath && s.audioCreated && addDays(s.audioCreated, AUDIO_TTL_DAYS) <= today());
 
@@ -421,12 +449,7 @@ async function uploadAudioWithRetry(path, blob, attempts = 3) {
 /* job-post screenshot storage */
 const shotPublicUrl = (path) => `${SUPA_URL}/storage/v1/object/public/job-posts/${path}`;
 async function uploadShot(path, file) {
-  const r = await fetch(`${SUPA_URL}/storage/v1/object/job-posts/${path}`, {
-    method: "POST",
-    headers: { apikey: SUPA_STORAGE_KEY, Authorization: `Bearer ${SUPA_STORAGE_KEY}`, "content-type": file.type || "image/png", "x-upsert": "true" },
-    body: file,
-  });
-  if (!r.ok) throw new Error(`shot upload ${r.status}: ${await r.text().catch(() => "")}`);
+  await edgeUpload("job-posts", path, file, file.type || "image/png");
 }
 
 /* ---------- supabase rpc ---------- */
