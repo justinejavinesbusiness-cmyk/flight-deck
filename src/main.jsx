@@ -140,14 +140,6 @@ function computeMilestoneWins(prevApp, newStatus) {
 }
 
 /* ---- goal / campaign planner ---- */
-const countWorkingDays = (startIso, endIso) => {
-  if (!startIso || !endIso || endIso < startIso) return 0;
-  let c = 0;
-  for (let d = new Date(startIso + "T00:00:00"); d <= new Date(endIso + "T00:00:00"); d.setDate(d.getDate() + 1)) {
-    if (d.getDay() !== 0) c++; /* Sunday is a rest day, not part of any Mon-Sat week bucket */
-  }
-  return c;
-};
 /* an application/outreach counts toward the goal the moment it's real activity —
    the ONLY thing that doesn't count is a "saved for later" lead with no status yet.
    Application and outreach are treated identically: each is worth 1 toward the target. */
@@ -193,7 +185,7 @@ function computeGoal(goal, apps) {
 
   const actualTotal = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && isGoalActivity(a)).length;
   const actualByNow = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && a.contacted <= t && isGoalActivity(a)).length;
-  const daysRemaining = Math.max(0, countWorkingDays(t > deadline ? deadline : t, deadline) - (t <= deadline ? 1 : 0));
+  const daysRemaining = Math.max(0, goal.days - elapsedCalendarDays); /* calendar days, same unit as "over N days" */
   const pastDeadline = t > deadline;
   const todaysTarget = dailyTargetForDay(goal, Math.max(1, elapsedCalendarDays), fullQuota);
   const stillRamping = goal.rampEnabled && elapsedCalendarDays < preset.rampDays;
@@ -708,6 +700,9 @@ export default function FlightDeck() {
   const [toast, setToast] = useState("");
   const [syncStatus, setSyncStatus] = useState("local");
   const [pipeFilter, setPipeFilter] = useState("active");
+  const [pipeSearch, setPipeSearch] = useState("");
+  const [pipeSourceFilter, setPipeSourceFilter] = useState("");
+  const [pipeStatusFilter, setPipeStatusFilter] = useState("");
   const [donutMode, setDonutMode] = useState("status");
   const [historyGroup, setHistoryGroup] = useState("date");
   const [coachLoading, setCoachLoading] = useState(null);
@@ -1847,6 +1842,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? !isOpenApp(a)
           : true
       )
+      .filter((a) => !pipeSourceFilter || a.source === pipeSourceFilter)
+      .filter((a) => !pipeStatusFilter || (a.status ?? "") === pipeStatusFilter)
+      .filter((a) => {
+        if (!pipeSearch.trim()) return true;
+        const q = pipeSearch.trim().toLowerCase();
+        return [a.company, a.contact, a.email, a.notes, a.jobBoardName, a.website]
+          .filter(Boolean)
+          .some((f) => f.toLowerCase().includes(q));
+      })
       .slice()
       .sort((a, b) => (b.contacted || "").localeCompare(a.contacted || ""));
 
@@ -1873,9 +1877,40 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         onFocus={(e) => (e.target.style.border = `1px solid ${C.blue}`)}
       />
     );
+    /* small clickable icon-link that opens a URL-ish field without blocking editing */
+    const openLink = (url, opts = {}) => {
+      if (!url) return null;
+      const href = opts.mailto ? `mailto:${url}` : url.startsWith("http") ? url : `https://${url}`;
+      return (
+        <a
+          href={href}
+          target={opts.mailto ? undefined : "_blank"}
+          rel="noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          title={opts.title || "Open"}
+          style={{ color: C.blue, fontSize: 13, textDecoration: "none", flexShrink: 0, lineHeight: 1 }}
+        >
+          {opts.icon || "↗"}
+        </a>
+      );
+    };
 
     return (
       <>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <input
+            value={pipeSearch}
+            onChange={(e) => setPipeSearch(e.target.value)}
+            placeholder="🔎 Search company, contact, email, notes…"
+            style={{ ...inputStyle, flex: 1 }}
+          />
+          {pipeSearch && (
+            <Btn ghost onClick={() => setPipeSearch("")} style={{ padding: "10px 14px" }}>
+              Clear
+            </Btn>
+          )}
+        </div>
+
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
             {filters.map((f) => (
@@ -1891,11 +1926,50 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <Btn onClick={() => setModal({ kind: "application", entry: null })}>+ Track application</Btn>
         </div>
 
+        <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+          <select
+            value={pipeSourceFilter}
+            onChange={(e) => setPipeSourceFilter(e.target.value)}
+            style={{ ...selMini, border: `1px solid ${pipeSourceFilter ? C.amber : C.panelEdge}`, color: pipeSourceFilter ? C.amber : C.muted, padding: "6px 10px", borderRadius: 20 }}
+          >
+            <option value="">Filter: any source</option>
+            {APP_SOURCES.map((s) => (
+              <option key={s} value={s} style={{ background: C.panel, color: C.ink }}>
+                {s}
+              </option>
+            ))}
+          </select>
+          <select
+            value={pipeStatusFilter}
+            onChange={(e) => setPipeStatusFilter(e.target.value)}
+            style={{ ...selMini, border: `1px solid ${pipeStatusFilter ? C.amber : C.panelEdge}`, color: pipeStatusFilter ? C.amber : C.muted, padding: "6px 10px", borderRadius: 20 }}
+          >
+            <option value="">Filter: any status</option>
+            {APP_STATUSES.map((s) => (
+              <option key={s || "blank"} value={s} style={{ background: C.panel, color: C.ink }}>
+                {statusLabel(s)}
+              </option>
+            ))}
+          </select>
+          {(pipeSourceFilter || pipeStatusFilter) && (
+            <Btn
+              ghost
+              onClick={() => {
+                setPipeSourceFilter("");
+                setPipeStatusFilter("");
+              }}
+              style={{ padding: "6px 12px", fontSize: 11 }}
+            >
+              Clear filters
+            </Btn>
+          )}
+        </div>
+
         {shown.length === 0 && (
           <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
             {apps.length === 0
               ? "No applications tracked yet. Every company you add here updates the funnel numbers automatically."
-              : "Nothing matches this filter."}
+              : "Nothing matches this search/filter."}
           </div>
         )}
 
@@ -1935,7 +2009,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                     <tr key={a.id} style={{ background: due ? "rgba(248,113,113,0.06)" : "transparent" }}>
                       <td style={{ ...td, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 170 }}>
                         {cellInput(a, "company", { ph: "Company" })}
-                        {cellInput(a, "website", { ph: "website.com" })}
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          {cellInput(a, "website", { ph: "website.com" })}
+                          {a.website && openLink(a.website, { title: "Open website" })}
+                        </div>
                       </td>
                       <td style={{ ...td, minWidth: 130 }} onClick={(e) => e.stopPropagation()}>
                         <select
@@ -1966,8 +2043,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         )}
                       </td>
                       <td style={{ ...td, minWidth: 110 }}>{cellInput(a, "contact", { ph: "Name" })}</td>
-                      <td style={{ ...td, minWidth: 140 }}>{cellInput(a, "email", { ph: "email@…" })}</td>
-                      <td style={{ ...td, minWidth: 130 }}>{cellInput(a, "postLink", { ph: "https://…" })}</td>
+                      <td style={{ ...td, minWidth: 150 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          {cellInput(a, "email", { ph: "email@…" })}
+                          {a.email && openLink(a.email, { mailto: true, icon: "✉", title: "Email" })}
+                        </div>
+                      </td>
+                      <td style={{ ...td, minWidth: 140 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          {cellInput(a, "postLink", { ph: "https://…" })}
+                          {a.postLink && openLink(a.postLink, { title: "Open job post" })}
+                        </div>
+                      </td>
                       <td style={{ ...td, minWidth: 150 }} onClick={(e) => e.stopPropagation()}>
                         {a.postShot ? (
                           <a href={shotPublicUrl(a.postShot)} target="_blank" rel="noreferrer" style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
@@ -2100,9 +2187,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 150 }}>
                         {a.company || "Unnamed"}
                         {a.website && (
-                          <div style={{ color: C.blue, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160 }}>
+                          <a
+                            href={a.website.startsWith("http") ? a.website : "https://" + a.website}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            style={{ color: C.blue, fontSize: 11, textDecoration: "none", display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160 }}
+                          >
                             ↗ {a.website.replace(/^https?:\/\//, "")}
-                          </div>
+                          </a>
                         )}
                       </td>
                       <td style={td}>
@@ -2113,11 +2206,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       </td>
                       <td style={td}>
                         {a.postLink ? (
-                          <span style={{ color: C.blue, fontSize: 12 }}>🔗 link</span>
+                          <a href={a.postLink.startsWith("http") ? a.postLink : "https://" + a.postLink} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
+                            🔗 link
+                          </a>
                         ) : a.postShot ? (
-                          <span style={{ color: C.blue, fontSize: 12 }}>🖼 shot</span>
+                          <a href={shotPublicUrl(a.postShot)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
+                            🖼 shot
+                          </a>
                         ) : a.screenshotLink ? (
-                          <span style={{ color: C.blue, fontSize: 12 }}>🔗 shot link</span>
+                          <a href={a.screenshotLink.startsWith("http") ? a.screenshotLink : "https://" + a.screenshotLink} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
+                            🔗 shot link
+                          </a>
                         ) : (
                           <span style={{ color: C.muted, fontSize: 12 }}>—</span>
                         )}
