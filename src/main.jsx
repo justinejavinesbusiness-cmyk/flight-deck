@@ -92,19 +92,22 @@ const addDays = (isoDate, n) => {
 };
 
 /* ---- application status model ---- */
-const APP_STATUSES = ["", "outreach", "applied", "followed up", "replied", "screening", "interview", "final round", "offer", "rejected"];
+const APP_STATUSES = ["", "outreach", "applied", "followed up", "replied", "screening", "interview", "final round", "offer", "rejected", "bad fit"];
 const APP_SOURCES = ["LinkedIn", "Instagram", "Facebook", "Referral", "Job board", "Company site", "X / Twitter", "Other"];
 const JOB_BOARD_OPTIONS = ["Onlinejobs.ph", "Upwork", "Indeed", "Jobstreet", "We Work Remotely", "Other"];
 const OUTREACH_KINDS = ["warm", "cold"];
 const OUTREACH_CHANNELS = ["Email", "Call", "Text", "Other"];
-const STAGE_IDX = { "": -2, outreach: -1, applied: 0, "followed up": 1, replied: 2, screening: 3, interview: 4, "final round": 5, offer: 6 };
+/* "bad fit" reasons — multi-select, for companies that don't align on comp/values/etc */
+const BAD_FIT_REASONS = ["Salary too low", "Values mismatch", "Culture concerns", "Red flags in process", "Scope creep", "Other"];
+const STAGE_IDX = { "": -2, outreach: -1, applied: 0, "followed up": 1, replied: 2, screening: 3, interview: 4, "final round": 5, offer: 6, "bad fit": -3, rejected: -3 };
 const statusLabel = (s) => (s ? s : "Not applied yet");
 const isOutreach = (a) => a.status === "outreach";
 const isBlankStatus = (a) => !a.status;
-const isOpenApp = (a) => !["offer", "rejected"].includes(a.status);
-const reached = (a, stage) => a.status !== "rejected" && (STAGE_IDX[a.status] ?? 0) >= STAGE_IDX[stage];
+const isBadFit = (a) => a.status === "bad fit";
+const isOpenApp = (a) => !["offer", "rejected", "bad fit"].includes(a.status);
+const reached = (a, stage) => a.status !== "rejected" && a.status !== "bad fit" && (STAGE_IDX[a.status] ?? 0) >= STAGE_IDX[stage];
 const statusColor = (s) =>
-  s === "offer" ? C.green : s === "rejected" ? C.muted : s === "" ? C.muted : s === "outreach" ? C.blue : ["interview", "final round"].includes(s) ? C.amber : ["replied", "screening"].includes(s) ? C.blue : C.ink;
+  s === "offer" ? C.green : s === "rejected" ? C.muted : s === "bad fit" ? C.red : s === "" ? C.muted : s === "outreach" ? C.blue : ["interview", "final round"].includes(s) ? C.amber : ["replied", "screening"].includes(s) ? C.blue : C.ink;
 const outreachKindColor = (k) => (k === "warm" ? C.amber : k === "cold" ? C.blue : C.muted);
 
 /* ---- automatic milestone wins ----
@@ -233,6 +236,89 @@ function computeGoal(goal, apps) {
   };
 }
 
+/* ---- milestone celebrations + cycle-completion snapshot ---- */
+const MILESTONE_MESSAGES = [
+  "You're building real momentum — keep this energy going.",
+  "Every number here is proof you're doing the work. Don't stop now.",
+  "This is exactly what consistent effort looks like on a graph.",
+  "Progress compounds. You're closer than you were yesterday.",
+  "The process is working. Trust the numbers, not the mood.",
+  "This didn't happen by accident — it happened because you kept feeding the funnel.",
+];
+/* pure: builds a full, AI-analyzable snapshot of one completed goal cycle */
+function buildCycleSnapshot(s, g, cycleNumber) {
+  const apps = s.applications || [];
+  const statusCounts = {};
+  APP_STATUSES.forEach((st) => {
+    statusCounts[st || "(not applied yet)"] = apps.filter((a) => (a.status ?? "") === st).length;
+  });
+  const totalApps = apps.filter((a) => !isBlankStatus(a) && !isOutreach(a)).length;
+  const totalOutreach = apps.filter((a) => isOutreach(a)).length;
+  const replies = apps.filter((a) => reached(a, "replied")).length;
+  const screens = apps.filter((a) => reached(a, "screening")).length;
+  const interviews = apps.filter((a) => reached(a, "interview")).length;
+  const offers = apps.filter((a) => a.status === "offer").length;
+  const badFits = apps.filter((a) => isBadFit(a)).length;
+  const highConfidence = apps.filter((a) => a.highConfidence).length;
+  const topOfFunnel = totalApps + totalOutreach;
+  const conversionRatePct = topOfFunnel > 0 ? +((offers / topOfFunnel) * 100).toFixed(1) : 0;
+
+  return {
+    id: uid(),
+    date: today(),
+    category: "Cycle Complete",
+    cycleNumber,
+    text: `🏁 Cycle ${cycleNumber} complete — goal of ${s.goal.target} applications+outreach reached${offers > 0 ? ` with ${offers} offer${offers === 1 ? "" : "s"}!` : "."}`,
+    snapshot: {
+      goal: {
+        target: s.goal.target,
+        days: s.goal.days,
+        startDate: s.goal.startDate,
+        deadline: g ? g.deadline : null,
+        aggressiveness: s.goal.aggressiveness,
+        rampEnabled: !!s.goal.rampEnabled,
+      },
+      funnel: { applications: totalApps, outreach: totalOutreach, replies, screens, interviews, offers, conversionRatePct, badFitCount: badFits, highConfidenceCount: highConfidence },
+      statusBreakdown: statusCounts,
+      pipeline: apps.map((a) => ({
+        company: a.company || null,
+        role: a.role || null,
+        source: a.source || null,
+        jobBoardName: a.jobBoardName || null,
+        status: a.status || null,
+        badReasons: a.badReasons && a.badReasons.length ? a.badReasons : null,
+        highConfidence: !!a.highConfidence,
+        outreachKind: a.outreachKind || null,
+        outreachChannel: a.outreachChannel || null,
+        salary: a.salary || null,
+        contacted: a.contacted || null,
+      })),
+      runway: {
+        fund: s.runway.fund,
+        expenses: s.runway.expenses,
+        monthsAtCompletion: s.runway.expenses > 0 ? +(s.runway.fund / s.runway.expenses).toFixed(1) : null,
+      },
+      emotionalDiary: {
+        protocolEntries: (s.emotions || []).map((e) => ({ date: e.date, name: e.name, intensity: e.intensity, claim: e.claim, action: e.action })),
+        supportSessions: (s.supportSessions || []).map((sess) => ({
+          date: sess.date,
+          feeling: sess.feeling,
+          intensity: sess.intensity,
+          deescalate: sess.deescalate || null,
+          reality: sess.reality || null,
+          achievements: sess.achievements || null,
+          forward: sess.forward || null,
+          one_action: sess.one_action || null,
+          transcript: sess.script || null,
+          isWeeklyVoiceCheckin: sess.kind === "weekly-voice",
+        })),
+      },
+      accomplishmentsLoggedDuringCycle: (s.accomplishments || []).length,
+    },
+    aiReport: null,
+  };
+}
+
 
 /* multi-step follow-ups: a.followUps = [{days, done}] counted from `contacted` */
 const DEFAULT_FOLLOWUPS = [3, 7, 14];
@@ -290,6 +376,7 @@ const DEFAULT_STATE = {
   accomplishments: [],
   supportSessions: [],
   goal: null,
+  cycleCount: 0,
   runway: { fund: 1200000, expenses: 50000 },
   settings: { checkinDay: 1 },
   lastCheckinMonth: null,
@@ -347,6 +434,7 @@ function mergeStates(localS, remoteS) {
     accomplishments: unionById(localS.accomplishments, remoteS.accomplishments),
     supportSessions: unionById(localS.supportSessions, remoteS.supportSessions),
     goal: remoteS.goal || localS.goal || null,
+    cycleCount: Math.max(localS.cycleCount || 0, remoteS.cycleCount || 0),
     runway: remoteS.runway || localS.runway,
     settings: { ...localS.settings, ...remoteS.settings },
     lastCheckinMonth:
@@ -582,6 +670,7 @@ function Label({ children }) {
 
 const inputStyle = {
   width: "100%",
+  minWidth: 0,
   boxSizing: "border-box",
   fontSize: 16,
   fontFamily: sans,
@@ -701,6 +790,8 @@ export default function FlightDeck() {
   const [modal, setModal] = useState(null);
   const [syncModal, setSyncModal] = useState(false);
   const [supportOpen, setSupportOpen] = useState(false);
+  const [focusModalOpen, setFocusModalOpen] = useState(false);
+  const [weeklyModalOpen, setWeeklyModalOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [syncStatus, setSyncStatus] = useState("local");
   const [pipeFilter, setPipeFilter] = useState("active");
@@ -1000,6 +1091,59 @@ export default function FlightDeck() {
       ? { name: "TIMELINE COMPRESSES", color: "#FB923C", note: "Floor holds. Accept strong at-floor offers faster. Add interim income." }
       : { name: "DELIBERATE DECISION ZONE", color: C.red, note: "Only zone where lowering the floor is legitimate — written, dated, numbers attached." };
 
+  /* watch goal progress: celebrate every 5% milestone (targets > 250), and
+     snapshot the whole cycle once the goal is fully achieved — regardless of
+     whether it ended in a job or not. Runs quietly in the background. */
+  useEffect(() => {
+    if (!state.goal) return;
+    const g = computeGoal(state.goal, apps);
+    if (!g) return;
+    const already = state.goal.milestonesCelebrated || [];
+    let newMilestones = already;
+    const newWins = [];
+
+    if (state.goal.target > 250) {
+      const currentPct = Math.min(100, Math.floor(g.pctComplete / 5) * 5);
+      const toAward = [];
+      for (let m = 5; m <= currentPct; m += 5) {
+        if (!already.includes(m)) toAward.push(m);
+      }
+      if (toAward.length) {
+        newMilestones = [...already, ...toAward];
+        toAward.forEach((m) => {
+          const msg = MILESTONE_MESSAGES[Math.floor(Math.random() * MILESTONE_MESSAGES.length)];
+          newWins.push({
+            id: uid(),
+            date: today(),
+            category: "Milestone",
+            text: `🎉 ${m}% of your goal complete (${Math.round((state.goal.target * m) / 100)}/${state.goal.target})! ${msg}`,
+          });
+        });
+      }
+    }
+
+    const cycleAlreadyDone = !!state.goal.cycleCompleted;
+    const shouldSnapshotCycle = g.pctComplete >= 100 && !cycleAlreadyDone;
+
+    if (newWins.length || shouldSnapshotCycle) {
+      setState((s) => {
+        let nextGoal = { ...s.goal, milestonesCelebrated: newMilestones };
+        let nextAccomplishments = newWins.length ? [...newWins, ...s.accomplishments] : s.accomplishments;
+        let nextCycleCount = s.cycleCount || 0;
+        if (shouldSnapshotCycle && !s.goal.cycleCompleted) {
+          nextCycleCount = (s.cycleCount || 0) + 1;
+          const gFinal = computeGoal(s.goal, s.applications);
+          const cycleEntry = buildCycleSnapshot(s, gFinal, nextCycleCount);
+          nextAccomplishments = [cycleEntry, ...nextAccomplishments];
+          nextGoal = { ...nextGoal, cycleCompleted: true };
+        }
+        return { ...s, goal: nextGoal, accomplishments: nextAccomplishments, cycleCount: nextCycleCount };
+      });
+      if (shouldSnapshotCycle) flash("🏁 Goal complete — Cycle snapshot saved to Wins");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.applications, state.goal]);
+
   /* monthly runway check-in */
   const checkinDay = +state.settings?.checkinDay || 1;
   const checkinDue = new Date().getDate() >= checkinDay && state.lastCheckinMonth !== thisMonth();
@@ -1092,6 +1236,39 @@ Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference the
       .map((b) => b.text)
       .join("\n");
     return JSON.parse(text.replace(/```json|```/g, "").trim());
+  };
+
+  /* analyzes a FROZEN historical cycle snapshot (not live state) — one button press */
+  const generateCycleReport = async (entryId, snapshot) => {
+    mutate((s) => ({ ...s, accomplishments: s.accomplishments.map((a) => (a.id === entryId ? { ...a, aiReportLoading: true } : a)) }));
+    try {
+      const prompt = `You are analyzing a completed job-search cycle for a graphic designer targeting remote roles at AU/CA/US/UK companies. This is a frozen snapshot of one full cycle (goal reached), not live data. Produce a direct, evidence-based report: what worked, what leaked, specific numbers-backed observations (cite the actual figures below), whether warm vs cold outreach or any particular source performed best, any emotional patterns worth noting, and 3-5 concrete recommendations for the next cycle. No generic advice — every claim should trace back to a number in this snapshot.
+
+SNAPSHOT:
+${JSON.stringify(snapshot, null, 2)}
+
+Respond with ONLY valid JSON, no markdown fences, no preamble, exactly this shape:
+{"summary": "...", "whatWorked": "...", "whatLeaked": "...", "emotionalPatterns": "...", "recommendations": ["...", "..."]}`;
+      const res = await fetch("/api/coach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      const text = (data.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
+      const report = JSON.parse(text.replace(/```json|```/g, "").trim());
+      mutate(
+        (s) => ({ ...s, accomplishments: s.accomplishments.map((a) => (a.id === entryId ? { ...a, aiReport: report, aiReportLoading: false } : a)) }),
+        "Cycle report generated"
+      );
+    } catch (e) {
+      mutate((s) => ({ ...s, accomplishments: s.accomplishments.map((a) => (a.id === entryId ? { ...a, aiReportLoading: false } : a)) }));
+      flash("Couldn't generate the report — check connection and retry.");
+    }
   };
 
   const runDaily = async () => {
@@ -1545,6 +1722,30 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         </div>
       )}
 
+      {/* today's focus & weekly review — popup modules, right below Today's Goal */}
+      <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+        <button
+          onClick={() => setFocusModalOpen(true)}
+          style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "14px 12px", cursor: "pointer", textAlign: "left" }}
+        >
+          <div style={{ fontSize: 20, marginBottom: 4 }}>📋</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.ink }}>Today's Focus</div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+            {coach.daily ? `${focusItems.filter((_, i) => (coach.dailyDone || []).includes(i)).length}/${focusItems.length} done` : "Tap to generate"}
+          </div>
+        </button>
+        <button
+          onClick={() => setWeeklyModalOpen(true)}
+          style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "14px 12px", cursor: "pointer", textAlign: "left" }}
+        >
+          <div style={{ fontSize: 20, marginBottom: 4 }}>📊</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.ink }}>Weekly Review</div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+            {coach.weeklyDate ? `Last run ${coach.weeklyDate}` : "Run every Friday"}
+          </div>
+        </button>
+      </div>
+
       {/* instrument strip */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 14 }}>
         {[
@@ -1625,28 +1826,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         <div style={{ marginTop: 8 }}>{renderFunnelSection()}</div>
       </div>
 
-      {/* monthly runway check-in banner */}
-      {checkinDue && (
-        <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <div>
-              <div style={{ fontWeight: 800, fontSize: 14, color: C.amber }}>Monthly runway check-in</div>
-              <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
-                Recalculate fund ÷ expenses. The floor decision runs on this number — not on mood.
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <Btn onClick={() => setModal({ kind: "runway", entry: { fund: state.runway.fund, expenses: state.runway.expenses } })} style={{ padding: "8px 12px", fontSize: 12 }}>
-                Update numbers
-              </Btn>
-              <Btn ghost onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay } })} style={{ padding: "8px 10px", fontSize: 12 }} title="Change check-in day">
-                Day: {checkinDay}
-              </Btn>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* due follow-ups queue */}
       {dueList.length > 0 && (
         <div style={{ background: "rgba(248,113,113,0.07)", border: `1px solid ${C.red}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
@@ -1662,118 +1841,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         </div>
       )}
-
-      {/* today's focus */}
-      <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-          <Label>
-            Today's focus — {new Date().toDateString()}
-            {coach.daily?.carried ? "  ·  CARRIED OVER" : ""}
-          </Label>
-          {coach.daily && (
-            <Btn ghost onClick={runDaily} disabled={coachLoading === "daily"} style={{ padding: "6px 10px", fontSize: 11 }} title="Regenerate (replaces the current list)">
-              {coachLoading === "daily" ? "…" : "↻"}
-            </Btn>
-          )}
-        </div>
-
-        {coach.daily?.carried && (
-          <div style={{ fontSize: 12, color: C.amber, margin: "6px 0 2px", lineHeight: 1.5 }}>
-            Yesterday's unfinished items carried over. Finish these to unlock a fresh focus tomorrow — completed ones are already in your History.
-          </div>
-        )}
-
-        {coachLoading === "daily" && (
-          <div style={{ color: C.muted, fontFamily: mono, fontSize: 12, padding: "18px 0", letterSpacing: "0.15em" }}>READING YOUR INSTRUMENTS…</div>
-        )}
-
-        {!coachLoading && coach.daily && (
-          <>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
-              {focusItems.map((f, i) => {
-                const done = (coach.dailyDone || []).includes(i);
-                const isNext = i === nextImportantIdx && !done;
-                return (
-                  <div
-                    key={i}
-                    onClick={() => setCoach((p) => ({ ...p, dailyDone: done ? p.dailyDone.filter((d) => d !== i) : [...p.dailyDone, i] }))}
-                    style={{ display: "flex", gap: 10, alignItems: "flex-start", background: C.bg, border: `1px solid ${done ? C.green : isNext ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer", transition: "border-color 0.25s ease" }}
-                  >
-                    <div style={{ fontFamily: mono, fontSize: 14, color: done ? C.green : isNext ? C.amber : C.muted, lineHeight: 1.4 }}>{done ? "◉" : "○"}</div>
-                    <div style={{ minWidth: 0 }}>
-                      {isNext && (
-                        <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.18em", color: C.amber, marginBottom: 2 }}>★ DO THIS NEXT — HIGHEST IMPACT</div>
-                      )}
-                      <div style={{ fontSize: 14, lineHeight: 1.45, textDecoration: done ? "line-through" : "none", color: done ? C.muted : C.ink }}>{f.text}</div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            {allFocusDone && (
-              <div style={{ fontSize: 13, color: C.green, marginTop: 10, fontWeight: 700 }}>
-                ✓ All done — these archive to History tonight, and a fresh focus arrives tomorrow.
-              </div>
-            )}
-            {coach.daily.why && <div style={{ fontSize: 12, color: C.muted, marginTop: 10, lineHeight: 1.5 }}>{coach.daily.why}</div>}
-            {coach.daily.watch && <div style={{ fontSize: 12, color: C.amber, marginTop: 8, lineHeight: 1.5 }}>⚠ {coach.daily.watch}</div>}
-            {coach.daily.reminder && (
-              <div style={{ marginTop: 12, borderLeft: `2px solid ${C.green}`, paddingLeft: 10, fontSize: 12, color: C.green, lineHeight: 1.5, fontStyle: "italic" }}>
-                {coach.daily.reminder}
-              </div>
-            )}
-          </>
-        )}
-
-        {!coachLoading && !coach.daily && (
-          <div style={{ padding: "10px 0" }}>
-            <div style={{ color: C.muted, fontSize: 13, marginBottom: 10 }}>
-              {canAutoGen ? "No focus set for today yet." : "Waiting for sync — generate manually if needed."}
-            </div>
-            <Btn onClick={runDaily} disabled={coachLoading === "daily"}>Generate today's focus</Btn>
-          </div>
-        )}
-      </div>
-
-      {/* weekly review */}
-      <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <Label>Weekly review{coach.weeklyDate ? ` — last run ${coach.weeklyDate}` : " — run every Friday"}</Label>
-          <Btn onClick={runWeekly} disabled={coachLoading === "weekly"} style={{ padding: "6px 12px", fontSize: 11 }}>
-            {coachLoading === "weekly" ? "Reviewing…" : "Run review"}
-          </Btn>
-        </div>
-
-        {coach.weekly && coachLoading !== "weekly" && (
-          <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: C.amber, lineHeight: 1.45 }}>{coach.weekly.verdict}</div>
-            {[
-              ["FUNNEL", coach.weekly.funnel],
-              ["PIPELINE", coach.weekly.pipeline],
-              ["EMOTIONS", coach.weekly.emotions],
-              ["FLOOR CHECK", coach.weekly.floor],
-            ].map(
-              ([k, v]) =>
-                v && (
-                  <div key={k}>
-                    <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.muted, marginBottom: 3 }}>{k}</div>
-                    <div style={{ fontSize: 13, lineHeight: 1.55 }}>{v}</div>
-                  </div>
-                )
-            )}
-            {Array.isArray(coach.weekly.next_week) && coach.weekly.next_week.length > 0 && (
-              <div>
-                <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.muted, marginBottom: 3 }}>NEXT WEEK</div>
-                {coach.weekly.next_week.map((n, i) => (
-                  <div key={i} style={{ fontSize: 13, lineHeight: 1.6 }}>
-                    <span style={{ color: C.amber, fontFamily: mono }}>{i + 1}.</span> {n}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
 
       {coachError && (
         <div style={{ marginTop: 12, background: "rgba(248,113,113,0.08)", border: `1px solid ${C.red}`, borderRadius: 10, padding: "10px 12px", fontSize: 13, color: C.red }}>
@@ -1840,6 +1907,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 {list.map((a) => {
                   const isPastWin = a.category === "Past Wins" && a.snapshot;
                   const isMilestone = Object.values(MILESTONE_LABEL).includes(a.category);
+                  const isGoalMilestone = a.category === "Milestone";
+                  const isCycle = a.category === "Cycle Complete" && a.snapshot;
                   return (
                     <SwipeRow
                       key={a.id}
@@ -1847,9 +1916,61 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       onTap={() => setModal({ kind: "accomplishment", entry: a })}
                       onDelete={() => mutate((s) => ({ ...s, accomplishments: s.accomplishments.filter((x) => x.id !== a.id) }), "Accomplishment deleted")}
                     >
-                      {isPastWin ? (
+                      {isCycle ? (
+                        <div style={{ margin: "-12px -14px", padding: "12px 14px", background: "rgba(125,176,247,0.08)", borderLeft: `3px solid ${C.blue}`, borderRadius: 12 }}>
+                          <div style={{ fontSize: 13, lineHeight: 1.5, fontWeight: 700, color: C.blue }}>{a.text}</div>
+                          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{a.date}</div>
+                          <div onClick={(e) => e.stopPropagation()} style={{ marginTop: 8 }}>
+                            {a.aiReportLoading ? (
+                              <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, letterSpacing: "0.1em" }}>ANALYZING THE CYCLE…</div>
+                            ) : a.aiReport ? (
+                              <details>
+                                <summary style={{ fontSize: 12, color: C.blue, cursor: "pointer" }}>View AI report</summary>
+                                <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 8 }}>
+                                  {[
+                                    ["SUMMARY", a.aiReport.summary],
+                                    ["WHAT WORKED", a.aiReport.whatWorked],
+                                    ["WHAT LEAKED", a.aiReport.whatLeaked],
+                                    ["EMOTIONAL PATTERNS", a.aiReport.emotionalPatterns],
+                                  ].map(
+                                    ([k, v]) =>
+                                      v && (
+                                        <div key={k}>
+                                          <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.16em", color: C.muted, marginBottom: 2 }}>{k}</div>
+                                          <div style={{ fontSize: 12, lineHeight: 1.55, wordBreak: "break-word" }}>{v}</div>
+                                        </div>
+                                      )
+                                  )}
+                                  {Array.isArray(a.aiReport.recommendations) && a.aiReport.recommendations.length > 0 && (
+                                    <div>
+                                      <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.16em", color: C.muted, marginBottom: 2 }}>RECOMMENDATIONS</div>
+                                      {a.aiReport.recommendations.map((r, i) => (
+                                        <div key={i} style={{ fontSize: 12, lineHeight: 1.6, wordBreak: "break-word" }}>
+                                          {i + 1}. {r}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                  <Btn ghost onClick={() => generateCycleReport(a.id, a.snapshot)} style={{ padding: "6px 10px", fontSize: 11, marginTop: 4 }}>
+                                    ↻ Regenerate
+                                  </Btn>
+                                </div>
+                              </details>
+                            ) : (
+                              <Btn onClick={() => generateCycleReport(a.id, a.snapshot)} color={C.blue} style={{ padding: "7px 12px", fontSize: 11 }}>
+                                📄 Generate AI Report
+                              </Btn>
+                            )}
+                          </div>
+                        </div>
+                      ) : isPastWin ? (
                         <div style={{ margin: "-12px -14px", padding: "12px 14px", background: "rgba(74,222,128,0.07)", borderLeft: `3px solid ${C.green}`, borderRadius: 12 }}>
                           <div style={{ fontSize: 13, lineHeight: 1.5, fontWeight: 700, color: C.green }}>{a.text}</div>
+                          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{a.date}</div>
+                        </div>
+                      ) : isGoalMilestone ? (
+                        <div style={{ margin: "-12px -14px", padding: "12px 14px", background: "rgba(245,185,66,0.08)", borderLeft: `3px solid ${C.amber}`, borderRadius: 12 }}>
+                          <div style={{ fontSize: 13, lineHeight: 1.5, fontWeight: 700, color: C.amber }}>{a.text}</div>
                           <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{a.date}</div>
                         </div>
                       ) : isMilestone ? (
@@ -1883,8 +2004,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   const renderPipeline = () => {
     const filters = [
       { key: "active", label: `Active (${apps.filter(isOpenApp).length})` },
+      { key: "highConfidence", label: `⭐ High confidence (${apps.filter((a) => a.highConfidence).length})` },
       { key: "blank", label: `◻ Saved for later (${apps.filter(isBlankStatus).length})` },
       { key: "due", label: `⚑ Due (${dueList.length})` },
+      { key: "badFit", label: `🚫 Bad fit (${apps.filter(isBadFit).length})` },
       { key: "closed", label: `Closed (${apps.filter((a) => !isOpenApp(a)).length})` },
       { key: "all", label: `All (${apps.length})` },
     ];
@@ -1898,6 +2021,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? isOpenApp(a)
           : pipeFilter === "closed"
           ? !isOpenApp(a)
+          : pipeFilter === "highConfidence"
+          ? !!a.highConfidence
+          : pipeFilter === "badFit"
+          ? isBadFit(a)
           : true
       )
       .filter((a) => !pipeSourceFilter || a.source === pipeSourceFilter)
@@ -1905,7 +2032,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .filter((a) => {
         if (!pipeSearch.trim()) return true;
         const q = pipeSearch.trim().toLowerCase();
-        return [a.company, a.contact, a.email, a.notes, a.jobBoardName, a.website]
+        return [a.company, a.contact, a.email, a.notes, a.jobBoardName, a.website, a.role]
           .filter(Boolean)
           .some((f) => f.toLowerCase().includes(q));
       })
@@ -2043,7 +2170,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1700 }}>
               <thead>
                 <tr>
+                  <th style={{ ...th, width: 34 }}>⭐</th>
                   <th style={th}>Company / Website</th>
+                  <th style={th}>Role</th>
                   <th style={th}>Source / Board</th>
                   <th style={th}>Contact</th>
                   <th style={th}>Email</th>
@@ -2064,7 +2193,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   const fus = normFollowUps(a);
                   const doneCount = fus.filter((x) => x.done).length;
                   return (
-                    <tr key={a.id} style={{ background: due ? "rgba(248,113,113,0.06)" : "transparent" }}>
+                    <tr key={a.id} style={{ background: due ? "rgba(248,113,113,0.06)" : a.highConfidence ? "rgba(245,185,66,0.05)" : "transparent" }}>
+                      <td style={{ ...td, textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => updateAppField(a.id, "highConfidence", !a.highConfidence)}
+                          title={a.highConfidence ? "High confidence — click to unmark" : "Mark as high confidence"}
+                          style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: 16, color: a.highConfidence ? C.amber : C.panelEdge, padding: 0 }}
+                        >
+                          {a.highConfidence ? "⭐" : "☆"}
+                        </button>
+                      </td>
                       <td style={{ ...td, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 170 }}>
                         {cellInput(a, "company", { ph: "Company" })}
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -2072,6 +2210,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {a.website && openLink(a.website, { title: "Open website" })}
                         </div>
                       </td>
+                      <td style={{ ...td, minWidth: 130 }}>{cellInput(a, "role", { ph: "Role applied for" })}</td>
                       <td style={{ ...td, minWidth: 130 }} onClick={(e) => e.stopPropagation()}>
                         <select
                           value={a.source || ""}
@@ -2179,6 +2318,24 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                             </select>
                           </div>
                         )}
+                        {a.status === "bad fit" && (
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 4 }}>
+                            {(a.badReasons || []).length > 0 ? (
+                              (a.badReasons || []).map((r) => (
+                                <span key={r} style={{ fontFamily: mono, fontSize: 8, letterSpacing: "0.04em", color: C.red, background: "rgba(248,113,113,0.1)", borderRadius: 8, padding: "2px 6px", whiteSpace: "nowrap" }}>
+                                  {r}
+                                </span>
+                              ))
+                            ) : (
+                              <button
+                                onClick={() => setModal({ kind: "application", entry: a })}
+                                style={{ background: "transparent", border: "none", color: C.muted, fontSize: 9, textDecoration: "underline", cursor: "pointer", padding: 0 }}
+                              >
+                                add reason
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </td>
                       <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
                         <input
@@ -2224,6 +2381,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 900 }}>
               <thead>
                 <tr>
+                  <th style={{ ...th, width: 30 }}>⭐</th>
                   <th style={th}>Company</th>
                   <th style={th}>Source</th>
                   <th style={th}>Post</th>
@@ -2242,8 +2400,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   const doneCount = fus.filter((x) => x.done).length;
                   return (
                     <tr key={a.id} onClick={() => setModal({ kind: "application", entry: a })} style={{ cursor: "pointer", background: due ? "rgba(248,113,113,0.06)" : "transparent" }}>
+                      <td style={{ ...td, textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => updateAppField(a.id, "highConfidence", !a.highConfidence)}
+                          style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: 15, color: a.highConfidence ? C.amber : C.panelEdge, padding: 0 }}
+                        >
+                          {a.highConfidence ? "⭐" : "☆"}
+                        </button>
+                      </td>
                       <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 150 }}>
                         {a.company || "Unnamed"}
+                        {a.role && <div style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}>{a.role}</div>}
                         {a.website && (
                           <a
                             href={a.website.startsWith("http") ? a.website : "https://" + a.website}
@@ -2298,6 +2465,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.1em", color: outreachKindColor(a.outreachKind), marginTop: 4, textTransform: "uppercase" }}>
                             {a.outreachKind}{a.outreachChannel ? ` · ${a.outreachChannel}` : ""}
                           </div>
+                        )}
+                        {a.status === "bad fit" && (a.badReasons || []).length > 0 && (
+                          <div style={{ fontFamily: mono, fontSize: 9, color: C.red, marginTop: 4 }}>{(a.badReasons || []).join(", ")}</div>
                         )}
                       </td>
                       <td style={{ ...td, whiteSpace: "nowrap" }}>
@@ -2386,41 +2556,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         );
       })()}
-
-      <Label>Weeks (Mon–Sat)</Label>
-
-      {weekRows.length === 0 && (
-        <div style={{ color: C.muted, fontSize: 14, padding: "20px 4px", textAlign: "center" }}>
-          Track applications and outreach in the Pipeline — the funnel builds itself.
-        </div>
-      )}
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
-        {weekRows.map((r) => {
-          const a = r.d.apps + r.legacy.apps;
-          const o = r.outreach + r.d.outreach;
-          const onPace = a >= 8 && o >= 20;
-          return (
-            <div key={r.week} style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div style={{ fontWeight: 700, fontSize: 14 }}>{r.week}</div>
-                <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.1em", color: onPace ? C.green : C.amber }}>
-                  {onPace ? "● ON PACE" : "○ BELOW PACE"}
-                </div>
-              </div>
-              <div style={{ fontFamily: mono, fontSize: 12, color: C.muted, marginTop: 6 }}>
-                A {a} · O {o} · R {r.d.replies + r.legacy.replies} · S {r.d.screens + r.legacy.screens} · I{" "}
-                {r.d.interviews + r.legacy.interviews} · OF {r.d.offers + r.legacy.offers}
-              </div>
-              {r.due > 0 && (
-                <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.red, marginTop: 6 }}>
-                  ⚑ {r.due} FOLLOW-UP{r.due === 1 ? "" : "S"} DUE
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
     </>
   );
 
@@ -2745,8 +2880,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       <style>{`
         ::-webkit-scrollbar { display: none; }
         * { scrollbar-width: none; -ms-overflow-style: none; }
-        input, textarea, select { font-size: 16px !important; }
-        html, body { margin: 0; padding: 0; background: ${C.bg}; }
+        input, textarea, select { font-size: 16px !important; max-width: 100%; box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; background: ${C.bg}; overflow-x: hidden; }
         button { -webkit-tap-highlight-color: transparent; }
         @media (hover: hover) {
           button:hover { filter: brightness(1.12); }
@@ -2921,6 +3056,27 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           }
         />
       )}
+      {focusModalOpen && (
+        <TodaysFocusModal
+          onClose={() => setFocusModalOpen(false)}
+          coach={coach}
+          setCoach={setCoach}
+          coachLoading={coachLoading}
+          runDaily={runDaily}
+          focusItems={focusItems}
+          nextImportantIdx={nextImportantIdx}
+          allFocusDone={allFocusDone}
+          canAutoGen={canAutoGen}
+        />
+      )}
+      {weeklyModalOpen && (
+        <WeeklyReviewModal
+          onClose={() => setWeeklyModalOpen(false)}
+          coach={coach}
+          coachLoading={coachLoading}
+          runWeekly={runWeekly}
+        />
+      )}
     </div>
   );
 }
@@ -2931,6 +3087,7 @@ function Modal({ modal, onClose, onSave, totals }) {
     if (kind === "application")
       return {
         company: entry?.company || "",
+        role: entry?.role || "",
         website: entry?.website || "",
         source: entry?.source || "",
         jobBoardName: entry?.jobBoardName || "",
@@ -2947,6 +3104,8 @@ function Modal({ modal, onClose, onSave, totals }) {
         status: entry ? entry.status || "applied" : "",
         outreachKind: entry?.outreachKind || "",
         outreachChannel: entry?.outreachChannel || "",
+        badReasons: entry?.badReasons ? [...entry.badReasons] : [],
+        highConfidence: entry?.highConfidence || false,
         notes: entry?.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
       };
@@ -3063,7 +3222,30 @@ function Modal({ modal, onClose, onSave, totals }) {
 
         {kind === "application" && (
           <>
-            <Field label="Company name" value={f.company} onChange={set("company")} placeholder="e.g. Acme SaaS Inc." />
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: 12 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <Field label="Company name" value={f.company} onChange={set("company")} placeholder="e.g. Acme SaaS Inc." />
+              </div>
+              <button
+                onClick={() => set("highConfidence")(!f.highConfidence)}
+                title={f.highConfidence ? "High confidence — tap to unmark" : "Mark as high confidence"}
+                style={{
+                  flexShrink: 0,
+                  marginBottom: 12,
+                  width: 42,
+                  height: 42,
+                  borderRadius: 10,
+                  border: `1px solid ${f.highConfidence ? C.amber : C.panelEdge}`,
+                  background: f.highConfidence ? "rgba(245,185,66,0.14)" : "transparent",
+                  color: f.highConfidence ? C.amber : C.muted,
+                  fontSize: 18,
+                  cursor: "pointer",
+                }}
+              >
+                {f.highConfidence ? "⭐" : "☆"}
+              </button>
+            </div>
+            <Field label="Role / position applied for" value={f.role} onChange={set("role")} placeholder="e.g. Senior Product Designer" />
             <Field label="Company website" value={f.website} onChange={set("website")} placeholder="https://acme.com" />
             <div style={{ marginBottom: 12 }}>
               <Label>Where did you find the job post?</Label>
@@ -3292,7 +3474,47 @@ function Modal({ modal, onClose, onSave, totals }) {
               </>
             )}
 
-            <Field label="Notes" value={f.notes} onChange={set("notes")} placeholder="role, next step…" />
+            {f.status === "bad fit" && (
+              <div style={{ marginBottom: 12 }}>
+                <Label>Why is this a bad fit? (select all that apply)</Label>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+                  {BAD_FIT_REASONS.map((r) => {
+                    const checked = f.badReasons.includes(r);
+                    return (
+                      <button
+                        key={r}
+                        onClick={() =>
+                          setF((p) => ({
+                            ...p,
+                            badReasons: checked ? p.badReasons.filter((x) => x !== r) : [...p.badReasons, r],
+                          }))
+                        }
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          textAlign: "left",
+                          fontFamily: sans,
+                          fontSize: 13,
+                          fontWeight: checked ? 700 : 500,
+                          padding: "9px 12px",
+                          borderRadius: 10,
+                          cursor: "pointer",
+                          border: `1px solid ${checked ? C.red : C.panelEdge}`,
+                          background: checked ? "rgba(248,113,113,0.1)" : "transparent",
+                          color: checked ? C.red : C.muted,
+                        }}
+                      >
+                        <span style={{ fontSize: 14 }}>{checked ? "☑" : "☐"}</span>
+                        {r}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <Field label="Notes" value={f.notes} onChange={set("notes")} placeholder="next step, thoughts…" />
 
             <Label>Custom fields</Label>
             {(f.custom || []).map((c, i) => (
@@ -3638,6 +3860,167 @@ const SUPPORT_BLOCKS = [
   ["achievements", "3 · YOUR TRACK RECORD", C.green],
   ["forward", "4 · YOUR WILL, AND THE BETTER FUTURE", C.blue],
 ];
+
+/* ---------- today's focus popup ---------- */
+function TodaysFocusModal({ onClose, coach, setCoach, coachLoading, runDaily, focusItems, nextImportantIdx, allFocusDone, canAutoGen }) {
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 440, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+      >
+        <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 14 }}>
+            <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink }}>
+              📋 Today's Focus — {new Date().toDateString()}
+              {coach.daily?.carried ? "  ·  CARRIED OVER" : ""}
+            </div>
+            {coach.daily && (
+              <Btn ghost onClick={runDaily} disabled={coachLoading === "daily"} style={{ padding: "6px 10px", fontSize: 11, flexShrink: 0 }} title="Regenerate (replaces the current list)">
+                {coachLoading === "daily" ? "…" : "↻"}
+              </Btn>
+            )}
+          </div>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden", padding: "0 20px 16px", minHeight: 0 }}>
+          {coach.daily?.carried && (
+            <div style={{ fontSize: 12, color: C.amber, margin: "0 0 10px", lineHeight: 1.5 }}>
+              Yesterday's unfinished items carried over. Finish these to unlock a fresh focus tomorrow — completed ones are already in your History.
+            </div>
+          )}
+
+          {coachLoading === "daily" && (
+            <div style={{ color: C.muted, fontFamily: mono, fontSize: 12, padding: "18px 0", letterSpacing: "0.15em" }}>READING YOUR INSTRUMENTS…</div>
+          )}
+
+          {!coachLoading && coach.daily && (
+            <>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {focusItems.map((f, i) => {
+                  const done = (coach.dailyDone || []).includes(i);
+                  const isNext = i === nextImportantIdx && !done;
+                  return (
+                    <div
+                      key={i}
+                      onClick={() => setCoach((p) => ({ ...p, dailyDone: done ? p.dailyDone.filter((d) => d !== i) : [...p.dailyDone, i] }))}
+                      style={{ display: "flex", gap: 10, alignItems: "flex-start", background: C.bg, border: `1px solid ${done ? C.green : isNext ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer", transition: "border-color 0.25s ease" }}
+                    >
+                      <div style={{ fontFamily: mono, fontSize: 14, color: done ? C.green : isNext ? C.amber : C.muted, lineHeight: 1.4 }}>{done ? "◉" : "○"}</div>
+                      <div style={{ minWidth: 0 }}>
+                        {isNext && (
+                          <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.18em", color: C.amber, marginBottom: 2 }}>★ DO THIS NEXT — HIGHEST IMPACT</div>
+                        )}
+                        <div style={{ fontSize: 14, lineHeight: 1.45, textDecoration: done ? "line-through" : "none", color: done ? C.muted : C.ink, wordBreak: "break-word" }}>{f.text}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {allFocusDone && (
+                <div style={{ fontSize: 13, color: C.green, marginTop: 10, fontWeight: 700 }}>
+                  ✓ All done — these archive to History tonight, and a fresh focus arrives tomorrow.
+                </div>
+              )}
+              {coach.daily.why && <div style={{ fontSize: 12, color: C.muted, marginTop: 10, lineHeight: 1.5 }}>{coach.daily.why}</div>}
+              {coach.daily.watch && <div style={{ fontSize: 12, color: C.amber, marginTop: 8, lineHeight: 1.5 }}>⚠ {coach.daily.watch}</div>}
+              {coach.daily.reminder && (
+                <div style={{ marginTop: 12, borderLeft: `2px solid ${C.green}`, paddingLeft: 10, fontSize: 12, color: C.green, lineHeight: 1.5, fontStyle: "italic" }}>
+                  {coach.daily.reminder}
+                </div>
+              )}
+            </>
+          )}
+
+          {!coachLoading && !coach.daily && (
+            <div style={{ padding: "10px 0" }}>
+              <div style={{ color: C.muted, fontSize: 13, marginBottom: 10 }}>
+                {canAutoGen ? "No focus set for today yet." : "Waiting for sync — generate manually if needed."}
+              </div>
+              <Btn onClick={runDaily} disabled={coachLoading === "daily"}>Generate today's focus</Btn>
+            </div>
+          )}
+        </div>
+
+        <div style={{ padding: "14px 20px", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0 }}>
+          <Btn ghost onClick={onClose} style={{ width: "100%" }}>Close</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- weekly review popup ---------- */
+function WeeklyReviewModal({ onClose, coach, coachLoading, runWeekly }) {
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 440, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+      >
+        <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 14 }}>
+            <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink }}>
+              📊 Weekly Review{coach.weeklyDate ? ` — last run ${coach.weeklyDate}` : ""}
+            </div>
+            <Btn onClick={runWeekly} disabled={coachLoading === "weekly"} style={{ padding: "6px 12px", fontSize: 11, flexShrink: 0 }}>
+              {coachLoading === "weekly" ? "Reviewing…" : "Run review"}
+            </Btn>
+          </div>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden", padding: "0 20px 16px", minHeight: 0 }}>
+          {!coach.weekly && coachLoading !== "weekly" && (
+            <div style={{ color: C.muted, fontSize: 13, padding: "10px 0" }}>No review yet — run one every Friday to see your funnel, pipeline, and emotional patterns for the week.</div>
+          )}
+          {coach.weekly && coachLoading !== "weekly" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: C.amber, lineHeight: 1.45, wordBreak: "break-word" }}>{coach.weekly.verdict}</div>
+              {[
+                ["FUNNEL", coach.weekly.funnel],
+                ["PIPELINE", coach.weekly.pipeline],
+                ["EMOTIONS", coach.weekly.emotions],
+                ["FLOOR CHECK", coach.weekly.floor],
+              ].map(
+                ([k, v]) =>
+                  v && (
+                    <div key={k}>
+                      <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.muted, marginBottom: 3 }}>{k}</div>
+                      <div style={{ fontSize: 13, lineHeight: 1.55, wordBreak: "break-word" }}>{v}</div>
+                    </div>
+                  )
+              )}
+              {Array.isArray(coach.weekly.next_week) && coach.weekly.next_week.length > 0 && (
+                <div>
+                  <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.muted, marginBottom: 3 }}>NEXT WEEK</div>
+                  {coach.weekly.next_week.map((n, i) => (
+                    <div key={i} style={{ fontSize: 13, lineHeight: 1.6, wordBreak: "break-word" }}>
+                      <span style={{ color: C.amber, fontFamily: mono }}>{i + 1}.</span> {n}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div style={{ padding: "14px 20px", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0 }}>
+          <Btn ghost onClick={onClose} style={{ width: "100%" }}>Close</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function SupportModal({ onClose, runSupport, onSaveSession }) {
   const [feeling, setFeeling] = useState("");
