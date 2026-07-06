@@ -1778,6 +1778,27 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const th = { textAlign: "left", fontFamily: sans, fontSize: 10, letterSpacing: "0.14em", color: C.muted, textTransform: "uppercase", padding: "8px 10px", borderBottom: `1px solid ${C.panelEdge}`, whiteSpace: "nowrap" };
     const td = { padding: "10px 10px", borderBottom: `1px solid ${C.panelEdge}`, fontSize: 13, verticalAlign: "middle" };
+    const selMini = { fontSize: 13, fontFamily: sans, background: "transparent", border: "1px solid transparent", borderRadius: 6, padding: "3px 2px", outline: "none" };
+
+    /* excel-style inline cell: uncontrolled, commits on blur/Enter, no popup needed */
+    const cellInput = (a, field, opts = {}) => (
+      <input
+        key={a.id + field + String(a[field] ?? "")}
+        defaultValue={a[field] ?? ""}
+        type={opts.type || "text"}
+        placeholder={opts.ph || "—"}
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") e.currentTarget.blur();
+        }}
+        onBlur={(e) => {
+          const v = e.target.value;
+          if (v !== (a[field] ?? "")) updateAppField(a.id, field, v);
+        }}
+        style={{ width: "100%", minWidth: opts.w || 90, boxSizing: "border-box", fontSize: 13, fontFamily: opts.mono ? mono : sans, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.ink, padding: "4px 6px", outline: "none" }}
+        onFocus={(e) => (e.target.style.border = `1px solid ${C.blue}`)}
+      />
+    );
 
     return (
       <>
@@ -1804,7 +1825,167 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         )}
 
-        {shown.length > 0 && (
+        {shown.length > 0 && isDesktop && (
+          <div
+            style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}
+          >
+            <datalist id="jobboard-suggestions">
+              {JOB_BOARD_OPTIONS.filter((b) => b !== "Other").map((b) => (
+                <option key={b} value={b} />
+              ))}
+            </datalist>
+            <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1700 }}>
+              <thead>
+                <tr>
+                  <th style={th}>Company / Website</th>
+                  <th style={th}>Source / Board</th>
+                  <th style={th}>Contact</th>
+                  <th style={th}>Email</th>
+                  <th style={th}>Post link</th>
+                  <th style={th}>Screenshot</th>
+                  <th style={th}>Salary / offer</th>
+                  <th style={th}>Status</th>
+                  <th style={th}>Contacted</th>
+                  <th style={th}>Follow-up</th>
+                  <th style={th}>Notes</th>
+                  <th style={{ ...th, width: 50 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((a) => {
+                  const nf = nextFollowUp(a);
+                  const due = isDue(a);
+                  const fus = normFollowUps(a);
+                  const doneCount = fus.filter((x) => x.done).length;
+                  return (
+                    <tr key={a.id} style={{ background: due ? "rgba(248,113,113,0.06)" : "transparent" }}>
+                      <td style={{ ...td, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 170 }}>
+                        {cellInput(a, "company", { ph: "Company" })}
+                        {cellInput(a, "website", { ph: "website.com" })}
+                      </td>
+                      <td style={{ ...td, minWidth: 130 }} onClick={(e) => e.stopPropagation()}>
+                        <select
+                          value={a.source || ""}
+                          onChange={(e) => updateAppField(a.id, "source", e.target.value)}
+                          style={{ ...selMini, color: a.source ? C.ink : C.muted, width: "100%" }}
+                        >
+                          <option value="">—</option>
+                          {APP_SOURCES.map((s) => (
+                            <option key={s} value={s} style={{ background: C.panel }}>
+                              {s}
+                            </option>
+                          ))}
+                        </select>
+                        {a.source === "Job board" && (
+                          <input
+                            key={a.id + "board" + (a.jobBoardName || "")}
+                            list="jobboard-suggestions"
+                            defaultValue={a.jobBoardName || ""}
+                            placeholder="Which board?"
+                            onBlur={(e) => {
+                              if (e.target.value !== (a.jobBoardName || "")) updateAppField(a.id, "jobBoardName", e.target.value);
+                            }}
+                            onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                            style={{ width: "100%", boxSizing: "border-box", fontSize: 12, fontFamily: mono, color: C.blue, background: "transparent", border: "1px solid transparent", borderRadius: 6, padding: "3px 4px", outline: "none", marginTop: 2 }}
+                            onFocus={(e) => (e.target.style.border = `1px solid ${C.blue}`)}
+                          />
+                        )}
+                      </td>
+                      <td style={{ ...td, minWidth: 110 }}>{cellInput(a, "contact", { ph: "Name" })}</td>
+                      <td style={{ ...td, minWidth: 140 }}>{cellInput(a, "email", { ph: "email@…" })}</td>
+                      <td style={{ ...td, minWidth: 130 }}>{cellInput(a, "postLink", { ph: "https://…" })}</td>
+                      <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
+                        {a.postShot ? (
+                          <a href={shotPublicUrl(a.postShot)} target="_blank" rel="noreferrer" style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
+                            🖼 view
+                          </a>
+                        ) : (
+                          <button
+                            onClick={() => setModal({ kind: "application", entry: a })}
+                            title="Attach a screenshot (upload or paste)"
+                            style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 6, padding: "3px 8px", fontSize: 11, cursor: "pointer" }}
+                          >
+                            📎 attach
+                          </button>
+                        )}
+                      </td>
+                      <td style={{ ...td, minWidth: 110 }}>{cellInput(a, "salary", { ph: "₱ / $", mono: true })}</td>
+                      <td style={{ ...td, minWidth: 140 }} onClick={(e) => e.stopPropagation()}>
+                        <select
+                          value={a.status ?? ""}
+                          onChange={(e) => setAppStatus(a.id, e.target.value)}
+                          style={{ ...selMini, fontFamily: mono, background: C.bg, color: statusColor(a.status), border: `1px solid ${C.panelEdge}`, padding: "4px 6px", width: "100%" }}
+                        >
+                          {APP_STATUSES.map((s) => (
+                            <option key={s || "blank"} value={s}>
+                              {statusLabel(s)}
+                            </option>
+                          ))}
+                        </select>
+                        {a.status === "outreach" && (
+                          <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                            <select
+                              value={a.outreachKind || ""}
+                              onChange={(e) => updateAppField(a.id, "outreachKind", e.target.value)}
+                              style={{ ...selMini, fontSize: 10, color: a.outreachKind ? outreachKindColor(a.outreachKind) : C.muted, flex: 1, padding: "2px" }}
+                            >
+                              <option value="">kind</option>
+                              {OUTREACH_KINDS.map((k) => (
+                                <option key={k} value={k}>
+                                  {k}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              value={a.outreachChannel || ""}
+                              onChange={(e) => updateAppField(a.id, "outreachChannel", e.target.value)}
+                              style={{ ...selMini, fontSize: 10, color: a.outreachChannel ? C.ink : C.muted, flex: 1, padding: "2px" }}
+                            >
+                              <option value="">via</option>
+                              {OUTREACH_CHANNELS.map((c) => (
+                                <option key={c} value={c}>
+                                  {c}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                      </td>
+                      <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
+                        <input
+                          key={a.id + "contacted" + (a.contacted || "")}
+                          type="date"
+                          defaultValue={a.contacted || ""}
+                          onChange={(e) => updateAppField(a.id, "contacted", e.target.value)}
+                          style={{ fontSize: 13, fontFamily: mono, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.muted, padding: "4px 2px", outline: "none", colorScheme: "dark" }}
+                        />
+                      </td>
+                      <td
+                        style={{ ...td, fontFamily: mono, fontSize: 12, whiteSpace: "nowrap", color: due ? C.red : nf ? C.muted : C.green, cursor: "pointer" }}
+                        onClick={() => setModal({ kind: "application", entry: a })}
+                        title="Click to edit the follow-up schedule"
+                      >
+                        {nf ? `${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}
+                      </td>
+                      <td style={{ ...td, minWidth: 140 }}>{cellInput(a, "notes", { ph: "notes…" })}</td>
+                      <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => mutate((s) => ({ ...s, applications: s.applications.filter((x) => x.id !== a.id) }), "Application deleted")}
+                          title="Delete"
+                          style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
+                        >
+                          ×
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {shown.length > 0 && !isDesktop && (
           <div
             onTouchStart={(e) => e.stopPropagation()}
             onTouchMove={(e) => e.stopPropagation()}
@@ -1830,75 +2011,33 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   const due = isDue(a);
                   const fus = normFollowUps(a);
                   const doneCount = fus.filter((x) => x.done).length;
-                  /* excel-style inline cell (desktop): uncontrolled, commits on blur/Enter */
-                  const cellInput = (field, opts = {}) => (
-                    <input
-                      key={a.id + field + String(a[field] ?? "")}
-                      defaultValue={a[field] ?? ""}
-                      type={opts.type || "text"}
-                      placeholder={opts.ph || "—"}
-                      onClick={(e) => e.stopPropagation()}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") e.currentTarget.blur();
-                      }}
-                      onBlur={(e) => {
-                        const v = e.target.value;
-                        if (v !== (a[field] ?? "")) updateAppField(a.id, field, v);
-                      }}
-                      style={{ width: "100%", minWidth: opts.w || 90, boxSizing: "border-box", fontSize: 16, fontFamily: opts.mono ? mono : sans, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.ink, padding: "4px 6px", outline: "none" }}
-                      onFocus={(e) => (e.target.style.border = `1px solid ${C.blue}`)}
-                    />
-                  );
                   return (
-                    <tr
-                      key={a.id}
-                      onClick={() => (isDesktop ? null : setModal({ kind: "application", entry: a }))}
-                      style={{ cursor: isDesktop ? "default" : "pointer", background: due ? "rgba(248,113,113,0.06)" : "transparent" }}
-                    >
+                    <tr key={a.id} onClick={() => setModal({ kind: "application", entry: a })} style={{ cursor: "pointer", background: due ? "rgba(248,113,113,0.06)" : "transparent" }}>
                       <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 150 }}>
-                        {isDesktop ? cellInput("company", { ph: "Company" }) : a.company || "Unnamed"}
+                        {a.company || "Unnamed"}
                         {a.website && (
-                          <a href={a.website.startsWith("http") ? a.website : "https://" + a.website} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} style={{ color: C.blue, fontSize: 11, textDecoration: "none", display: "block", padding: "0 6px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160 }}>
+                          <div style={{ color: C.blue, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 160 }}>
                             ↗ {a.website.replace(/^https?:\/\//, "")}
-                          </a>
+                          </div>
                         )}
                       </td>
-                      <td style={td} onClick={(e) => e.stopPropagation()}>
-                        {isDesktop ? (
-                          <select
-                            value={a.source || ""}
-                            onChange={(e) => updateAppField(a.id, "source", e.target.value)}
-                            style={{ fontSize: 16, fontFamily: sans, background: "transparent", color: a.source ? C.ink : C.muted, border: `1px solid transparent`, borderRadius: 6, padding: "4px 2px", outline: "none", maxWidth: 120 }}
-                          >
-                            <option value="">—</option>
-                            {APP_SOURCES.map((s) => (
-                              <option key={s} value={s} style={{ background: C.panel }}>
-                                {s}
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          <span style={{ fontSize: 12, color: a.source ? C.ink : C.muted }}>{a.source || "—"}</span>
-                        )}
+                      <td style={td}>
+                        <span style={{ fontSize: 12, color: a.source ? C.ink : C.muted }}>{a.source || "—"}</span>
                         {a.source === "Job board" && a.jobBoardName && (
                           <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.06em", color: C.blue, marginTop: 3 }}>{a.jobBoardName}</div>
                         )}
                       </td>
-                      <td style={td} onClick={(e) => e.stopPropagation()}>
+                      <td style={td}>
                         {a.postLink ? (
-                          <a href={a.postLink.startsWith("http") ? a.postLink : "https://" + a.postLink} target="_blank" rel="noreferrer" style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
-                            🔗 link
-                          </a>
+                          <span style={{ color: C.blue, fontSize: 12 }}>🔗 link</span>
                         ) : a.postShot ? (
-                          <a href={shotPublicUrl(a.postShot)} target="_blank" rel="noreferrer" style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
-                            🖼 shot
-                          </a>
+                          <span style={{ color: C.blue, fontSize: 12 }}>🖼 shot</span>
                         ) : (
                           <span style={{ color: C.muted, fontSize: 12 }}>—</span>
                         )}
                       </td>
-                      <td style={{ ...td, minWidth: 110 }} onClick={(e) => e.stopPropagation()}>
-                        {isDesktop ? cellInput("salary", { ph: "₱ / $", mono: true, w: 110 }) : <span style={{ fontFamily: mono, fontSize: 12, color: a.salary ? C.ink : C.muted }}>{a.salary || "—"}</span>}
+                      <td style={{ ...td, minWidth: 110 }}>
+                        <span style={{ fontFamily: mono, fontSize: 12, color: a.salary ? C.ink : C.muted }}>{a.salary || "—"}</span>
                       </td>
                       <td style={td} onClick={(e) => e.stopPropagation()}>
                         <select
@@ -1918,30 +2057,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           </div>
                         )}
                       </td>
-                      <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
-                        {isDesktop ? (
-                          <input
-                            key={a.id + "contacted" + (a.contacted || "")}
-                            type="date"
-                            defaultValue={a.contacted || ""}
-                            onChange={(e) => updateAppField(a.id, "contacted", e.target.value)}
-                            style={{ fontSize: 16, fontFamily: mono, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.muted, padding: "4px 2px", outline: "none", colorScheme: "dark" }}
-                          />
-                        ) : (
-                          <span style={{ fontFamily: mono, fontSize: 12, color: C.muted }}>{a.contacted || "—"}</span>
-                        )}
+                      <td style={{ ...td, whiteSpace: "nowrap" }}>
+                        <span style={{ fontFamily: mono, fontSize: 12, color: C.muted }}>{a.contacted || "—"}</span>
                       </td>
                       <td style={{ ...td, fontFamily: mono, fontSize: 12, whiteSpace: "nowrap", color: due ? C.red : nf ? C.muted : C.green }}>
                         {nf ? `${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}
                       </td>
                       <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
-                        <button
-                          onClick={() => setModal({ kind: "application", entry: a })}
-                          title="Open full editor (notes, follow-ups, screenshot)"
-                          style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.blue, fontSize: 12, lineHeight: "22px", cursor: "pointer", padding: 0, marginRight: 6 }}
-                        >
-                          ▸
-                        </button>
                         <button
                           onClick={() => mutate((s) => ({ ...s, applications: s.applications.filter((x) => x.id !== a.id) }), "Application deleted")}
                           title="Delete"
@@ -1959,7 +2081,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         )}
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
           {isDesktop
-            ? "Edit cells directly like a spreadsheet (Enter or click away to save) · ▸ opens the full editor · status changes update the Funnel instantly."
+            ? "Full spreadsheet — click any cell to edit, Enter or click away to save. 📎 attach handles screenshots; the follow-up column opens the schedule editor."
             : "Tap a row to edit · status changes update the Funnel instantly."}
         </div>
       </>
@@ -2379,13 +2501,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         }
       `}</style>
 
-      <div style={{ width: "100%", maxWidth: isDesktop ? 1240 : 560, margin: "0 auto", flex: 1, display: "flex", flexDirection: "column" }}>
+      <div style={{ width: "100%", maxWidth: isDesktop ? (MODES[mode] === "PIPELINE" ? 1800 : 900) : 560, margin: "0 auto", flex: 1, display: "flex", flexDirection: "column", transition: "max-width 0.2s ease" }}>
         {/* header */}
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
           <div>
             <div style={{ fontFamily: mono, fontSize: 11, letterSpacing: "0.3em", color: C.amber }}>FLIGHT DECK</div>
             <div style={{ fontSize: isDesktop ? 24 : 20, fontWeight: 800, letterSpacing: "-0.01em", marginTop: 2 }}>
-              {isDesktop ? "Job Search Operating System" : TITLES[MODES[mode]]}
+              {TITLES[MODES[mode]]}
             </div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
@@ -2401,28 +2523,59 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         </div>
 
+        {/* desktop: top tab navigation (mirrors the mobile bottom bar, one mode at a time) */}
+        {isDesktop && (
+          <div style={{ display: "flex", gap: 6, margin: "16px 0 4px", borderBottom: `1px solid ${C.panelEdge}`, paddingBottom: 10 }}>
+            {[
+              ["⌂", "Home", 0],
+              ["🎯", "Goal", 1],
+              ["▦", "CRM", 2, dueList.length],
+              ["♡", "Mind", 3],
+              ["⛽", "Fuel", 4],
+              ["★", "Wins", 5],
+            ].map(([icon, label, i, badge]) => (
+              <button
+                key={label}
+                onClick={() => setMode(i)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 7,
+                  background: mode === i ? "rgba(245,185,66,0.12)" : "transparent",
+                  border: `1px solid ${mode === i ? C.amber : "transparent"}`,
+                  borderRadius: 20,
+                  padding: "8px 16px",
+                  cursor: "pointer",
+                  color: mode === i ? C.amber : C.muted,
+                  fontFamily: sans,
+                  fontSize: 13,
+                  fontWeight: mode === i ? 800 : 600,
+                  position: "relative",
+                }}
+              >
+                <span style={{ fontSize: 15 }}>{icon}</span>
+                {label}
+                {badge > 0 && (
+                  <span style={{ minWidth: 16, height: 16, borderRadius: 8, background: C.red, color: "#2b0b0b", fontFamily: mono, fontSize: 9, fontWeight: 800, lineHeight: "16px", padding: "0 4px" }}>
+                    {badge}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* mobile: content area (tab bar is fixed at bottom) */}
         {!isDesktop && <div style={{ height: 6 }} />}
 
-        {/* content */}
-        {isDesktop ? (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, alignItems: "start", marginTop: 18, flex: 1 }}>
-            <Panel title="◈ DASHBOARD" style={{ gridColumn: "1 / -1" }}>
-              {renderDashboard()}
-            </Panel>
-            <Panel title="◈ PIPELINE — ALL APPLICATIONS" style={{ gridColumn: "1 / -1" }}>
-              {renderPipeline()}
-            </Panel>
-            <Panel title="◈ GOAL PLANNER">{renderGoal()}</Panel>
-            <Panel title="◈ MIND">{renderEmotions()}</Panel>
-            <Panel title="◈ RUNWAY GAUGE">{renderRunway()}</Panel>
-            <Panel title="◈ HISTORY — ACCOMPLISHMENTS" style={{ gridColumn: "1 / -1" }}>
-              {renderHistory()}
-            </Panel>
-          </div>
-        ) : (
-          <div style={{ flex: 1 }}>{SECTIONS[MODES[mode]]()}</div>
-        )}
+        {/* content — one mode at a time on both mobile and desktop; Pipeline gets full width via the wrapper above */}
+        <div style={{ flex: 1, marginTop: isDesktop ? 14 : 0 }}>
+          {isDesktop ? (
+            <Panel title={`◈ ${TITLES[MODES[mode]].toUpperCase()}`}>{SECTIONS[MODES[mode]]()}</Panel>
+          ) : (
+            SECTIONS[MODES[mode]]()
+          )}
+        </div>
 
         {/* footer */}
         <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center", marginTop: 16, paddingBottom: isDesktop ? 0 : 74 }}>
@@ -2578,7 +2731,8 @@ function Modal({ modal, onClose, onSave, totals }) {
       const extFromName = file.name && file.name.includes(".") ? file.name.split(".").pop() : "";
       const extFromType = file.type && file.type.includes("/") ? file.type.split("/")[1] : "";
       const ext = (extFromName || extFromType || "png").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 5) || "png";
-      const p = `${modal.syncKey || "shared"}/${uid()}-${Date.now()}.${ext}`;
+      const prefix = modal.syncKey || `fallback-${uid()}${uid()}`; /* never a guessable literal, even if syncKey is somehow missing */
+      const p = `${prefix}/${uid()}-${Date.now()}.${ext}`;
       await uploadShot(p, file);
       set("postShot")(p);
     } catch (err) {
