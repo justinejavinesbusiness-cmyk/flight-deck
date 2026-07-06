@@ -152,38 +152,78 @@ const countWorkingDays = (startIso, endIso) => {
    the ONLY thing that doesn't count is a "saved for later" lead with no status yet.
    Application and outreach are treated identically: each is worth 1 toward the target. */
 const isGoalActivity = (a) => !isBlankStatus(a);
+
+/* Aggressiveness controls BOTH how big the daily quota is AND, when ramp-up is
+   on, how gently/quickly you build up to it. Chill = lower quota, slow 2-week
+   warm-up. Aggressive = higher quota (pushes past the strict math), 3-day ramp. */
+const AGGRESSIVENESS = {
+  chill: { label: "Chill", emoji: "🌱", quotaMultiplier: 0.8, rampDays: 14, rampStart: 0.3 },
+  steady: { label: "Steady", emoji: "⚖️", quotaMultiplier: 1.0, rampDays: 7, rampStart: 0.5 },
+  aggressive: { label: "Aggressive", emoji: "🔥", quotaMultiplier: 1.25, rampDays: 3, rampStart: 0.7 },
+};
+const aggressivenessOf = (goal) => AGGRESSIVENESS[goal?.aggressiveness] || AGGRESSIVENESS.steady;
+/* the target for one specific 1-based day-index in the campaign, given ramp settings */
+function dailyTargetForDay(goal, dayIndex, fullQuota) {
+  if (!goal.rampEnabled) return fullQuota;
+  const preset = aggressivenessOf(goal);
+  const rampDays = Math.max(1, preset.rampDays);
+  if (rampDays === 1 || dayIndex >= rampDays) return fullQuota;
+  const startVal = Math.max(1, Math.round(fullQuota * preset.rampStart));
+  const frac = (dayIndex - 1) / (rampDays - 1);
+  return Math.max(1, Math.round(startVal + (fullQuota - startVal) * frac));
+}
+
 /* pure: derive everything about a goal from the goal record + the pipeline */
 function computeGoal(goal, apps) {
   if (!goal || !goal.target || !goal.days) return null;
-  const dailyQuota = Math.ceil(goal.target / goal.days);
+  const preset = aggressivenessOf(goal);
+  const fullQuota = Math.max(1, Math.ceil((goal.target / goal.days) * preset.quotaMultiplier));
   const deadline = addDays(goal.startDate, goal.days - 1);
   const t = today();
   const elapsedCalendarDays = Math.min(goal.days, Math.max(0, Math.floor((new Date(t) - new Date(goal.startDate)) / 86400000) + 1));
-  const expectedByNow = Math.min(goal.target, Math.round((goal.target * elapsedCalendarDays) / goal.days));
+
+  /* expected-by-now = sum of each day's scheduled target so far (ramp-aware), skipping Sundays */
+  let expectedByNow = 0;
+  for (let i = 1; i <= elapsedCalendarDays; i++) {
+    const d = new Date(goal.startDate + "T00:00:00");
+    d.setDate(d.getDate() + (i - 1));
+    if (d.getDay() === 0) continue;
+    expectedByNow += dailyTargetForDay(goal, i, fullQuota);
+  }
+
   const actualTotal = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && isGoalActivity(a)).length;
   const actualByNow = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && a.contacted <= t && isGoalActivity(a)).length;
   const daysRemaining = Math.max(0, countWorkingDays(t > deadline ? deadline : t, deadline) - (t <= deadline ? 1 : 0));
   const pastDeadline = t > deadline;
+  const todaysTarget = dailyTargetForDay(goal, Math.max(1, elapsedCalendarDays), fullQuota);
+  const stillRamping = goal.rampEnabled && elapsedCalendarDays < preset.rampDays;
 
-  /* weekly breakdown, Mon-Sat buckets across the whole campaign span */
+  /* weekly breakdown, Mon-Sat buckets across the whole campaign span, ramp-aware */
   const weeksMap = new Map();
+  let dayCounter = 0;
   for (let d = new Date(goal.startDate + "T00:00:00"); d <= new Date(deadline + "T00:00:00"); d.setDate(d.getDate() + 1)) {
+    dayCounter++;
     if (d.getDay() === 0) continue;
     const wStart = iso(mondayOf(d));
     const label = weekLabel(mondayOf(d));
-    if (!weeksMap.has(label)) weeksMap.set(label, { label, weekStart: wStart, workingDays: 0 });
-    weeksMap.get(label).workingDays += 1;
+    if (!weeksMap.has(label)) weeksMap.set(label, { label, weekStart: wStart, workingDays: 0, target: 0 });
+    const wk = weeksMap.get(label);
+    wk.workingDays += 1;
+    wk.target += dailyTargetForDay(goal, dayCounter, fullQuota);
   }
   const weeks = Array.from(weeksMap.values())
     .sort((a, b) => a.weekStart.localeCompare(b.weekStart))
     .map((w) => ({
       ...w,
-      target: dailyQuota * w.workingDays,
       actual: apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length,
     }));
 
   return {
-    dailyQuota,
+    fullQuota,
+    todaysTarget,
+    stillRamping,
+    rampDaysLeft: stillRamping ? Math.max(0, preset.rampDays - elapsedCalendarDays) : 0,
+    aggressiveness: preset,
     deadline,
     elapsedCalendarDays,
     expectedByNow,
@@ -999,7 +1039,12 @@ export default function FlightDeck() {
       if (!state.goal) return "No goal currently set.";
       const g = computeGoal(state.goal, apps);
       if (!g) return "No goal currently set.";
-      return `Active goal: ${state.goal.target} applications+outreach combined (each counts as 1) over ${state.goal.days} days, deadline ${g.deadline}, daily quota ${g.dailyQuota}. Progress: ${g.actualTotal}/${state.goal.target} (${g.pctComplete}%) — ${g.pastDeadline ? "deadline passed" : g.onPace ? "on pace" : `behind, expected ${g.expectedByNow} by now`}.`;
+      const rampNote = state.goal.rampEnabled
+        ? g.stillRamping
+          ? ` Ramping up (${g.aggressiveness.label} style): today's target is ${g.todaysTarget}/day, building to ${g.fullQuota}/day over the next ${g.rampDaysLeft} day(s).`
+          : ` Ramp-up complete, holding at full pace (${g.fullQuota}/day).`
+        : ` Flat pace, no ramp-up.`;
+      return `Active goal: ${state.goal.target} applications+outreach combined (each counts as 1) over ${state.goal.days} days, deadline ${g.deadline}, aggressiveness ${g.aggressiveness.label}, full daily quota ${g.fullQuota}.${rampNote} Progress: ${g.actualTotal}/${state.goal.target} (${g.pctComplete}%) — ${g.pastDeadline ? "deadline passed" : g.onPace ? "on pace" : `behind, expected ${g.expectedByNow} by now`}.`;
     })();
     const sessions = (state.supportSessions || [])
       .slice(0, 6)
@@ -1029,7 +1074,7 @@ Non-negotiable playbook rules you must coach within:
 - Follow-ups that are due should usually be today's first action items - name the specific companies.
 - Rejection at ~95% of cold applications is the statistical norm, not a verdict. Decisions come from tracker numbers, never from moods.
 - Emotions: each logged emotion should convert to exactly ONE small action. High intensity (8+) = body regulation first.
-- If an active goal is set, its daily quota and deadline override the generic weekly benchmark for volume advice — prioritize hitting the quota and flag clearly if behind pace.
+- If an active goal is set, use its stated "today's target" (which may still be ramping up) and deadline instead of the generic weekly benchmark for volume advice — prioritize hitting today's specific number and flag clearly if behind pace.
 - If past wins exist, treat their snapshot numbers as this person's own proven benchmark (e.g. "last time it took you N applications") rather than generic statistics — it's more convincing evidence than population averages.
 Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference their actual numbers and company names.`;
 
@@ -1363,7 +1408,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       mutate(
         (s) => ({
           ...s,
-          goal: { target, days, startDate: data.startDate || today() },
+          goal: {
+            target,
+            days,
+            startDate: data.startDate || today(),
+            aggressiveness: AGGRESSIVENESS[data.aggressiveness] ? data.aggressiveness : "steady",
+            rampEnabled: !!data.rampEnabled,
+          },
         }),
         entry ? "Goal updated" : "Goal set"
       );
@@ -2240,21 +2291,31 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 <Label>
                   {state.goal.target} applications + outreach over {state.goal.days} days
                 </Label>
-                <Btn ghost onClick={() => setModal({ kind: "goal", entry: state.goal })} style={{ padding: "6px 10px", fontSize: 11 }}>
-                  Edit
-                </Btn>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <span style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.amber, border: `1px solid ${C.panelEdge}`, borderRadius: 20, padding: "3px 9px" }}>
+                    {g.aggressiveness.emoji} {g.aggressiveness.label}
+                  </span>
+                  <Btn ghost onClick={() => setModal({ kind: "goal", entry: state.goal })} style={{ padding: "6px 10px", fontSize: 11 }}>
+                    Edit
+                  </Btn>
+                </div>
               </div>
 
               <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 6 }}>
                 <div style={{ fontFamily: mono, fontSize: 44, fontWeight: 800, color: C.amber, lineHeight: 1.1 }}>
-                  {g.dailyQuota}
+                  {g.todaysTarget}
                 </div>
                 <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.4 }}>
-                  per day
+                  today's target
                   <br />
-                  to hit the target
+                  {g.stillRamping ? `ramping to ${g.fullQuota}/day` : "at full pace"}
                 </div>
               </div>
+              {g.stillRamping && (
+                <div style={{ fontSize: 11, color: C.green, marginTop: 4 }}>
+                  🌱 Warming up — {g.rampDaysLeft} day{g.rampDaysLeft === 1 ? "" : "s"} left until full pace ({g.fullQuota}/day).
+                </div>
+              )}
 
               <div style={{ height: 10, background: C.bg, borderRadius: 5, marginTop: 12, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
                 <div style={{ height: "100%", width: `${g.pctComplete}%`, background: g.onPace ? C.green : C.amber, borderRadius: 5, transition: "width 0.4s ease" }} />
@@ -2743,6 +2804,8 @@ function Modal({ modal, onClose, onSave, totals }) {
         target: entry?.target ?? 500,
         days: entry?.days ?? 90,
         startDate: entry?.startDate || today(),
+        aggressiveness: entry?.aggressiveness || "steady",
+        rampEnabled: entry?.rampEnabled || false,
       };
     if (kind === "winSnapshot") return { company: "", role: "", date: today() };
     return { fund: entry?.fund ?? "", expenses: entry?.expenses ?? "" };
@@ -3230,14 +3293,84 @@ function Modal({ modal, onClose, onSave, totals }) {
               <Field label="Over how many days" type="number" value={f.days} onChange={set("days")} />
             </div>
             <Field label="Start date" type="date" value={f.startDate} onChange={set("startDate")} />
+
+            <div style={{ marginBottom: 12 }}>
+              <Label>Aggressiveness</Label>
+              <div style={{ display: "flex", gap: 8 }}>
+                {Object.entries(AGGRESSIVENESS).map(([key, p]) => (
+                  <button
+                    key={key}
+                    onClick={() => set("aggressiveness")(key)}
+                    style={{
+                      flex: 1,
+                      fontFamily: sans,
+                      fontSize: 13,
+                      fontWeight: 700,
+                      padding: "10px 8px",
+                      borderRadius: 10,
+                      cursor: "pointer",
+                      border: `1px solid ${f.aggressiveness === key ? C.amber : C.panelEdge}`,
+                      background: f.aggressiveness === key ? "rgba(245,185,66,0.12)" : "transparent",
+                      color: f.aggressiveness === key ? C.amber : C.muted,
+                    }}
+                  >
+                    {p.emoji} {p.label}
+                  </button>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>
+                {f.aggressiveness === "chill" && "Lighter daily target (80% of the strict math) — sustainable pace, easier to keep up for the long haul."}
+                {f.aggressiveness === "steady" && "Exactly the strict math (target ÷ days) — the baseline pace."}
+                {f.aggressiveness === "aggressive" && "Pushes past the strict math (125%) — finishes with margin, or gets there faster."}
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <Label>Ramp-up</Label>
+                <button
+                  onClick={() => set("rampEnabled")(!f.rampEnabled)}
+                  style={{
+                    fontFamily: sans,
+                    fontSize: 12,
+                    fontWeight: 700,
+                    padding: "6px 14px",
+                    borderRadius: 20,
+                    cursor: "pointer",
+                    border: `1px solid ${f.rampEnabled ? C.green : C.panelEdge}`,
+                    background: f.rampEnabled ? "rgba(74,222,128,0.12)" : "transparent",
+                    color: f.rampEnabled ? C.green : C.muted,
+                  }}
+                >
+                  {f.rampEnabled ? "● On" : "○ Off"}
+                </button>
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 4, lineHeight: 1.5 }}>
+                Start below full pace and build up gradually, instead of hitting the full daily number from day one. The warm-up length and starting point follow your aggressiveness choice above.
+              </div>
+            </div>
+
             {(() => {
               const target = Math.max(1, Math.round(+f.target || 0));
               const days = Math.max(1, Math.round(+f.days || 0));
-              const quota = Math.ceil(target / days);
+              const previewGoal = { target, days, startDate: f.startDate || today(), aggressiveness: f.aggressiveness, rampEnabled: f.rampEnabled };
+              const preset = aggressivenessOf(previewGoal);
+              const fullQuota = Math.max(1, Math.ceil((target / days) * preset.quotaMultiplier));
               const deadline = addDays(f.startDate || today(), days - 1);
+              const startVal = Math.max(1, Math.round(fullQuota * preset.rampStart));
               return (
                 <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", fontSize: 12, color: C.muted, lineHeight: 1.6, marginBottom: 4 }}>
-                  → <span style={{ color: C.amber, fontWeight: 700 }}>{quota} per day</span> ({target} ÷ {days} days, rounded up)
+                  {f.rampEnabled ? (
+                    <>
+                      → Starts around <span style={{ color: C.amber, fontWeight: 700 }}>{startVal}/day</span>, ramps up to{" "}
+                      <span style={{ color: C.amber, fontWeight: 700 }}>{fullQuota}/day</span> over {preset.rampDays} days, then holds steady.
+                    </>
+                  ) : (
+                    <>
+                      → <span style={{ color: C.amber, fontWeight: 700 }}>{fullQuota} per day</span>, flat from day one
+                      {preset.quotaMultiplier !== 1 ? ` (${target}÷${days} × ${preset.quotaMultiplier}, rounded up)` : ` (${target}÷${days}, rounded up)`}
+                    </>
+                  )}
                   <br />→ Deadline: <span style={{ color: C.ink, fontWeight: 700 }}>{deadline}</span>
                 </div>
               );
