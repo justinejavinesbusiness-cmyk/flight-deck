@@ -31,11 +31,12 @@ const C = {
   blue: "#7DB0F7",
 };
 
-const MODES = ["DASHBOARD", "PIPELINE", "EMOTIONS", "RUNWAY", "HISTORY"];
+const MODES = ["DASHBOARD", "GOAL", "PIPELINE", "EMOTIONS", "RUNWAY", "HISTORY"];
 const TITLES = {
   DASHBOARD: "Dashboard",
+  GOAL: "Goal Planner",
   PIPELINE: "Pipeline (CRM)",
-  EMOTIONS: "Emotion Protocol",
+  EMOTIONS: "Mind",
   RUNWAY: "Runway Gauge",
   HISTORY: "Accomplishments",
 };
@@ -88,6 +89,7 @@ const addDays = (isoDate, n) => {
 /* ---- application status model ---- */
 const APP_STATUSES = ["", "outreach", "applied", "followed up", "replied", "screening", "interview", "final round", "offer", "rejected"];
 const APP_SOURCES = ["LinkedIn", "Instagram", "Facebook", "Referral", "Job board", "Company site", "X / Twitter", "Other"];
+const JOB_BOARD_OPTIONS = ["Onlinejobs.ph", "Upwork", "Indeed", "Jobstreet", "We Work Remotely", "Other"];
 const OUTREACH_KINDS = ["warm", "cold"];
 const OUTREACH_CHANNELS = ["Email", "Call", "Text", "Other"];
 const STAGE_IDX = { "": -2, outreach: -1, applied: 0, "followed up": 1, replied: 2, screening: 3, interview: 4, "final round": 5, offer: 6 };
@@ -99,6 +101,94 @@ const reached = (a, stage) => a.status !== "rejected" && (STAGE_IDX[a.status] ??
 const statusColor = (s) =>
   s === "offer" ? C.green : s === "rejected" ? C.muted : s === "" ? C.muted : s === "outreach" ? C.blue : ["interview", "final round"].includes(s) ? C.amber : ["replied", "screening"].includes(s) ? C.blue : C.ink;
 const outreachKindColor = (k) => (k === "warm" ? C.amber : k === "cold" ? C.blue : C.muted);
+
+/* ---- automatic milestone wins ----
+   Any status change that moves a lead FORWARD (closer to the job) auto-logs
+   a motivating win to History, once per stage per application — never
+   duplicated even if the status bounces around or gets edited repeatedly. */
+const MILESTONE_STAGES = ["replied", "screening", "interview", "final round", "offer"];
+const MILESTONE_LABEL = { replied: "Reply", screening: "Screening", interview: "Interview", "final round": "Final Round", offer: "Offer" };
+const MILESTONE_EMOJI = { replied: "💬", screening: "📞", interview: "🎤", "final round": "🏁", offer: "🏆" };
+/* which milestone stages does newStatus newly reach, that oldStatus hadn't already? */
+function newlyReachedMilestones(oldStatus, newStatus) {
+  if (newStatus === "rejected") return [];
+  const oldIdx = STAGE_IDX[oldStatus] ?? -2;
+  const newIdx = STAGE_IDX[newStatus] ?? -2;
+  if (newIdx <= oldIdx) return [];
+  return MILESTONE_STAGES.filter((s) => STAGE_IDX[s] > oldIdx && STAGE_IDX[s] <= newIdx);
+}
+/* pure: given the application's PRIOR state and its new status, returns
+   { milestonesLogged, wins } if anything new was reached, else null */
+function computeMilestoneWins(prevApp, newStatus) {
+  const oldStatus = prevApp?.status ?? "";
+  const already = prevApp?.milestonesLogged || [];
+  const newlyReached = newlyReachedMilestones(oldStatus, newStatus).filter((s) => !already.includes(s));
+  if (!newlyReached.length) return null;
+  const companyName = prevApp?.company || "a company";
+  const wins = newlyReached.map((stage) => ({
+    id: uid(),
+    date: today(),
+    category: MILESTONE_LABEL[stage],
+    text: `${MILESTONE_EMOJI[stage]} ${MILESTONE_LABEL[stage]} — ${companyName}`,
+  }));
+  return { milestonesLogged: [...already, ...newlyReached], wins };
+}
+
+/* ---- goal / campaign planner ---- */
+const countWorkingDays = (startIso, endIso) => {
+  if (!startIso || !endIso || endIso < startIso) return 0;
+  let c = 0;
+  for (let d = new Date(startIso + "T00:00:00"); d <= new Date(endIso + "T00:00:00"); d.setDate(d.getDate() + 1)) {
+    if (d.getDay() !== 0) c++; /* Sunday is a rest day, not part of any Mon-Sat week bucket */
+  }
+  return c;
+};
+const goalMatch = (a, metric) => (metric === "outreach" ? isOutreach(a) : !isOutreach(a) && !isBlankStatus(a));
+/* pure: derive everything about a goal from the goal record + the pipeline */
+function computeGoal(goal, apps) {
+  if (!goal || !goal.target || !goal.days) return null;
+  const dailyQuota = Math.ceil(goal.target / goal.days);
+  const deadline = addDays(goal.startDate, goal.days - 1);
+  const t = today();
+  const elapsedCalendarDays = Math.min(goal.days, Math.max(0, Math.floor((new Date(t) - new Date(goal.startDate)) / 86400000) + 1));
+  const expectedByNow = Math.min(goal.target, Math.round((goal.target * elapsedCalendarDays) / goal.days));
+  const actualTotal = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && goalMatch(a, goal.metric)).length;
+  const actualByNow = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && a.contacted <= t && goalMatch(a, goal.metric)).length;
+  const daysRemaining = Math.max(0, countWorkingDays(t > deadline ? deadline : t, deadline) - (t <= deadline ? 1 : 0));
+  const pastDeadline = t > deadline;
+
+  /* weekly breakdown, Mon-Sat buckets across the whole campaign span */
+  const weeksMap = new Map();
+  for (let d = new Date(goal.startDate + "T00:00:00"); d <= new Date(deadline + "T00:00:00"); d.setDate(d.getDate() + 1)) {
+    if (d.getDay() === 0) continue;
+    const wStart = iso(mondayOf(d));
+    const label = weekLabel(mondayOf(d));
+    if (!weeksMap.has(label)) weeksMap.set(label, { label, weekStart: wStart, workingDays: 0 });
+    weeksMap.get(label).workingDays += 1;
+  }
+  const weeks = Array.from(weeksMap.values())
+    .sort((a, b) => a.weekStart.localeCompare(b.weekStart))
+    .map((w) => ({
+      ...w,
+      target: dailyQuota * w.workingDays,
+      actual: apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && goalMatch(a, goal.metric)).length,
+    }));
+
+  return {
+    dailyQuota,
+    deadline,
+    elapsedCalendarDays,
+    expectedByNow,
+    actualTotal,
+    actualByNow,
+    daysRemaining,
+    pastDeadline,
+    onPace: actualByNow >= expectedByNow,
+    pctComplete: Math.min(100, Math.round((actualTotal / goal.target) * 100)),
+    weeks,
+  };
+}
+
 
 /* multi-step follow-ups: a.followUps = [{days, done}] counted from `contacted` */
 const DEFAULT_FOLLOWUPS = [3, 7, 14];
@@ -155,6 +245,7 @@ const DEFAULT_STATE = {
   decisions: [],
   accomplishments: [],
   supportSessions: [],
+  goal: null,
   runway: { fund: 1200000, expenses: 50000 },
   settings: { checkinDay: 1 },
   lastCheckinMonth: null,
@@ -211,6 +302,7 @@ function mergeStates(localS, remoteS) {
     decisions: unionById(localS.decisions, remoteS.decisions),
     accomplishments: unionById(localS.accomplishments, remoteS.accomplishments),
     supportSessions: unionById(localS.supportSessions, remoteS.supportSessions),
+    goal: remoteS.goal || localS.goal || null,
     runway: remoteS.runway || localS.runway,
     settings: { ...localS.settings, ...remoteS.settings },
     lastCheckinMonth:
@@ -865,6 +957,19 @@ export default function FlightDeck() {
     const wins = (state.accomplishments || [])
       .slice(0, 10)
       .map((a) => `${a.date}: ${a.text}${a.category ? ` [${a.category}]` : ""}`);
+    const pastWins = (state.accomplishments || [])
+      .filter((a) => a.category === "Past Wins" && a.snapshot)
+      .map((a) => {
+        const s = a.snapshot;
+        const label = [s.role, s.company].filter(Boolean).join(" at ") || "a past role";
+        return `${a.date} — landed ${label}: took ${s.apps} apps, ${s.outreach} outreach, ${s.replies} replies, ${s.screens} screens, ${s.interviews} interviews for ${s.offers} offer(s) (warm ${s.warm}/cold ${s.cold}, runway was ${s.runwayMonths}mo).`;
+      });
+    const goalLine = (() => {
+      if (!state.goal) return "No goal currently set.";
+      const g = computeGoal(state.goal, apps);
+      if (!g) return "No goal currently set.";
+      return `Active goal: ${state.goal.target} ${state.goal.metric} over ${state.goal.days} days, deadline ${g.deadline}, daily quota ${g.dailyQuota}. Progress: ${g.actualTotal}/${state.goal.target} (${g.pctComplete}%) — ${g.pastDeadline ? "deadline passed" : g.onPace ? "on pace" : `behind, expected ${g.expectedByNow} by now`}.`;
+    })();
     const sessions = (state.supportSessions || [])
       .slice(0, 6)
       .map((s) => `${s.date} "${s.feeling || "?"}" intensity ${s.intensity || "?"}/10`);
@@ -876,6 +981,8 @@ export default function FlightDeck() {
       `Outreach split (tags kept even after status advances): warm ${apps.filter((a) => a.outreachKind === "warm").length}, cold ${apps.filter((a) => a.outreachKind === "cold").length}, still-untagged-in-outreach ${apps.filter((a) => isOutreach(a) && !a.outreachKind).length}. Warm converts 4-10x better than cold.`,
       `Pipeline by status: ${byStatus}.`,
       `Follow-ups DUE today or overdue: ${dueList.length}${dueList.length ? " — " + dueList.slice(0, 6).map((a) => `${a.company || "unnamed"} (contacted ${a.contacted}, status ${a.status})`).join("; ") : ""}.`,
+      goalLine,
+      `Past wins (historical benchmark from previous successful searches, if any):\n${pastWins.join("\n") || "none recorded yet"}`,
       `Recent accomplishments (completed focus items — acknowledge momentum):\n${wins.join("\n") || "none yet"}`,
       `Emotional support sessions (date, feeling, intensity — watch for patterns/trends):\n${sessions.join("\n") || "none yet"}`,
       `Recent weeks (newest first):\n${weekLines.join("\n") || "none yet"}`,
@@ -891,6 +998,8 @@ Non-negotiable playbook rules you must coach within:
 - Follow-ups that are due should usually be today's first action items - name the specific companies.
 - Rejection at ~95% of cold applications is the statistical norm, not a verdict. Decisions come from tracker numbers, never from moods.
 - Emotions: each logged emotion should convert to exactly ONE small action. High intensity (8+) = body regulation first.
+- If an active goal is set, its daily quota and deadline override the generic weekly benchmark for volume advice — prioritize hitting the quota and flag clearly if behind pace.
+- If past wins exist, treat their snapshot numbers as this person's own proven benchmark (e.g. "last time it took you N applications") rather than generic statistics — it's more convincing evidence than population averages.
 Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference their actual numbers and company names.`;
 
   const callClaude = async (task, format) => {
@@ -1009,7 +1118,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         (s) => ({
           ...s,
           supportSessions: [
-            { id: sessionId, date: today(), feeling: "🎙 Weekly voice check-in", intensity: "", script, ...audioFields },
+            { id: sessionId, date: today(), kind: "weekly-voice", feeling: "🎙 Weekly voice check-in", intensity: "", script, ...audioFields },
             ...(s.supportSessions || []),
           ],
         }),
@@ -1117,18 +1226,30 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   }, [loaded, retryPendingAudio]);
 
   /* ---------- mutations ---------- */
-  const setAppStatus = (id, status) =>
+  const setAppStatus = (id, status) => {
+    let winMsg = "";
     mutate(
-      (s) => ({
-        ...s,
-        applications: s.applications.map((a) => {
+      (s) => {
+        let addWins = [];
+        const applications = s.applications.map((a) => {
           if (a.id !== id) return a;
           const wasBlank = !a.status;
-          return { ...a, status, contacted: wasBlank && status && !a.contacted ? today() : a.contacted };
-        }),
-      }),
+          const m = computeMilestoneWins(a, status);
+          if (m) addWins = m.wins;
+          return {
+            ...a,
+            status,
+            contacted: wasBlank && status && !a.contacted ? today() : a.contacted,
+            milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged,
+          };
+        });
+        if (addWins.length) winMsg = addWins.map((w) => w.text).join(" · ");
+        return { ...s, applications, accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments };
+      },
       "Status updated — funnel recalculated"
     );
+    if (winMsg) setTimeout(() => flash(winMsg), 400); /* surface the win after the status toast */
+  };
 
   /* excel-style inline cell commit */
   const updateAppField = (id, field, value) =>
@@ -1137,25 +1258,30 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   const saveModal = (data) => {
     const { kind, entry } = modal;
     if (kind === "application") {
+      let winMsg = "";
       mutate(
-        (s) => ({
-          ...s,
-          applications: entry
-            ? s.applications.map((a) => (a.id === entry.id ? { ...a, ...data } : a))
-            : [{ id: uid(), ...data }, ...s.applications],
-        }),
+        (s) => {
+          let addWins = [];
+          let applications;
+          if (entry) {
+            applications = s.applications.map((a) => {
+              if (a.id !== entry.id) return a;
+              const m = computeMilestoneWins(a, data.status);
+              if (m) addWins = m.wins;
+              return { ...a, ...data, milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged };
+            });
+          } else {
+            /* brand-new entry created directly at an advanced status (rare, but possible) */
+            const m = computeMilestoneWins({ status: "", milestonesLogged: [] }, data.status);
+            if (m) addWins = m.wins;
+            applications = [{ id: uid(), ...data, milestonesLogged: m ? m.milestonesLogged : undefined }, ...s.applications];
+          }
+          if (addWins.length) winMsg = addWins.map((w) => w.text).join(" · ");
+          return { ...s, applications, accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments };
+        },
         entry ? "Application updated" : "Application added — funnel updated"
       );
-    } else if (kind === "emotion") {
-      mutate(
-        (s) => ({
-          ...s,
-          emotions: entry
-            ? s.emotions.map((x) => (x.id === entry.id ? { ...x, ...data } : x))
-            : [{ id: uid(), date: today(), ...data }, ...s.emotions],
-        }),
-        entry ? "Entry updated" : "Protocol logged"
-      );
+      if (winMsg) setTimeout(() => flash(winMsg), 400);
     } else if (kind === "decision") {
       mutate(
         (s) => ({
@@ -1199,6 +1325,41 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           },
         }),
         "Settings updated"
+      );
+    } else if (kind === "goal") {
+      const target = Math.max(1, Math.round(+data.target || 0));
+      const days = Math.max(1, Math.round(+data.days || 0));
+      mutate(
+        (s) => ({
+          ...s,
+          goal: { metric: data.metric === "outreach" ? "outreach" : "apps", target, days, startDate: data.startDate || today() },
+        }),
+        entry ? "Goal updated" : "Goal set"
+      );
+    } else if (kind === "winSnapshot") {
+      const warm = apps.filter((a) => a.outreachKind === "warm").length;
+      const cold = apps.filter((a) => a.outreachKind === "cold").length;
+      const snapshot = {
+        apps: totals.apps,
+        outreach: totals.outreach,
+        replies: totals.replies,
+        screens: totals.screens,
+        interviews: totals.interviews,
+        offers: totals.offers,
+        warm,
+        cold,
+        runwayMonths: +months.toFixed(1),
+        company: data.company || "",
+        role: data.role || "",
+      };
+      const label = [data.role, data.company].filter(Boolean).join(" at ") || "new role";
+      const text = `🏆 Landed ${label} — ${totals.apps} apps, ${totals.outreach} outreach, ${totals.replies} replies, ${totals.screens} screens, ${totals.interviews} interviews, ${totals.offers} offer${totals.offers === 1 ? "" : "s"}.`;
+      mutate(
+        (s) => ({
+          ...s,
+          accomplishments: [{ id: uid(), date: data.date || today(), category: "Past Wins", text, snapshot }, ...s.accomplishments],
+        }),
+        "🏆 Win snapshot saved"
       );
     }
     setModal(null);
@@ -1291,10 +1452,20 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             donutMode === "status"
               ? APP_STATUSES.map((s) => ({ label: statusLabel(s), value: apps.filter((a) => (a.status ?? "") === s).length }))
               : donutMode === "source"
-              ? [...APP_SOURCES, ""].map((s) => ({
-                  label: s || "Not set",
-                  value: apps.filter((a) => (s ? a.source === s : !a.source || !APP_SOURCES.includes(a.source))).length,
-                }))
+              ? (() => {
+                  const buckets = new Map();
+                  const bump = (label) => buckets.set(label, (buckets.get(label) || 0) + 1);
+                  apps.forEach((a) => {
+                    if (a.source === "Job board") {
+                      bump(a.jobBoardName ? a.jobBoardName : "Job board (unspecified)");
+                    } else if (a.source && APP_SOURCES.includes(a.source)) {
+                      bump(a.source);
+                    } else {
+                      bump("Not set");
+                    }
+                  });
+                  return Array.from(buckets.entries()).map(([label, value]) => ({ label, value }));
+                })()
               : [
                   { label: "Warm", value: apps.filter((a) => a.outreachKind === "warm").length },
                   { label: "Cold", value: apps.filter((a) => a.outreachKind === "cold").length },
@@ -1302,6 +1473,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 ]
           }
         />
+        {donutMode === "source" && (
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
+            Job board entries are broken out by the specific board you named (e.g. Onlinejobs.ph, Upwork) instead of a generic "Job board" bucket.
+          </div>
+        )}
         {donutMode === "outreach" && (
           <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
             Warm/cold tags are kept even after status moves on (e.g. to applied). "Untagged" is only entries still sitting in outreach status. Warm converts 4–10x better than cold.
@@ -1425,47 +1601,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         )}
       </div>
 
-      {/* emotional support — only on request */}
-      <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
-        <Btn onClick={() => setSupportOpen(true)} color={C.blue} style={{ flex: 1 }}>
-          🛟 Emotional support
-        </Btn>
-      </div>
-
-      {/* weekly VOICE check-in */}
-      <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <Label>
-            🎙 Weekly voice check-in
-            {coach.voiceDate ? ` — last ${coach.voiceDate}` : ""}
-            {!coach.voiceDate || addDays(coach.voiceDate, 7) <= today() ? "  ·  DUE" : ""}
-          </Label>
-          <Btn onClick={runVoiceCheckin} disabled={voiceBusy} color={C.blue} style={{ padding: "6px 12px", fontSize: 11 }}>
-            {voiceBusy ? "Creating…" : "Create session"}
-          </Btn>
-        </div>
-        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
-          A spoken session built from your actual week — numbers, wins, emotional patterns — settle, reality, track record, forward, one action. Transcript saves to your diary.
-        </div>
-        {voiceBusy && (
-          <div style={{ color: C.muted, fontFamily: mono, fontSize: 12, padding: "12px 0 0", letterSpacing: "0.15em" }}>
-            WRITING & RECORDING YOUR SESSION…
-          </div>
-        )}
-        {voiceUrl && !voiceBusy && (
-          <audio controls src={voiceUrl} style={{ width: "100%", marginTop: 12 }} />
-        )}
-        {voiceScript && !voiceBusy && (
-          <details style={{ marginTop: 8 }}>
-            <summary style={{ fontSize: 12, color: C.muted, cursor: "pointer" }}>Transcript</summary>
-            <div style={{ fontSize: 13, lineHeight: 1.6, color: C.ink, marginTop: 6, whiteSpace: "pre-wrap" }}>{voiceScript}</div>
-          </details>
-        )}
-        {voiceErr && (
-          <div style={{ marginTop: 10, fontSize: 12, color: C.red, lineHeight: 1.5 }}>{voiceErr}</div>
-        )}
-      </div>
-
       {/* weekly review */}
       <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1542,6 +1677,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <Btn onClick={() => setModal({ kind: "accomplishment", entry: null })}>+ Log a win</Btn>
         </div>
 
+        <div
+          onClick={() => setModal({ kind: "winSnapshot", entry: null })}
+          style={{ background: "rgba(74,222,128,0.08)", border: `1px solid ${C.green}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14, cursor: "pointer" }}
+        >
+          <div style={{ fontWeight: 800, fontSize: 13, color: C.green }}>🏆 I landed the job — snapshot this search</div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 3, lineHeight: 1.5 }}>
+            Saves your current apps/outreach/replies/screens/interviews/offers as a permanent record under Past Wins — a benchmark for next time.
+          </div>
+        </div>
+
         <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
           Completed focus items land here automatically at the start of the next day. The coach remembers these — your evidence file of momentum. Read this list when the belief resurfaces.
         </div>
@@ -1557,21 +1702,42 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <div key={g}>
               <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.2em", color: C.amber, marginBottom: 6, textTransform: "uppercase" }}>{g}</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {list.map((a) => (
-                  <SwipeRow
-                    key={a.id}
-                    showX={isDesktop}
-                    onTap={() => setModal({ kind: "accomplishment", entry: a })}
-                    onDelete={() => mutate((s) => ({ ...s, accomplishments: s.accomplishments.filter((x) => x.id !== a.id) }), "Accomplishment deleted")}
-                  >
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                      <div style={{ fontSize: 13, lineHeight: 1.5 }}>✓ {a.text}</div>
-                      <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>
-                        {historyGroup === "category" ? a.date : a.category}
-                      </div>
-                    </div>
-                  </SwipeRow>
-                ))}
+                {list.map((a) => {
+                  const isPastWin = a.category === "Past Wins" && a.snapshot;
+                  const isMilestone = Object.values(MILESTONE_LABEL).includes(a.category);
+                  return (
+                    <SwipeRow
+                      key={a.id}
+                      showX={isDesktop}
+                      onTap={() => setModal({ kind: "accomplishment", entry: a })}
+                      onDelete={() => mutate((s) => ({ ...s, accomplishments: s.accomplishments.filter((x) => x.id !== a.id) }), "Accomplishment deleted")}
+                    >
+                      {isPastWin ? (
+                        <div style={{ margin: "-12px -14px", padding: "12px 14px", background: "rgba(74,222,128,0.07)", borderLeft: `3px solid ${C.green}`, borderRadius: 12 }}>
+                          <div style={{ fontSize: 13, lineHeight: 1.5, fontWeight: 700, color: C.green }}>{a.text}</div>
+                          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{a.date}</div>
+                        </div>
+                      ) : isMilestone ? (
+                        <div style={{ margin: "-12px -14px", padding: "12px 14px", background: "rgba(245,185,66,0.08)", borderLeft: `3px solid ${C.amber}`, borderRadius: 12 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                            <div style={{ fontSize: 13, lineHeight: 1.5, fontWeight: 700, color: C.amber }}>{a.text}</div>
+                            <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.1em", color: C.amber, flexShrink: 0, textTransform: "uppercase" }}>
+                              {historyGroup === "category" ? "" : a.category}
+                            </div>
+                          </div>
+                          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{a.date} · auto-detected forward progress</div>
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                          <div style={{ fontSize: 13, lineHeight: 1.5 }}>✓ {a.text}</div>
+                          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>
+                            {historyGroup === "category" ? a.date : a.category}
+                          </div>
+                        </div>
+                      )}
+                    </SwipeRow>
+                  );
+                })}
               </div>
             </div>
           ))}
@@ -1706,6 +1872,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         ) : (
                           <span style={{ fontSize: 12, color: a.source ? C.ink : C.muted }}>{a.source || "—"}</span>
                         )}
+                        {a.source === "Job board" && a.jobBoardName && (
+                          <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.06em", color: C.blue, marginTop: 3 }}>{a.jobBoardName}</div>
+                        )}
                       </td>
                       <td style={td} onClick={(e) => e.stopPropagation()}>
                         {a.postLink ? (
@@ -1810,6 +1979,41 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         Fully automatic from the Pipeline — set an entry's status to "outreach" to count it there instead of Apps.
       </div>
 
+      {/* conversion: application/outreach -> closed deal */}
+      {(() => {
+        const topOfFunnel = totals.apps + totals.outreach;
+        const pct = (num, den) => (den > 0 ? ((num / den) * 100).toFixed(1) : "0.0");
+        const stages = [
+          ["Apps+Outreach → Replies", totals.replies, topOfFunnel],
+          ["Replies → Screens", totals.screens, totals.replies],
+          ["Screens → Interviews", totals.interviews, totals.screens],
+          ["Interviews → Offers", totals.offers, totals.interviews],
+        ];
+        return (
+          <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+              <Label>Conversion — apps/outreach → offer</Label>
+              <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: totals.offers > 0 ? C.green : C.ink }}>
+                {pct(totals.offers, topOfFunnel)}%
+              </div>
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 2, marginBottom: 10 }}>
+              {totals.offers} offer{totals.offers === 1 ? "" : "s"} from {topOfFunnel} total sent
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              {stages.map(([label, num, den]) => (
+                <div key={label} style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+                  <span style={{ color: C.muted }}>{label}</span>
+                  <span style={{ fontFamily: mono, color: den > 0 ? C.ink : C.muted }}>
+                    {den > 0 ? `${pct(num, den)}%` : "—"} <span style={{ color: C.muted }}>({num}/{den})</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
       <Label>Weeks (Mon–Sat)</Label>
 
       {weekRows.length === 0 && (
@@ -1847,45 +2051,151 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     </>
   );
 
+  const renderGoal = () => {
+    const g = computeGoal(state.goal, apps);
+    return (
+      <>
+        {!state.goal && (
+          <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 20, textAlign: "center" }}>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>🎯</div>
+            <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>No goal set</div>
+            <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16 }}>
+              Set a target — e.g. 500 applications over 90 days — and this splits it into a daily quota, a
+              deadline, and a Mon–Sat weekly schedule tracked against what's actually in your Pipeline.
+            </div>
+            <Btn onClick={() => setModal({ kind: "goal", entry: null })}>+ Set a goal</Btn>
+          </div>
+        )}
+
+        {state.goal && g && (
+          <>
+            <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <Label>
+                  {state.goal.target} {state.goal.metric === "outreach" ? "outreaches" : "applications"} over {state.goal.days} days
+                </Label>
+                <Btn ghost onClick={() => setModal({ kind: "goal", entry: state.goal })} style={{ padding: "6px 10px", fontSize: 11 }}>
+                  Edit
+                </Btn>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 6 }}>
+                <div style={{ fontFamily: mono, fontSize: 44, fontWeight: 800, color: C.amber, lineHeight: 1.1 }}>
+                  {g.dailyQuota}
+                </div>
+                <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.4 }}>
+                  per day
+                  <br />
+                  to hit the target
+                </div>
+              </div>
+
+              <div style={{ height: 10, background: C.bg, borderRadius: 5, marginTop: 12, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
+                <div style={{ height: "100%", width: `${g.pctComplete}%`, background: g.onPace ? C.green : C.amber, borderRadius: 5, transition: "width 0.4s ease" }} />
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 12 }}>
+                <span style={{ color: C.muted }}>
+                  {g.actualTotal} / {state.goal.target} ({g.pctComplete}%)
+                </span>
+                <span style={{ fontFamily: mono, color: g.onPace ? C.green : C.red }}>
+                  {g.pastDeadline ? "DEADLINE PASSED" : g.onPace ? "● ON PACE" : `○ BEHIND (expected ${g.expectedByNow})`}
+                </span>
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 12, paddingTop: 12, borderTop: `1px solid ${C.panelEdge}` }}>
+                <div>
+                  <div style={{ fontSize: 9, letterSpacing: "0.14em", color: C.muted }}>DEADLINE</div>
+                  <div style={{ fontFamily: mono, fontSize: 15, fontWeight: 700 }}>{g.deadline}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 9, letterSpacing: "0.14em", color: C.muted }}>DAYS REMAINING</div>
+                  <div style={{ fontFamily: mono, fontSize: 15, fontWeight: 700, color: g.daysRemaining <= 7 ? C.amber : C.ink }}>
+                    {g.pastDeadline ? 0 : g.daysRemaining}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <Label>Weekly schedule (Mon–Sat)</Label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+              {g.weeks.map((w) => {
+                const wOnPace = w.actual >= w.target || w.weekStart > today();
+                return (
+                  <div key={w.label} style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 14px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <div style={{ fontWeight: 700, fontSize: 13 }}>{w.label}</div>
+                      <div style={{ fontFamily: mono, fontSize: 11, color: wOnPace ? C.green : C.amber }}>
+                        {w.actual} / {w.target}
+                      </div>
+                    </div>
+                    <div style={{ height: 5, background: C.bg, borderRadius: 3, marginTop: 6, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${w.target > 0 ? Math.min(100, (w.actual / w.target) * 100) : 0}%`, background: wOnPace ? C.green : C.amber, borderRadius: 3 }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{ marginTop: 14 }}>
+              <Btn
+                ghost
+                onClick={() => mutate((s) => ({ ...s, goal: null }), "Goal cleared")}
+                style={{ width: "100%", color: C.red }}
+              >
+                Clear goal
+              </Btn>
+            </div>
+          </>
+        )}
+      </>
+    );
+  };
+
   const renderEmotions = () => (
     <>
-      <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14, fontSize: 13, lineHeight: 1.5, color: C.muted }}>
-        <span style={{ color: C.amber, fontWeight: 700 }}>Protocol: </span>
-        Body first (breathe 4-in / 6-out). If intensity is 8+, walk before logging. Name it → write the claim in third person → test vs. evidence → one action within 10 minutes.
+      {/* emotional support — only on request */}
+      <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+        <Btn onClick={() => setSupportOpen(true)} color={C.blue} style={{ flex: 1 }}>
+          🛟 Emotional support
+        </Btn>
       </div>
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-        <Label>{isDesktop ? "Log — click to edit, × to delete" : "Log — tap to edit, swipe left to delete"}</Label>
-        <Btn onClick={() => setModal({ kind: "emotion", entry: null })}>+ Run protocol</Btn>
-      </div>
-
-      {state.emotions.length === 0 && (
-        <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
-          Nothing logged. When a feeling hits, run it through here instead of your head.
+      {/* weekly VOICE check-in */}
+      <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <Label>
+            🎙 Weekly voice check-in
+            {coach.voiceDate ? ` — last ${coach.voiceDate}` : ""}
+            {!coach.voiceDate || addDays(coach.voiceDate, 7) <= today() ? "  ·  DUE" : ""}
+          </Label>
+          <Btn onClick={runVoiceCheckin} disabled={voiceBusy} color={C.blue} style={{ padding: "6px 12px", fontSize: 11 }}>
+            {voiceBusy ? "Creating…" : "Create session"}
+          </Btn>
         </div>
-      )}
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {state.emotions.map((x) => (
-          <SwipeRow
-            key={x.id}
-            showX={isDesktop}
-            onTap={() => setModal({ kind: "emotion", entry: x })}
-            onDelete={() => mutate((s) => ({ ...s, emotions: s.emotions.filter((e) => e.id !== x.id) }), "Entry deleted")}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <div style={{ fontWeight: 700, fontSize: 14 }}>{x.name || "Unnamed feeling"}</div>
-              <div style={{ fontFamily: mono, fontSize: 12, color: (+x.intensity || 0) >= 8 ? C.red : C.amber }}>{x.intensity || "–"}/10</div>
-            </div>
-            {x.claim && <div style={{ fontSize: 12, color: C.muted, marginTop: 4, fontStyle: "italic" }}>"The thought says: {x.claim}"</div>}
-            <div style={{ fontSize: 12, marginTop: 6, color: x.action ? C.green : C.muted }}>{x.action ? `→ ${x.action}` : "→ no action set yet"}</div>
-            <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{x.date}</div>
-          </SwipeRow>
-        ))}
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+          A spoken session built from your actual week — numbers, wins, emotional patterns — settle, reality, track record, forward, one action. Transcript saves to your diary below.
+        </div>
+        {voiceBusy && (
+          <div style={{ color: C.muted, fontFamily: mono, fontSize: 12, padding: "12px 0 0", letterSpacing: "0.15em" }}>
+            WRITING & RECORDING YOUR SESSION…
+          </div>
+        )}
+        {voiceUrl && !voiceBusy && (
+          <audio controls src={voiceUrl} style={{ width: "100%", marginTop: 12 }} />
+        )}
+        {voiceScript && !voiceBusy && (
+          <details style={{ marginTop: 8 }}>
+            <summary style={{ fontSize: 12, color: C.muted, cursor: "pointer" }}>Transcript</summary>
+            <div style={{ fontSize: 13, lineHeight: 1.6, color: C.ink, marginTop: 6, whiteSpace: "pre-wrap" }}>{voiceScript}</div>
+          </details>
+        )}
+        {voiceErr && (
+          <div style={{ marginTop: 10, fontSize: 12, color: C.red, lineHeight: 1.5 }}>{voiceErr}</div>
+        )}
       </div>
 
       {/* support diary */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "18px 0 10px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "4px 0 10px" }}>
         <Label>🛟 Support diary — {isDesktop ? "click" : "tap"} a session to reread the advice</Label>
         {(() => {
           const withI = (state.supportSessions || []).map((s) => +s.intensity).filter((n) => n > 0);
@@ -1906,39 +2216,52 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
       {(state.supportSessions || []).length === 0 && (
         <div style={{ color: C.muted, fontSize: 13, padding: "12px 4px", textAlign: "center" }}>
-          No sessions yet. Every 🛟 Emotional support session saves here automatically — a diary of advice you can reread anytime.
+          No sessions yet. Every 🛟 Emotional support session and 🎙 weekly check-in saves here automatically — a diary of advice you can reread anytime.
         </div>
       )}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {(state.supportSessions || []).map((s) => (
-          <SwipeRow
-            key={s.id}
-            showX={isDesktop}
-            onTap={async () => {
-              let localUrl = null;
-              if (!s.audioPath && s.audioLocal) {
-                const blob = await idbGet(s.id).catch(() => null);
-                if (blob) localUrl = URL.createObjectURL(blob);
-              }
-              setModal({ kind: "session", entry: s, localUrl });
-            }}
-            onDelete={() => mutate((st) => ({ ...st, supportSessions: st.supportSessions.filter((y) => y.id !== s.id) }), "Session deleted")}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-              <div style={{ fontWeight: 700, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                🛟 {s.feeling || "Support session"}
+        {(state.supportSessions || []).map((s) => {
+          const isWeekly = s.kind === "weekly-voice" || (s.feeling || "").includes("Weekly voice check-in");
+          return (
+            <SwipeRow
+              key={s.id}
+              showX={isDesktop}
+              onTap={async () => {
+                let localUrl = null;
+                if (!s.audioPath && s.audioLocal) {
+                  const blob = await idbGet(s.id).catch(() => null);
+                  if (blob) localUrl = URL.createObjectURL(blob);
+                }
+                setModal({ kind: "session", entry: s, localUrl });
+              }}
+              onDelete={() => mutate((st) => ({ ...st, supportSessions: st.supportSessions.filter((y) => y.id !== s.id) }), "Session deleted")}
+            >
+              <div
+                style={
+                  isWeekly
+                    ? { margin: "-12px -14px", padding: "12px 14px", background: "rgba(125,176,247,0.08)", borderLeft: `3px solid ${C.blue}`, borderRadius: 12 }
+                    : undefined
+                }
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: isWeekly ? C.blue : C.ink }}>
+                    {isWeekly ? "🎙 Weekly check-in" : `🛟 ${s.feeling || "Support session"}`}
+                  </div>
+                  {s.intensity !== "" && s.intensity != null && (
+                    <div style={{ fontFamily: mono, fontSize: 12, color: (+s.intensity || 0) >= 8 ? C.red : C.amber, flexShrink: 0 }}>
+                      {s.intensity}/10
+                    </div>
+                  )}
+                </div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {s.one_action || (isWeekly ? "Tap to listen / read transcript" : "")}
+                </div>
+                <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{s.date}</div>
               </div>
-              <div style={{ fontFamily: mono, fontSize: 12, color: (+s.intensity || 0) >= 8 ? C.red : C.amber, flexShrink: 0 }}>
-                {s.intensity || "–"}/10
-              </div>
-            </div>
-            <div style={{ fontSize: 12, color: C.muted, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {s.one_action || ""}
-            </div>
-            <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{s.date}</div>
-          </SwipeRow>
-        ))}
+            </SwipeRow>
+          );
+        })}
       </div>
     </>
   );
@@ -2008,7 +2331,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     </>
   );
 
-  const SECTIONS = { DASHBOARD: renderDashboard, PIPELINE: renderPipeline, EMOTIONS: renderEmotions, RUNWAY: renderRunway, HISTORY: renderHistory };
+  const SECTIONS = { DASHBOARD: renderDashboard, GOAL: renderGoal, PIPELINE: renderPipeline, EMOTIONS: renderEmotions, RUNWAY: renderRunway, HISTORY: renderHistory };
 
   if (!loaded)
     return (
@@ -2081,7 +2404,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <Panel title="◈ PIPELINE — ALL APPLICATIONS" style={{ gridColumn: "1 / -1" }}>
               {renderPipeline()}
             </Panel>
-            <Panel title="◈ EMOTION PROTOCOL">{renderEmotions()}</Panel>
+            <Panel title="◈ GOAL PLANNER">{renderGoal()}</Panel>
+            <Panel title="◈ MIND">{renderEmotions()}</Panel>
             <Panel title="◈ RUNWAY GAUGE">{renderRunway()}</Panel>
             <Panel title="◈ HISTORY — ACCOMPLISHMENTS" style={{ gridColumn: "1 / -1" }}>
               {renderHistory()}
@@ -2117,10 +2441,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         >
           {[
             ["⌂", "Home", 0],
-            ["▦", "CRM", 1, dueList.length],
-            ["♡", "Mind", 2],
-            ["⛽", "Fuel", 3],
-            ["★", "Wins", 4],
+            ["🎯", "Goal", 1],
+            ["▦", "CRM", 2, dueList.length],
+            ["♡", "Mind", 3],
+            ["⛽", "Fuel", 4],
+            ["★", "Wins", 5],
           ].map(([icon, label, i, badge]) => (
             <button
               key={label}
@@ -2160,6 +2485,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, syncKey: syncKeyRef.current }}
           onClose={() => setModal(null)}
           onSave={saveModal}
+          totals={totals}
         />
       )}
       {syncModal && <SyncModal currentKey={syncKeyRef.current} onClose={() => setSyncModal(false)} onSwitch={switchSyncKey} flash={flash} />}
@@ -2178,17 +2504,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           onSaveSession={(session) =>
             mutate((s) => ({ ...s, supportSessions: [{ id: uid(), date: today(), ...session }, ...(s.supportSessions || [])] }), "Session saved to diary")
           }
-          onLog={(entry) => {
-            mutate((s) => ({ ...s, emotions: [{ id: uid(), date: today(), ...entry }, ...s.emotions] }), "Logged to Emotion Protocol");
-            setSupportOpen(false);
-          }}
         />
       )}
     </div>
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave }) {
+function Modal({ modal, onClose, onSave, totals }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
     if (kind === "application")
@@ -2196,6 +2518,7 @@ function Modal({ modal, onClose, onSave }) {
         company: entry?.company || "",
         website: entry?.website || "",
         source: entry?.source || "",
+        jobBoardName: entry?.jobBoardName || "",
         postLink: entry?.postLink || "",
         postShot: entry?.postShot || "",
         salary: entry?.salary || "",
@@ -2211,29 +2534,39 @@ function Modal({ modal, onClose, onSave }) {
         notes: entry?.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
       };
-    if (kind === "emotion")
-      return { name: entry?.name || "", intensity: entry?.intensity ?? "", claim: entry?.claim || "", action: entry?.action || "" };
     if (kind === "decision") return { note: entry?.note || "" };
     if (kind === "session") return {};
     if (kind === "accomplishment")
       return { text: entry?.text || "", date: entry?.date || today(), category: entry?.category || "Daily focus" };
     if (kind === "checkinDay")
       return { day: entry?.day ?? 1, followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String) };
+    if (kind === "goal")
+      return {
+        metric: entry?.metric || "apps",
+        target: entry?.target ?? 500,
+        days: entry?.days ?? 90,
+        startDate: entry?.startDate || today(),
+      };
+    if (kind === "winSnapshot") return { company: "", role: "", date: today() };
     return { fund: entry?.fund ?? "", expenses: entry?.expenses ?? "" };
   });
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
   const [shotBusy, setShotBusy] = useState(false);
   const [shotErr, setShotErr] = useState("");
+  const [customBoard, setCustomBoard] = useState(
+    () => kind === "application" && !!entry?.jobBoardName && !JOB_BOARD_OPTIONS.includes(entry.jobBoardName)
+  );
 
   const selectStyle = { ...inputStyle, appearance: "none" };
 
   const titles = {
     application: entry ? "Edit application" : "Track an application",
-    emotion: entry ? "Edit protocol entry" : "Run the protocol",
     decision: entry ? "Edit decision" : "Written decision",
     session: "Support session — reread",
     accomplishment: entry ? "Edit accomplishment" : "Log a win",
     checkinDay: "Settings — check-in & follow-ups",
+    goal: entry ? "Edit goal" : "Set a goal",
+    winSnapshot: "🏆 Snapshot this win",
     runway: "Update runway numbers",
   };
 
@@ -2258,9 +2591,13 @@ function Modal({ modal, onClose, onSave }) {
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        style={{ width: "100%", maxWidth: 420, maxHeight: "80vh", overflowY: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+        style={{ width: "100%", maxWidth: 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
       >
-        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 14 }}>{titles[kind]}</div>
+        <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
+          <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 14 }}>{titles[kind]}</div>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: "0 20px 16px", minHeight: 0 }}>
 
         {kind === "application" && (
           <>
@@ -2277,6 +2614,43 @@ function Modal({ modal, onClose, onSave }) {
                 ))}
               </select>
             </div>
+
+            {f.source === "Job board" && (
+              <div style={{ marginBottom: 12 }}>
+                <Label>Which job board?</Label>
+                {!customBoard ? (
+                  <select
+                    value={JOB_BOARD_OPTIONS.includes(f.jobBoardName) ? f.jobBoardName : ""}
+                    onChange={(e) => {
+                      if (e.target.value === "__other__") setCustomBoard(true);
+                      else set("jobBoardName")(e.target.value);
+                    }}
+                    style={selectStyle}
+                  >
+                    <option value="">— select board —</option>
+                    {JOB_BOARD_OPTIONS.filter((b) => b !== "Other").map((b) => (
+                      <option key={b} value={b}>
+                        {b}
+                      </option>
+                    ))}
+                    <option value="__other__">Other (type name)…</option>
+                  </select>
+                ) : (
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input
+                      value={f.jobBoardName}
+                      placeholder="e.g. Kalibrr, Remote OK"
+                      onChange={(e) => set("jobBoardName")(e.target.value)}
+                      style={{ ...inputStyle, flex: 1 }}
+                    />
+                    <Btn ghost onClick={() => setCustomBoard(false)} style={{ padding: "10px 12px" }}>
+                      List
+                    </Btn>
+                  </div>
+                )}
+                {f.jobBoardName && <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>Shows as its own slice in the "Where found" donut.</div>}
+              </div>
+            )}
             <Field label="Link to the job post" value={f.postLink} onChange={set("postLink")} placeholder="https://linkedin.com/jobs/…" />
             <div style={{ marginBottom: 12 }}>
               <Label>…or upload a screenshot of the post</Label>
@@ -2494,15 +2868,6 @@ function Modal({ modal, onClose, onSave }) {
           </>
         )}
 
-        {kind === "emotion" && (
-          <>
-            <Field label="Name the feeling (be specific)" value={f.name} onChange={set("name")} placeholder="e.g. fear of rejection" />
-            <Field label="Intensity 1–10 (if 8+, walk first)" type="number" value={f.intensity} onChange={set("intensity")} />
-            <Field label='The claim — "The thought says…"' value={f.claim} onChange={set("claim")} placeholder="e.g. I won't get another high-paying job" />
-            <Field label="One action (within 10 minutes)" value={f.action} onChange={set("action")} placeholder="e.g. send 1 outreach" />
-          </>
-        )}
-
         {kind === "decision" && (
           <Field label="Decision, with the numbers behind it" value={f.note} onChange={set("note")} placeholder="e.g. Runway 14.2 mo — floor holds at P95K" />
         )}
@@ -2617,6 +2982,75 @@ function Modal({ modal, onClose, onSave }) {
           </>
         )}
 
+        {kind === "goal" && (
+          <>
+            <div style={{ marginBottom: 12 }}>
+              <Label>Track</Label>
+              <div style={{ display: "flex", gap: 8 }}>
+                {[
+                  ["apps", "Applications"],
+                  ["outreach", "Outreach"],
+                ].map(([k, l]) => (
+                  <button
+                    key={k}
+                    onClick={() => set("metric")(k)}
+                    style={{
+                      flex: 1,
+                      fontFamily: sans,
+                      fontSize: 13,
+                      fontWeight: 700,
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      cursor: "pointer",
+                      border: `1px solid ${f.metric === k ? C.amber : C.panelEdge}`,
+                      background: f.metric === k ? "rgba(245,185,66,0.12)" : "transparent",
+                      color: f.metric === k ? C.amber : C.muted,
+                    }}
+                  >
+                    {l}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <Field label="Target number" type="number" value={f.target} onChange={set("target")} />
+              <Field label="Over how many days" type="number" value={f.days} onChange={set("days")} />
+            </div>
+            <Field label="Start date" type="date" value={f.startDate} onChange={set("startDate")} />
+            {(() => {
+              const target = Math.max(1, Math.round(+f.target || 0));
+              const days = Math.max(1, Math.round(+f.days || 0));
+              const quota = Math.ceil(target / days);
+              const deadline = addDays(f.startDate || today(), days - 1);
+              return (
+                <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", fontSize: 12, color: C.muted, lineHeight: 1.6, marginBottom: 4 }}>
+                  → <span style={{ color: C.amber, fontWeight: 700 }}>{quota} per day</span> ({target} ÷ {days} days, rounded up)
+                  <br />→ Deadline: <span style={{ color: C.ink, fontWeight: 700 }}>{deadline}</span>
+                </div>
+              );
+            })()}
+          </>
+        )}
+
+        {kind === "winSnapshot" && (
+          <>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+              This saves your current pipeline totals permanently under Past Wins — a benchmark to reference if you ever search again.
+            </div>
+            <Field label="Company" value={f.company} onChange={set("company")} placeholder="e.g. Acme SaaS Inc." />
+            <Field label="Role / title" value={f.role} onChange={set("role")} placeholder="e.g. Senior Product Designer" />
+            <Field label="Date" type="date" value={f.date} onChange={set("date")} />
+            <div style={{ background: C.bg, border: `1px solid ${C.green}`, borderRadius: 10, padding: "10px 12px", marginTop: 4 }}>
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.18em", color: C.green, marginBottom: 6 }}>SNAPSHOT PREVIEW</div>
+              <div style={{ fontFamily: mono, fontSize: 12, color: C.ink, lineHeight: 1.7 }}>
+                Apps {totals.apps} · Outreach {totals.outreach} · Replies {totals.replies}
+                <br />
+                Screens {totals.screens} · Interviews {totals.interviews} · Offers {totals.offers}
+              </div>
+            </div>
+          </>
+        )}
+
         {kind === "runway" && (
           <>
             <Field label="Emergency fund (₱)" type="number" value={f.fund} onChange={set("fund")} />
@@ -2624,7 +3058,9 @@ function Modal({ modal, onClose, onSave }) {
           </>
         )}
 
-        <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, padding: "14px 20px", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0, background: C.panel }}>
           {kind === "session" ? (
             <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
           ) : (
@@ -2700,7 +3136,7 @@ const SUPPORT_BLOCKS = [
   ["forward", "4 · YOUR WILL, AND THE BETTER FUTURE", C.blue],
 ];
 
-function SupportModal({ onClose, runSupport, onLog, onSaveSession }) {
+function SupportModal({ onClose, runSupport, onSaveSession }) {
   const [feeling, setFeeling] = useState("");
   const [intensity, setIntensity] = useState("");
   const [result, setResult] = useState(null);
@@ -2718,7 +3154,7 @@ function SupportModal({ onClose, runSupport, onLog, onSaveSession }) {
     forward:
       "The way out of this situation is the process you already built: every application, follow-up, and finished focus item compounds. You are not waiting for a better future — you are constructing it in trackable increments, on a runway measured in months, not days.",
     one_action:
-      "Write the feeling and the claim it's making in your Emotion Protocol — one sentence each. That's the whole task for the next 10 minutes.",
+      "Write down the feeling and the one claim it's making — one sentence each. That's the whole task for the next 10 minutes.",
   };
 
   const go = async () => {
@@ -2757,7 +3193,7 @@ function SupportModal({ onClose, runSupport, onLog, onSaveSession }) {
         {!result && (
           <>
             <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 14 }}>
-              First we settle the feeling, then reality with evidence, your track record, the path forward — then one small step. Every session is saved to your diary in the Emotions tab.
+              First we settle the feeling, then reality with evidence, your track record, the path forward — then one small step. Every session is saved to your diary in the Mind tab.
             </div>
             <Field label="What's happening / what are you feeling?" value={feeling} onChange={setFeeling} placeholder="e.g. Got a rejection and the old belief is back" />
             <Field label="Intensity 1–10" type="number" value={intensity} onChange={setIntensity} />
@@ -2791,17 +3227,8 @@ function SupportModal({ onClose, runSupport, onLog, onSaveSession }) {
               <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.2em", color: C.green, marginBottom: 4 }}>5 · ONE THING TO REGULATE — NEXT 10 MINUTES</div>
               <div style={{ fontSize: 13, lineHeight: 1.6, fontWeight: 700 }}>{result.one_action}</div>
             </div>
-            <div style={{ fontSize: 11, color: C.muted }}>✓ Saved to your support diary (Emotions tab)</div>
-            <div style={{ display: "flex", gap: 10 }}>
-              <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
-              <Btn
-                onClick={() => onLog({ name: feeling.slice(0, 60) || "Support session", intensity: intensity || "", claim: feeling, action: result.one_action })}
-                color={C.green}
-                style={{ flex: 2 }}
-              >
-                Log to Emotion Protocol
-              </Btn>
-            </div>
+            <div style={{ fontSize: 11, color: C.muted }}>✓ Saved to your support diary (Mind tab)</div>
+            <Btn onClick={onClose} style={{ width: "100%" }}>Close</Btn>
           </div>
         )}
       </div>
