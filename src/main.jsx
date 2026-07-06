@@ -185,9 +185,11 @@ function computeGoal(goal, apps) {
 
   const actualTotal = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && isGoalActivity(a)).length;
   const actualByNow = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && a.contacted <= t && isGoalActivity(a)).length;
+  const actualToday = apps.filter((a) => a.contacted === t && isGoalActivity(a)).length;
   const daysRemaining = Math.max(0, goal.days - elapsedCalendarDays); /* calendar days, same unit as "over N days" */
   const pastDeadline = t > deadline;
   const todaysTarget = dailyTargetForDay(goal, Math.max(1, elapsedCalendarDays), fullQuota);
+  const todayMet = actualToday >= todaysTarget;
   const stillRamping = goal.rampEnabled && elapsedCalendarDays < preset.rampDays;
 
   /* weekly breakdown, Mon-Sat buckets across the whole campaign span, ramp-aware */
@@ -213,6 +215,8 @@ function computeGoal(goal, apps) {
   return {
     fullQuota,
     todaysTarget,
+    actualToday,
+    todayMet,
     stillRamping,
     rampDaysLeft: stillRamping ? Math.max(0, preset.rampDays - elapsedCalendarDays) : 0,
     aggressiveness: preset,
@@ -1486,8 +1490,61 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   /* ============ SECTION RENDERERS ============ */
 
-  const renderDashboard = () => (
+  const renderDashboard = () => {
+    const g = computeGoal(state.goal, apps);
+    return (
     <>
+      {/* today's goal — featured front and center, not buried in the Goal tab */}
+      {state.goal && g ? (
+        <div
+          onClick={() => setMode(1)}
+          style={{ background: C.panel, border: `1px solid ${g.todayMet ? C.green : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14, cursor: "pointer" }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <Label>🎯 Today's goal — applications + outreach</Label>
+            <span style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.amber, border: `1px solid ${C.panelEdge}`, borderRadius: 20, padding: "3px 9px" }}>
+              {g.aggressiveness.emoji} {g.aggressiveness.label}
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 6 }}>
+            <div style={{ fontFamily: mono, fontSize: 40, fontWeight: 800, color: g.todayMet ? C.green : C.amber, lineHeight: 1.1 }}>
+              {g.actualToday} / {g.todaysTarget}
+            </div>
+            <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.4 }}>
+              {g.todayMet ? "✓ hit today's target" : "to do today"}
+              {g.stillRamping && !g.todayMet && (
+                <>
+                  <br />
+                  🌱 ramping to {g.fullQuota}/day
+                </>
+              )}
+            </div>
+          </div>
+          <div style={{ height: 8, background: C.bg, borderRadius: 4, marginTop: 10, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
+            <div
+              style={{
+                height: "100%",
+                width: `${g.todaysTarget > 0 ? Math.min(100, (g.actualToday / g.todaysTarget) * 100) : 0}%`,
+                background: g.todayMet ? C.green : C.amber,
+                borderRadius: 4,
+                transition: "width 0.3s ease",
+              }}
+            />
+          </div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
+            Overall: {g.actualTotal}/{state.goal.target} ({g.pctComplete}%) · deadline {g.deadline} · tap for full plan
+          </div>
+        </div>
+      ) : (
+        <div
+          onClick={() => setMode(1)}
+          style={{ background: C.panel, border: `1px dashed ${C.panelEdge}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+        >
+          <div style={{ fontSize: 13, color: C.muted }}>🎯 No goal set yet — tap to set a target and see today's number here</div>
+          <span style={{ color: C.amber, fontSize: 12, fontWeight: 700 }}>Set goal →</span>
+        </div>
+      )}
+
       {/* instrument strip */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 14 }}>
         {[
@@ -1724,7 +1781,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         </div>
       )}
     </>
-  );
+    );
+  };
 
   const renderHistory = () => {
     const items = (state.accomplishments || []).slice().sort((a, b) => (b.date || "").localeCompare(a.date || ""));
