@@ -1865,7 +1865,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   <th style={th}>Contact</th>
                   <th style={th}>Email</th>
                   <th style={th}>Post link</th>
-                  <th style={th}>Screenshot</th>
+                  <th style={th}>Screenshot / Link</th>
                   <th style={th}>Salary / offer</th>
                   <th style={th}>Status</th>
                   <th style={th}>Contacted</th>
@@ -1917,19 +1917,29 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, minWidth: 110 }}>{cellInput(a, "contact", { ph: "Name" })}</td>
                       <td style={{ ...td, minWidth: 140 }}>{cellInput(a, "email", { ph: "email@…" })}</td>
                       <td style={{ ...td, minWidth: 130 }}>{cellInput(a, "postLink", { ph: "https://…" })}</td>
-                      <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
+                      <td style={{ ...td, minWidth: 150 }} onClick={(e) => e.stopPropagation()}>
                         {a.postShot ? (
                           <a href={shotPublicUrl(a.postShot)} target="_blank" rel="noreferrer" style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}>
-                            🖼 view
+                            🖼 view upload
                           </a>
                         ) : (
-                          <button
-                            onClick={() => setModal({ kind: "application", entry: a })}
-                            title="Attach a screenshot (upload or paste)"
-                            style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 6, padding: "3px 8px", fontSize: 11, cursor: "pointer" }}
-                          >
-                            📎 attach
-                          </button>
+                          <>
+                            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                              {cellInput(a, "screenshotLink", { ph: "Drive/Photos link…" })}
+                              {a.screenshotLink && (
+                                <a href={a.screenshotLink.startsWith("http") ? a.screenshotLink : "https://" + a.screenshotLink} target="_blank" rel="noreferrer" title="Open link" style={{ color: C.blue, fontSize: 13, flexShrink: 0, textDecoration: "none" }}>
+                                  🔗
+                                </a>
+                              )}
+                            </div>
+                            <button
+                              onClick={() => setModal({ kind: "application", entry: a })}
+                              title="Attach a screenshot instead (upload or paste)"
+                              style={{ background: "transparent", border: "none", color: C.muted, fontSize: 10, cursor: "pointer", padding: "2px 0", textDecoration: "underline" }}
+                            >
+                              or upload instead
+                            </button>
+                          </>
                         )}
                       </td>
                       <td style={{ ...td, minWidth: 110 }}>{cellInput(a, "salary", { ph: "₱ / $", mono: true })}</td>
@@ -2055,6 +2065,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           <span style={{ color: C.blue, fontSize: 12 }}>🔗 link</span>
                         ) : a.postShot ? (
                           <span style={{ color: C.blue, fontSize: 12 }}>🖼 shot</span>
+                        ) : a.screenshotLink ? (
+                          <span style={{ color: C.blue, fontSize: 12 }}>🔗 shot link</span>
                         ) : (
                           <span style={{ color: C.muted, fontSize: 12 }}>—</span>
                         )}
@@ -2706,6 +2718,7 @@ function Modal({ modal, onClose, onSave, totals }) {
         jobBoardName: entry?.jobBoardName || "",
         postLink: entry?.postLink || "",
         postShot: entry?.postShot || "",
+        screenshotLink: entry?.screenshotLink || "",
         salary: entry?.salary || "",
         contact: entry?.contact || "",
         email: entry?.email || "",
@@ -2910,6 +2923,19 @@ function Modal({ modal, onClose, onSave, totals }) {
                 </>
               )}
             </div>
+            {!f.postShot && (
+              <Field
+                label="…or paste a link if you uploaded it elsewhere (Google Drive, Photos, etc.)"
+                value={f.screenshotLink}
+                onChange={set("screenshotLink")}
+                placeholder="https://drive.google.com/…"
+              />
+            )}
+            {f.screenshotLink && !f.postShot && (
+              <div style={{ fontSize: 11, color: C.muted, margin: "-8px 0 12px" }}>
+                Tip: in Google Drive/Photos, right-click the file → Share → "Anyone with the link" so it opens for you later.
+              </div>
+            )}
             <Field label="Salary / offer" value={f.salary} onChange={set("salary")} placeholder="e.g. ₱120K–150K/mo or $1,800/mo" />
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
               <Field label="Contact person" value={f.contact} onChange={set("contact")} placeholder="e.g. Jane Cruz" />
