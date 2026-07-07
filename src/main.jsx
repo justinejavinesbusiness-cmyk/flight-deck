@@ -151,6 +151,24 @@ function computeMilestoneWins(prevApp, newStatus) {
   return { milestonesLogged: [...already, ...newlyReached], wins };
 }
 
+/* ---- content publish wins ----
+   Content is nurturing, not a conversion tool — the only automatic win here
+   is the act of publishing itself (consistency + follow-through), never
+   framed as "this will get you a job." Fires once per content item. */
+function computeContentPublishWin(prevContent, newStatus) {
+  if (newStatus !== "published" || prevContent?.celebratedPublish) return null;
+  const title = prevContent?.title || "Untitled";
+  const typeNote = prevContent?.type ? ` (${prevContent.type})` : "";
+  return {
+    win: {
+      id: uid(),
+      date: today(),
+      category: "Published",
+      text: `🎉 Published — "${title}"${typeNote}. Showing up consistently is its own win.`,
+    },
+  };
+}
+
 /* ---- goal / campaign planner ---- */
 /* an application/outreach counts toward the goal the moment it's real activity —
    the ONLY thing that doesn't count is a "saved for later" lead with no status yet.
@@ -677,8 +695,8 @@ function SwipeRow({ onDelete, onTap, showX, children }) {
   const onTouchEnd = (e) => {
     e.stopPropagation();
     if (dx < -80) {
-      setDx(-400);
-      setTimeout(onDelete, 160);
+      setDx(0); /* snap back visually; the caller decides what happens next (may ask for confirmation first) */
+      onDelete();
     } else {
       setDx(0);
       if (!moved.current && onTap) onTap();
@@ -854,6 +872,7 @@ export default function FlightDeck() {
   const [syncModal, setSyncModal] = useState(false);
   const [supportOpen, setSupportOpen] = useState(false);
   const [focusModalOpen, setFocusModalOpen] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(null); /* { kind: "application"|"account", id, label } */
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [syncStatus, setSyncStatus] = useState("local");
@@ -1265,6 +1284,19 @@ export default function FlightDeck() {
     const sessions = (state.supportSessions || [])
       .slice(0, 6)
       .map((s) => `${s.date} "${s.feeling || "?"}" intensity ${s.intensity || "?"}/10`);
+    const contentLine = (() => {
+      const items = state.content || [];
+      if (!items.length) return "No content tracked yet.";
+      const thisWeekStart = iso(mondayOf(new Date()));
+      const doneThisWeek = items.filter((c) => c.date && weekStartOfDate(c.date) === thisWeekStart).length;
+      const perWeek = state.contentGoal?.perWeek || 0;
+      const published = items.filter((c) => c.status === "published").length;
+      const recent = items
+        .slice(0, 5)
+        .map((c) => `${c.title || "Untitled"} [${c.status || "idea"}${c.type ? `, ${c.type}` : ""}]`)
+        .join("; ");
+      return `Content: ${doneThisWeek}/${perWeek} this week, ${published} published total. Recent: ${recent}. Content is nurturing/staying visible to your network — NOT a job-search conversion tactic. Never frame it as "this will get you interviews"; the goal is consistency and genuine presence, full stop.`;
+    })();
     const now = new Date();
     return [
       `Today: ${now.toDateString()}.`,
@@ -1274,6 +1306,7 @@ export default function FlightDeck() {
       `Pipeline by status: ${byStatus}.`,
       `Follow-ups DUE today or overdue: ${dueList.length}${dueList.length ? " — " + dueList.slice(0, 6).map((a) => `${a.company || "unnamed"} (contacted ${a.contacted}, status ${a.status})`).join("; ") : ""}.`,
       goalLine,
+      contentLine,
       `Past wins (historical benchmark from previous successful searches, if any):\n${pastWins.join("\n") || "none recorded yet"}`,
       `Recent accomplishments (completed focus items — acknowledge momentum):\n${wins.join("\n") || "none yet"}`,
       `Emotional support sessions (date, feeling, intensity — watch for patterns/trends):\n${sessions.join("\n") || "none yet"}`,
@@ -1292,6 +1325,7 @@ Non-negotiable playbook rules you must coach within:
 - Emotions: each logged emotion should convert to exactly ONE small action. High intensity (8+) = body regulation first.
 - If an active goal is set, use its stated "today's target" (which may still be ramping up) and deadline instead of the generic weekly benchmark for volume advice — prioritize hitting today's specific number and flag clearly if behind pace.
 - If past wins exist, treat their snapshot numbers as this person's own proven benchmark (e.g. "last time it took you N applications") rather than generic statistics — it's more convincing evidence than population averages.
+- Content (blog posts, videos, carousels, etc.) is a SEPARATE track from the job search — it exists purely for meaningful nurturing and staying visible to their network, NOT as a lead-generation or conversion tactic. Never suggest content "to get more interviews" or tie its success to job-search metrics. If mentioning content at all, frame it around consistency and genuine presence, and only bring it up when it's actually relevant (e.g. behind on the weekly content goal) — don't force it into every briefing.
 Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference their actual numbers and company names.`;
 
   const callClaude = async (task, format) => {
@@ -1349,7 +1383,7 @@ Respond with ONLY valid JSON, no markdown fences, no preamble, exactly this shap
     setCoachError("");
     try {
       const daily = await callClaude(
-        "Give today's focus: a MAXIMUM of 3 things to do TODAY (specific and finishable today; due follow-ups by company name usually come first, then volume/quality work sized to where the funnel leaks, then any unfinished emotion-log action). ORDER the items from HIGHEST to LOWEST impact on landing the job — item 1 must be the single highest-leverage action right now. Set key=true on item 1 only. This order matters: as items get completed, the app will highlight whichever remaining item is next in this priority order, so order them exactly by true impact, not by convenience or sequence. Also give one sentence on why based on the numbers, one thing to watch (or empty string), and one grounding reminder in evidence-file style.",
+        "Give today's focus: a MAXIMUM of 3 things to do TODAY (specific and finishable today; due follow-ups by company name usually come first, then volume/quality work sized to where the funnel leaks, then any unfinished emotion-log action). ORDER the items from HIGHEST to LOWEST impact on landing the job — item 1 must be the single highest-leverage job-search action right now (application, outreach, follow-up, or interview prep), never content. Set key=true on item 1 only. This order matters: as items get completed, the app will highlight whichever remaining item is next in this priority order, so order them exactly by true impact, not by convenience or sequence. If they are meaningfully behind their weekly content goal, content CAN be one of the up-to-3 items — framed purely as consistency/staying visible, never as something that helps land the job — but it should rarely if ever be item 1. Also give one sentence on why based on the numbers, one thing to watch (or empty string), and one grounding reminder in evidence-file style.",
         `{"focus": [{"text": "...", "key": false}, {"text": "...", "key": true}], "why": "...", "watch": "...", "reminder": "..."}`
       );
       const items = normFocus(daily.focus).slice(0, 3);
@@ -1367,8 +1401,8 @@ Respond with ONLY valid JSON, no markdown fences, no preamble, exactly this shap
     setCoachError("");
     try {
       const weekly = await callClaude(
-        "Run the Friday weekly review: a one-line verdict (on-track / off-track and why), funnel diagnosis (which stage leaks most vs benchmarks and the fix), pipeline hygiene (stale applications, follow-up discipline, status mix), emotional pattern analysis from the protocol log, acknowledgment of accomplishments, 2-4 priorities for next week, and a floor check (does P95K hold given runway - it should unless runway is critically low).",
-        `{"verdict": "...", "funnel": "...", "pipeline": "...", "emotions": "...", "next_week": ["..."], "floor": "..."}`
+        "Run the Friday weekly review: a one-line verdict (on-track / off-track and why), funnel diagnosis (which stage leaks most vs benchmarks and the fix), pipeline hygiene (stale applications, follow-up discipline, status mix), emotional pattern analysis from the protocol log, acknowledgment of accomplishments, 2-4 priorities for next week, a floor check (does P95K hold given runway - it should unless runway is critically low), and a brief content note (consistency toward the weekly content goal, framed purely as nurturing/visibility — explicitly NOT tied to job-search outcomes; if no content is tracked, leave this empty).",
+        `{"verdict": "...", "funnel": "...", "pipeline": "...", "emotions": "...", "content": "...", "next_week": ["..."], "floor": "..."}`
       );
       setCoach((p) => ({ ...p, weekly, weeklyDate: today() }));
     } catch (e) {
@@ -1581,10 +1615,44 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     mutate((s) => ({ ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
   const updateAccountField = (id, field, value) =>
     mutate((s) => ({ ...s, accounts: s.accounts.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
-  const updateContentField = (id, field, value) =>
-    mutate((s) => ({ ...s, content: s.content.map((c) => (c.id === id ? { ...c, [field]: value } : c)) }));
+  const updateContentField = (id, field, value) => {
+    let winMsg = "";
+    mutate((s) => {
+      let addWin = null;
+      const content = s.content.map((c) => {
+        if (c.id !== id) return c;
+        if (field === "status") {
+          const m = computeContentPublishWin(c, value);
+          if (m) {
+            addWin = m.win;
+            return { ...c, [field]: value, celebratedPublish: true };
+          }
+        }
+        return { ...c, [field]: value };
+      });
+      if (addWin) winMsg = addWin.text;
+      return { ...s, content, accomplishments: addWin ? [addWin, ...s.accomplishments] : s.accomplishments };
+    });
+    if (winMsg) setTimeout(() => flash(winMsg), 400);
+  };
   const setContentGoalPerWeek = (n) =>
     mutate((s) => ({ ...s, contentGoal: { ...s.contentGoal, perWeek: Math.max(0, Math.round(+n || 0)) } }));
+
+  /* delete confirmation — asks first, deletes only once confirmed. Scoped to
+     Applications and Accounts, both of which can hold a lot of accumulated
+     detail (contacts, follow-ups, notes) worth double-checking before losing. */
+  const askDeleteApplication = (a) => setConfirmDelete({ kind: "application", id: a.id, label: a.company || "this application" });
+  const askDeleteAccount = (acc) => setConfirmDelete({ kind: "account", id: acc.id, label: acc.company || "this account" });
+  const executeConfirmedDelete = () => {
+    if (!confirmDelete) return;
+    const { kind, id, label } = confirmDelete;
+    if (kind === "application") {
+      mutate((s) => ({ ...s, applications: s.applications.filter((x) => x.id !== id) }), `Deleted ${label}`);
+    } else if (kind === "account") {
+      mutate((s) => ({ ...s, accounts: s.accounts.filter((x) => x.id !== id) }), `Deleted ${label}`);
+    }
+    setConfirmDelete(null);
+  };
 
   const saveModal = (data) => {
     const { kind, entry } = modal;
@@ -1625,15 +1693,26 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       );
       if (!entry) setCrmView("accounts"); /* land on the Accounts table after creating one */
     } else if (kind === "content") {
-      mutate(
-        (s) => ({
-          ...s,
-          content: entry
-            ? s.content.map((c) => (c.id === entry.id ? { ...c, ...data } : c))
-            : [{ id: uid(), ...data }, ...s.content],
-        }),
-        entry ? "Content updated" : "Content added"
-      );
+      let winMsg = "";
+      mutate((s) => {
+        let addWin = null;
+        let content;
+        if (entry) {
+          content = s.content.map((c) => {
+            if (c.id !== entry.id) return c;
+            const m = computeContentPublishWin(c, data.status);
+            if (m) addWin = m.win;
+            return { ...c, ...data, celebratedPublish: m ? true : c.celebratedPublish };
+          });
+        } else {
+          const m = computeContentPublishWin({}, data.status);
+          if (m) addWin = m.win;
+          content = [{ id: uid(), ...data, celebratedPublish: m ? true : false }, ...s.content];
+        }
+        if (addWin) winMsg = addWin.text;
+        return { ...s, content, accomplishments: addWin ? [addWin, ...s.accomplishments] : s.accomplishments };
+      }, entry ? "Content updated" : "Content added");
+      if (winMsg) setTimeout(() => flash(winMsg), 400);
     } else if (kind === "decision") {
       mutate(
         (s) => ({
@@ -2013,7 +2092,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 {list.map((a) => {
                   const isPastWin = a.category === "Past Wins" && a.snapshot;
-                  const isMilestone = Object.values(MILESTONE_LABEL).includes(a.category);
+                  const isMilestone = Object.values(MILESTONE_LABEL).includes(a.category) || a.category === "Published";
                   const isGoalMilestone = a.category === "Milestone";
                   const isCycle = a.category === "Cycle Complete" && a.snapshot;
                   return (
@@ -2088,7 +2167,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                               {historyGroup === "category" ? "" : a.category}
                             </div>
                           </div>
-                          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{a.date} · auto-detected forward progress</div>
+                          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{a.date} · {a.category === "Published" ? "content, out in the world" : "auto-detected forward progress"}</div>
                         </div>
                       ) : (
                         <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
@@ -2509,7 +2588,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, minWidth: 140 }}>{cellInput(a, "notes", { ph: "notes…" })}</td>
                       <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
                         <button
-                          onClick={() => mutate((s) => ({ ...s, applications: s.applications.filter((x) => x.id !== a.id) }), "Application deleted")}
+                          onClick={() => askDeleteApplication(a)}
                           title="Delete"
                           style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
                         >
@@ -2646,7 +2725,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       </td>
                       <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
                         <button
-                          onClick={() => mutate((s) => ({ ...s, applications: s.applications.filter((x) => x.id !== a.id) }), "Application deleted")}
+                          onClick={() => askDeleteApplication(a)}
                           title="Delete"
                           style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
                         >
@@ -2767,7 +2846,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, minWidth: 150 }}>{cellInput(acc, "notes", { ph: "notes…", onCommit: updateAccountField })}</td>
                       <td style={td} onClick={(e) => e.stopPropagation()}>
                         <button
-                          onClick={() => mutate((s) => ({ ...s, accounts: s.accounts.filter((x) => x.id !== acc.id) }), "Account deleted")}
+                          onClick={() => askDeleteAccount(acc)}
                           title="Delete"
                           style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
                         >
@@ -2793,7 +2872,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   key={acc.id}
                   showX={false}
                   onTap={() => setModal({ kind: "account", entry: acc })}
-                  onDelete={() => mutate((s) => ({ ...s, accounts: s.accounts.filter((x) => x.id !== acc.id) }), "Account deleted")}
+                  onDelete={() => askDeleteAccount(acc)}
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
                     <div style={{ fontWeight: 700, fontSize: 14 }}>{acc.company || "Unnamed"}</div>
@@ -3618,6 +3697,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           coach={coach}
           coachLoading={coachLoading}
           runWeekly={runWeekly}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmDeleteModal
+          label={confirmDelete.label}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={executeConfirmedDelete}
         />
       )}
     </div>
@@ -4521,6 +4607,32 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
 }
 
 /* ---------- sync modal (centered) ---------- */
+/* ---------- delete confirmation (centered) ---------- */
+function ConfirmDeleteModal({ label, onCancel, onConfirm }) {
+  return (
+    <div
+      onClick={onCancel}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.82)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 55, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 360, background: C.panel, border: `1px solid ${C.red}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+      >
+        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>Delete this entry?</div>
+        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16, wordBreak: "break-word" }}>
+          You're about to delete <span style={{ color: C.ink, fontWeight: 700 }}>{label}</span>. You can undo this afterward with the ↩ Undo button if you change your mind.
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <Btn ghost onClick={onCancel} style={{ flex: 1 }}>Cancel</Btn>
+          <Btn onClick={onConfirm} color={C.red} style={{ flex: 1 }}>Delete</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SyncModal({ currentKey, onClose, onSwitch, flash }) {
   const [input, setInput] = useState("");
   return (
@@ -4710,6 +4822,7 @@ function WeeklyReviewModal({ onClose, coach, coachLoading, runWeekly }) {
                 ["FUNNEL", coach.weekly.funnel],
                 ["PIPELINE", coach.weekly.pipeline],
                 ["EMOTIONS", coach.weekly.emotions],
+                ["CONTENT", coach.weekly.content],
                 ["FLOOR CHECK", coach.weekly.floor],
               ].map(
                 ([k, v]) =>
