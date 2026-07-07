@@ -2012,11 +2012,20 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   });
                   return Array.from(buckets.entries()).map(([label, value]) => ({ label, value }));
                 })()
-              : [
-                  { label: "Warm", value: apps.filter((a) => a.outreachKind === "warm").length },
-                  { label: "Cold", value: apps.filter((a) => a.outreachKind === "cold").length },
-                  { label: "Untagged (in outreach)", value: apps.filter((a) => isOutreach(a) && !a.outreachKind).length },
-                ]
+              : (() => {
+                  const allContacts = (state.accounts || []).flatMap((a) => a.contacts || []);
+                  const appWarm = apps.filter((a) => a.outreachKind === "warm").length;
+                  const appCold = apps.filter((a) => a.outreachKind === "cold").length;
+                  const appUntagged = apps.filter((a) => isOutreach(a) && !a.outreachKind).length;
+                  const contactWarm = allContacts.filter((c) => c.outreachKind === "warm").length;
+                  const contactCold = allContacts.filter((c) => c.outreachKind === "cold").length;
+                  const contactUntagged = allContacts.filter((c) => isContactOutreached(c) && !c.outreachKind).length;
+                  return [
+                    { label: "Warm", value: appWarm + contactWarm },
+                    { label: "Cold", value: appCold + contactCold },
+                    { label: "Untagged (in outreach)", value: appUntagged + contactUntagged },
+                  ];
+                })()
           }
         />
         {donutMode === "source" && (
@@ -2026,7 +2035,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         )}
         {donutMode === "outreach" && (
           <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
-            Warm/cold tags are kept even after status moves on (e.g. to applied). "Untagged" is only entries still sitting in outreach status. Warm converts 4–10x better than cold.
+            Includes both application outreach and account contacts. Warm/cold tags are kept even after status moves on (e.g. to applied/replied). "Untagged" is only entries still sitting in outreach status. Warm converts 4–10x better than cold.
           </div>
         )}
       </div>
