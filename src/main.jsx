@@ -147,6 +147,13 @@ function computeMilestoneWins(prevApp, newStatus) {
    the ONLY thing that doesn't count is a "saved for later" lead with no status yet.
    Application and outreach are treated identically: each is worth 1 toward the target. */
 const isGoalActivity = (a) => !isBlankStatus(a);
+/* links an Account to Applications sharing the same company name (trimmed, case-insensitive) */
+const normCompanyName = (s) => (s || "").trim().toLowerCase();
+const relatedApplications = (accountCompany, apps) => {
+  const key = normCompanyName(accountCompany);
+  if (!key) return [];
+  return apps.filter((a) => normCompanyName(a.company) === key);
+};
 
 /* Aggressiveness controls BOTH how big the daily quota is AND, when ramp-up is
    on, how gently/quickly you build up to it. Chill = lower quota, slow 2-week
@@ -166,6 +173,36 @@ function dailyTargetForDay(goal, dayIndex, fullQuota) {
   const startVal = Math.max(1, Math.round(fullQuota * preset.rampStart));
   const frac = (dayIndex - 1) / (rampDays - 1);
   return Math.max(1, Math.round(startVal + (fullQuota - startVal) * frac));
+}
+
+/* Rollover: walks day 1 -> uptoDayIndex, carrying yesterday's shortfall/surplus
+   into today. Overachieving reduces tomorrow's target (never below 0);
+   falling short adds the remainder on top of tomorrow's base target. Only
+   TODAY's number is exposed — future days aren't speculatively adjusted,
+   since their actuals aren't known yet. */
+function computeDailyRollout(goal, apps, fullQuota, uptoDayIndex) {
+  const countsByDate = new Map();
+  apps.forEach((a) => {
+    if (a.contacted && isGoalActivity(a)) countsByDate.set(a.contacted, (countsByDate.get(a.contacted) || 0) + 1);
+  });
+  let carry = 0;
+  let carryIntoToday = 0;
+  let todaysEffective = fullQuota;
+  for (let d = 1; d <= uptoDayIndex; d++) {
+    const dateObj = new Date(goal.startDate + "T00:00:00");
+    dateObj.setDate(dateObj.getDate() + (d - 1));
+    const isSunday = dateObj.getDay() === 0;
+    const base = isSunday ? 0 : dailyTargetForDay(goal, d, fullQuota);
+    const effective = Math.max(0, base + carry);
+    if (d === uptoDayIndex) {
+      carryIntoToday = carry;
+      todaysEffective = effective;
+    }
+    const dateIso = iso(dateObj);
+    const actual = countsByDate.get(dateIso) || 0;
+    carry = effective - actual; /* positive = shortfall carries forward; negative = surplus banked */
+  }
+  return { todaysTarget: todaysEffective, carryIntoToday };
 }
 
 /* pure: derive everything about a goal from the goal record + the pipeline */
@@ -191,7 +228,9 @@ function computeGoal(goal, apps) {
   const actualToday = apps.filter((a) => a.contacted === t && isGoalActivity(a)).length;
   const daysRemaining = Math.max(0, goal.days - elapsedCalendarDays); /* calendar days, same unit as "over N days" */
   const pastDeadline = t > deadline;
-  const todaysTarget = dailyTargetForDay(goal, Math.max(1, elapsedCalendarDays), fullQuota);
+  const rollout = computeDailyRollout(goal, apps, fullQuota, Math.max(1, elapsedCalendarDays));
+  const todaysTarget = rollout.todaysTarget;
+  const carryIntoToday = rollout.carryIntoToday; /* >0 = shortfall carried in from yesterday, <0 = surplus banked, 0 = none */
   const todayMet = actualToday >= todaysTarget;
   const stillRamping = goal.rampEnabled && elapsedCalendarDays < preset.rampDays;
 
@@ -218,6 +257,7 @@ function computeGoal(goal, apps) {
   return {
     fullQuota,
     todaysTarget,
+    carryIntoToday,
     actualToday,
     todayMet,
     stillRamping,
@@ -370,6 +410,7 @@ function rolloverCoach(c, todayStr) {
 
 const DEFAULT_STATE = {
   applications: [],
+  accounts: [],
   funnel: [],
   emotions: [],
   decisions: [],
@@ -390,12 +431,14 @@ const sans = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, 
 function migrate(saved) {
   const s = { ...DEFAULT_STATE, ...saved };
   if (!Array.isArray(s.applications)) s.applications = [];
+  if (!Array.isArray(s.accounts)) s.accounts = [];
   if (!Array.isArray(s.accomplishments)) s.accomplishments = [];
   if (!Array.isArray(s.supportSessions)) s.supportSessions = [];
   if (!s.settings || typeof s.settings !== "object") s.settings = { checkinDay: 1 };
   if (!s.settings.checkinDay) s.settings.checkinDay = 1;
   if (!Array.isArray(s.settings.followUpDefaults) || !s.settings.followUpDefaults.length)
     s.settings.followUpDefaults = [...DEFAULT_FOLLOWUPS];
+  s.accounts = s.accounts.map((a) => ({ ...a, contacts: Array.isArray(a.contacts) ? a.contacts : [] }));
   /* legacy single followUpDays → followUps array; records with NO status field
      at all (saved before this feature existed) default to "applied" so old
      data isn't silently reclassified — but a deliberate status: "" (saved
@@ -428,6 +471,7 @@ function mergeStates(localS, remoteS) {
   return {
     ...remoteS,
     applications: unionById(localS.applications, remoteS.applications),
+    accounts: unionById(localS.accounts, remoteS.accounts),
     funnel: unionById(localS.funnel, remoteS.funnel),
     emotions: unionById(localS.emotions, remoteS.emotions),
     decisions: unionById(localS.decisions, remoteS.decisions),
@@ -794,8 +838,10 @@ export default function FlightDeck() {
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [syncStatus, setSyncStatus] = useState("local");
+  const [crmView, setCrmView] = useState("applications"); /* toggle inside the CRM tab: applications <-> accounts */
   const [pipeFilter, setPipeFilter] = useState("active");
   const [pipeSearch, setPipeSearch] = useState("");
+  const [accSearch, setAccSearch] = useState("");
   const [pipeSourceFilter, setPipeSourceFilter] = useState("");
   const [pipeStatusFilter, setPipeStatusFilter] = useState("");
   const [donutMode, setDonutMode] = useState("status");
@@ -1187,7 +1233,13 @@ export default function FlightDeck() {
           ? ` Ramping up (${g.aggressiveness.label} style): today's target is ${g.todaysTarget}/day, building to ${g.fullQuota}/day over the next ${g.rampDaysLeft} day(s).`
           : ` Ramp-up complete, holding at full pace (${g.fullQuota}/day).`
         : ` Flat pace, no ramp-up.`;
-      return `Active goal: ${state.goal.target} applications+outreach combined (each counts as 1) over ${state.goal.days} days, deadline ${g.deadline}, aggressiveness ${g.aggressiveness.label}, full daily quota ${g.fullQuota}.${rampNote} Progress: ${g.actualTotal}/${state.goal.target} (${g.pctComplete}%) — ${g.pastDeadline ? "deadline passed" : g.onPace ? "on pace" : `behind, expected ${g.expectedByNow} by now`}.`;
+      const carryNote =
+        g.carryIntoToday > 0
+          ? ` Yesterday's shortfall of ${g.carryIntoToday} carried over — today's target is boosted accordingly.`
+          : g.carryIntoToday < 0
+          ? ` Overachieved yesterday by ${Math.abs(g.carryIntoToday)} — today's target is reduced accordingly.`
+          : "";
+      return `Active goal: ${state.goal.target} applications+outreach combined (each counts as 1) over ${state.goal.days} days, deadline ${g.deadline}, aggressiveness ${g.aggressiveness.label}, full daily quota ${g.fullQuota}.${rampNote}${carryNote} Today's actual target (after rollover): ${g.todaysTarget}, done so far today: ${g.actualToday}. Progress: ${g.actualTotal}/${state.goal.target} (${g.pctComplete}%) — ${g.pastDeadline ? "deadline passed" : g.onPace ? "on pace" : `behind, expected ${g.expectedByNow} by now`}.`;
     })();
     const sessions = (state.supportSessions || [])
       .slice(0, 6)
@@ -1506,6 +1558,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   /* excel-style inline cell commit */
   const updateAppField = (id, field, value) =>
     mutate((s) => ({ ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
+  const updateAccountField = (id, field, value) =>
+    mutate((s) => ({ ...s, accounts: s.accounts.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
 
   const saveModal = (data) => {
     const { kind, entry } = modal;
@@ -1534,6 +1588,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         entry ? "Application updated" : "Application added — funnel updated"
       );
       if (winMsg) setTimeout(() => flash(winMsg), 400);
+    } else if (kind === "account") {
+      mutate(
+        (s) => ({
+          ...s,
+          accounts: entry
+            ? s.accounts.map((a) => (a.id === entry.id ? { ...a, ...data } : a))
+            : [{ id: uid(), ...data }, ...s.accounts],
+        }),
+        entry ? "Account updated" : "Account tracked"
+      );
+      if (!entry) setCrmView("accounts"); /* land on the Accounts table after creating one */
     } else if (kind === "decision") {
       mutate(
         (s) => ({
@@ -1697,6 +1762,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               )}
             </div>
           </div>
+          {g.carryIntoToday !== 0 && (
+            <div style={{ fontSize: 11, color: g.carryIntoToday > 0 ? C.red : C.green, marginTop: 6 }}>
+              {g.carryIntoToday > 0
+                ? `⬆ +${g.carryIntoToday} carried over from yesterday's shortfall`
+                : `⬇ ${Math.abs(g.carryIntoToday)} banked from yesterday's overachievement — lighter today`}
+            </div>
+          )}
           <div style={{ height: 8, background: C.bg, borderRadius: 4, marginTop: 10, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
             <div
               style={{
@@ -2001,6 +2073,47 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       </>
     );
   };
+  /* shared table styling/helpers — used by both the Applications and Accounts views */
+  const th = { textAlign: "left", fontFamily: sans, fontSize: 10, letterSpacing: "0.14em", color: C.muted, textTransform: "uppercase", padding: "8px 10px", borderBottom: `1px solid ${C.panelEdge}`, whiteSpace: "nowrap" };
+  const td = { padding: "10px 10px", borderBottom: `1px solid ${C.panelEdge}`, fontSize: 13, verticalAlign: "middle" };
+  const selMini = { fontSize: 13, fontFamily: sans, background: "transparent", border: "1px solid transparent", borderRadius: 6, padding: "3px 2px", outline: "none" };
+  /* excel-style inline cell: uncontrolled, commits on blur/Enter, no popup needed */
+  const cellInput = (a, field, opts = {}) => (
+    <input
+      key={a.id + field + String(a[field] ?? "")}
+      defaultValue={a[field] ?? ""}
+      type={opts.type || "text"}
+      placeholder={opts.ph || "—"}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+      }}
+      onBlur={(e) => {
+        const v = e.target.value;
+        if (v !== (a[field] ?? "")) (opts.onCommit || updateAppField)(a.id, field, v);
+      }}
+      style={{ width: "100%", minWidth: opts.w || 90, boxSizing: "border-box", fontSize: 13, fontFamily: opts.mono ? mono : sans, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.ink, padding: "4px 6px", outline: "none" }}
+      onFocus={(e) => (e.target.style.border = `1px solid ${C.blue}`)}
+    />
+  );
+  /* small clickable icon-link that opens a URL-ish field without blocking editing */
+  const openLink = (url, opts = {}) => {
+    if (!url) return null;
+    const href = opts.mailto ? `mailto:${url}` : url.startsWith("http") ? url : `https://${url}`;
+    return (
+      <a
+        href={href}
+        target={opts.mailto ? undefined : "_blank"}
+        rel="noreferrer"
+        onClick={(e) => e.stopPropagation()}
+        title={opts.title || "Open"}
+        style={{ color: C.blue, fontSize: 13, textDecoration: "none", flexShrink: 0, lineHeight: 1 }}
+      >
+        {opts.icon || "↗"}
+      </a>
+    );
+  };
+
   const renderPipeline = () => {
     const filters = [
       { key: "active", label: `Active (${apps.filter(isOpenApp).length})` },
@@ -2039,49 +2152,40 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .slice()
       .sort((a, b) => (b.contacted || "").localeCompare(a.contacted || ""));
 
-    const th = { textAlign: "left", fontFamily: sans, fontSize: 10, letterSpacing: "0.14em", color: C.muted, textTransform: "uppercase", padding: "8px 10px", borderBottom: `1px solid ${C.panelEdge}`, whiteSpace: "nowrap" };
-    const td = { padding: "10px 10px", borderBottom: `1px solid ${C.panelEdge}`, fontSize: 13, verticalAlign: "middle" };
-    const selMini = { fontSize: 13, fontFamily: sans, background: "transparent", border: "1px solid transparent", borderRadius: 6, padding: "3px 2px", outline: "none" };
-
-    /* excel-style inline cell: uncontrolled, commits on blur/Enter, no popup needed */
-    const cellInput = (a, field, opts = {}) => (
-      <input
-        key={a.id + field + String(a[field] ?? "")}
-        defaultValue={a[field] ?? ""}
-        type={opts.type || "text"}
-        placeholder={opts.ph || "—"}
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") e.currentTarget.blur();
-        }}
-        onBlur={(e) => {
-          const v = e.target.value;
-          if (v !== (a[field] ?? "")) updateAppField(a.id, field, v);
-        }}
-        style={{ width: "100%", minWidth: opts.w || 90, boxSizing: "border-box", fontSize: 13, fontFamily: opts.mono ? mono : sans, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.ink, padding: "4px 6px", outline: "none" }}
-        onFocus={(e) => (e.target.style.border = `1px solid ${C.blue}`)}
-      />
-    );
-    /* small clickable icon-link that opens a URL-ish field without blocking editing */
-    const openLink = (url, opts = {}) => {
-      if (!url) return null;
-      const href = opts.mailto ? `mailto:${url}` : url.startsWith("http") ? url : `https://${url}`;
-      return (
-        <a
-          href={href}
-          target={opts.mailto ? undefined : "_blank"}
-          rel="noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          title={opts.title || "Open"}
-          style={{ color: C.blue, fontSize: 13, textDecoration: "none", flexShrink: 0, lineHeight: 1 }}
-        >
-          {opts.icon || "↗"}
-        </a>
-      );
-    };
-
     return (
       <>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[
+              ["applications", "📋 Applications"],
+              ["accounts", "🏢 Accounts"],
+            ].map(([k, l]) => (
+              <button
+                key={k}
+                onClick={() => setCrmView(k)}
+                style={{ fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "7px 14px", borderRadius: 20, border: `1px solid ${crmView === k ? C.amber : C.panelEdge}`, background: crmView === k ? "rgba(245,185,66,0.12)" : "transparent", color: crmView === k ? C.amber : C.muted, cursor: "pointer" }}
+              >
+                {l}
+              </button>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Btn onClick={() => setModal({ kind: "application", entry: null })}>+ Track application</Btn>
+            <Btn
+              ghost
+              onClick={() => {
+                setModal({ kind: "account", entry: null });
+              }}
+            >
+              + Track account
+            </Btn>
+          </div>
+        </div>
+
+        {crmView === "accounts" ? (
+          renderAccounts()
+        ) : (
+          <>
         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
           <input
             value={pipeSearch}
@@ -2108,7 +2212,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               </button>
             ))}
           </div>
-          <Btn onClick={() => setModal({ kind: "application", entry: null })}>+ Track application</Btn>
         </div>
 
         <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
@@ -2497,6 +2600,160 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             ? "Full spreadsheet — click any cell to edit, Enter or click away to save. 📎 attach handles screenshots; the follow-up column opens the schedule editor."
             : "Tap a row to edit · status changes update the Funnel instantly."}
         </div>
+          </>
+        )}
+      </>
+    );
+  };
+
+  const renderAccounts = () => {
+    const accounts = state.accounts || [];
+    const shownAccounts = accounts
+      .filter((acc) => {
+        if (!accSearch.trim()) return true;
+        const q = accSearch.trim().toLowerCase();
+        const contactMatch = (acc.contacts || []).some((c) => [c.name, c.email, c.position].filter(Boolean).some((f) => f.toLowerCase().includes(q)));
+        return [acc.company, acc.website, acc.industry, acc.notes].filter(Boolean).some((f) => f.toLowerCase().includes(q)) || contactMatch;
+      })
+      .slice()
+      .sort((a, b) => (a.company || "").localeCompare(b.company || ""));
+
+    const rowsDesktop = shownAccounts.length > 0 && isDesktop;
+    const rowsMobile = shownAccounts.length > 0 && !isDesktop;
+
+    return (
+      <>
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <input
+            value={accSearch}
+            onChange={(e) => setAccSearch(e.target.value)}
+            placeholder="🔎 Search company, contact name, email…"
+            style={{ ...inputStyle, flex: 1 }}
+          />
+          {accSearch && (
+            <Btn ghost onClick={() => setAccSearch("")} style={{ padding: "10px 14px" }}>
+              Clear
+            </Btn>
+          )}
+        </div>
+
+        {shownAccounts.length === 0 && (
+          <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
+            {accounts.length === 0
+              ? "No accounts tracked yet. Use + Track account to build a company-level relationship record — multiple contacts, one place."
+              : "Nothing matches this search."}
+          </div>
+        )}
+
+        {rowsDesktop && (
+          <div style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}>
+            <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1000 }}>
+              <thead>
+                <tr>
+                  <th style={th}>Company / Website</th>
+                  <th style={th}>Industry</th>
+                  <th style={th}>Contacts</th>
+                  <th style={th}>Related applications</th>
+                  <th style={th}>Notes</th>
+                  <th style={{ ...th, width: 50 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {shownAccounts.map((acc) => {
+                  const contacts = acc.contacts || [];
+                  const primary = contacts[0];
+                  const related = relatedApplications(acc.company, apps);
+                  return (
+                    <tr key={acc.id}>
+                      <td style={{ ...td, minWidth: 180 }}>
+                        {cellInput(acc, "company", { ph: "Company", onCommit: updateAccountField })}
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          {cellInput(acc, "website", { ph: "website.com", onCommit: updateAccountField })}
+                          {acc.website && openLink(acc.website, { title: "Open website" })}
+                        </div>
+                      </td>
+                      <td style={{ ...td, minWidth: 120 }}>{cellInput(acc, "industry", { ph: "Industry", onCommit: updateAccountField })}</td>
+                      <td style={{ ...td, minWidth: 160, cursor: "pointer" }} onClick={() => setModal({ kind: "account", entry: acc })}>
+                        <div style={{ fontWeight: 700, fontSize: 13, color: contacts.length ? C.ink : C.muted }}>
+                          {contacts.length} contact{contacts.length === 1 ? "" : "s"}
+                        </div>
+                        {primary && (
+                          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+                            {primary.name || "Unnamed"}{primary.position ? ` · ${primary.position}` : ""}
+                          </div>
+                        )}
+                      </td>
+                      <td style={{ ...td, minWidth: 150 }}>
+                        {related.length === 0 ? (
+                          <span style={{ color: C.muted, fontSize: 12 }}>—</span>
+                        ) : (
+                          <div style={{ fontSize: 12 }}>
+                            <span style={{ color: C.blue, fontWeight: 700 }}>{related.length} linked</span>
+                            <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
+                              {related
+                                .slice(0, 3)
+                                .map((r) => statusLabel(r.status))
+                                .join(", ")}
+                              {related.length > 3 ? "…" : ""}
+                            </div>
+                          </div>
+                        )}
+                      </td>
+                      <td style={{ ...td, minWidth: 150 }}>{cellInput(acc, "notes", { ph: "notes…", onCommit: updateAccountField })}</td>
+                      <td style={td} onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => mutate((s) => ({ ...s, accounts: s.accounts.filter((x) => x.id !== acc.id) }), "Account deleted")}
+                          title="Delete"
+                          style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
+                        >
+                          ×
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {rowsMobile && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {shownAccounts.map((acc) => {
+              const contacts = acc.contacts || [];
+              const primary = contacts[0];
+              const related = relatedApplications(acc.company, apps);
+              return (
+                <SwipeRow
+                  key={acc.id}
+                  showX={false}
+                  onTap={() => setModal({ kind: "account", entry: acc })}
+                  onDelete={() => mutate((s) => ({ ...s, accounts: s.accounts.filter((x) => x.id !== acc.id) }), "Account deleted")}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                    <div style={{ fontWeight: 700, fontSize: 14 }}>{acc.company || "Unnamed"}</div>
+                    <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, flexShrink: 0 }}>
+                      {contacts.length} contact{contacts.length === 1 ? "" : "s"}
+                    </div>
+                  </div>
+                  {acc.industry && <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>{acc.industry}</div>}
+                  {primary && (
+                    <div style={{ fontSize: 12, color: C.ink, marginTop: 4 }}>
+                      {primary.name || "Unnamed"}{primary.position ? ` · ${primary.position}` : ""}
+                    </div>
+                  )}
+                  {related.length > 0 && (
+                    <div style={{ fontSize: 11, color: C.blue, marginTop: 4 }}>{related.length} related application{related.length === 1 ? "" : "s"}</div>
+                  )}
+                </SwipeRow>
+              );
+            })}
+          </div>
+        )}
+
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
+          {isDesktop ? "Click any cell to edit · click Contacts to manage the full contact list." : "Tap a row to manage contacts and details."} Related applications link automatically by company name.
+        </div>
       </>
     );
   };
@@ -2606,6 +2863,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               {g.stillRamping && (
                 <div style={{ fontSize: 11, color: C.green, marginTop: 4 }}>
                   🌱 Warming up — {g.rampDaysLeft} day{g.rampDaysLeft === 1 ? "" : "s"} left until full pace ({g.fullQuota}/day).
+                </div>
+              )}
+              {g.carryIntoToday !== 0 && (
+                <div style={{ fontSize: 11, color: g.carryIntoToday > 0 ? C.red : C.green, marginTop: 4 }}>
+                  {g.carryIntoToday > 0
+                    ? `⬆ +${g.carryIntoToday} carried over from yesterday's shortfall`
+                    : `⬇ ${Math.abs(g.carryIntoToday)} banked from yesterday's overachievement — lighter today`}
                 </div>
               )}
 
@@ -3036,6 +3300,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
+          apps={apps}
         />
       )}
       {syncModal && <SyncModal currentKey={syncKeyRef.current} onClose={() => setSyncModal(false)} onSwitch={switchSyncKey} flash={flash} />}
@@ -3081,7 +3346,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave, totals }) {
+function Modal({ modal, onClose, onSave, totals, apps }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
     if (kind === "application")
@@ -3124,6 +3389,14 @@ function Modal({ modal, onClose, onSave, totals }) {
         rampEnabled: entry?.rampEnabled || false,
       };
     if (kind === "winSnapshot") return { company: "", role: "", date: today() };
+    if (kind === "account")
+      return {
+        company: entry?.company || "",
+        website: entry?.website || "",
+        industry: entry?.industry || "",
+        notes: entry?.notes || "",
+        contacts: entry?.contacts ? entry.contacts.map((c) => ({ ...c })) : [{ id: uid(), name: "", position: "", email: "", phone: "", notes: "" }],
+      };
     return { fund: entry?.fund ?? "", expenses: entry?.expenses ?? "" };
   });
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
@@ -3188,6 +3461,7 @@ function Modal({ modal, onClose, onSave, totals }) {
     checkinDay: "Settings — check-in & follow-ups",
     goal: entry ? "Edit goal" : "Set a goal",
     winSnapshot: "🏆 Snapshot this win",
+    account: entry ? "Edit account" : "Track an account",
     runway: "Update runway numbers",
   };
 
@@ -3197,6 +3471,11 @@ function Modal({ modal, onClose, onSave, totals }) {
         ...f,
         followUps: (f.followUps || []).map((x) => ({ days: Math.max(0, +x.days || 0), done: !!x.done })),
         custom: (f.custom || []).filter((c) => c.k || c.v),
+      });
+    } else if (kind === "account") {
+      onSave({
+        ...f,
+        contacts: (f.contacts || []).filter((c) => c.name || c.position || c.email || c.phone || c.notes),
       });
     } else {
       onSave(f);
@@ -3773,6 +4052,88 @@ function Modal({ modal, onClose, onSave, totals }) {
                 Screens {totals.screens} · Interviews {totals.interviews} · Offers {totals.offers}
               </div>
             </div>
+          </>
+        )}
+
+        {kind === "account" && (
+          <>
+            <Field label="Company name" value={f.company} onChange={set("company")} placeholder="e.g. Acme SaaS Inc." />
+            <Field label="Website" value={f.website} onChange={set("website")} placeholder="https://acme.com" />
+            <Field label="Industry" value={f.industry} onChange={set("industry")} placeholder="e.g. Fintech, SaaS" />
+
+            <Label>Contacts</Label>
+            {(f.contacts || []).map((c, i) => (
+              <div key={c.id || i} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+                <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+                  <input
+                    value={c.name}
+                    placeholder="Contact name"
+                    onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)) }))}
+                    style={{ ...inputStyle, flex: 1 }}
+                  />
+                  <button
+                    onClick={() => setF((p) => ({ ...p, contacts: p.contacts.filter((_, j) => j !== i) }))}
+                    style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0 }}
+                  >
+                    ×
+                  </button>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 6 }}>
+                  <input
+                    value={c.position}
+                    placeholder="Position / title"
+                    onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, position: e.target.value } : x)) }))}
+                    style={inputStyle}
+                  />
+                  <input
+                    value={c.phone}
+                    placeholder="Phone number"
+                    onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, phone: e.target.value } : x)) }))}
+                    style={inputStyle}
+                  />
+                </div>
+                <input
+                  value={c.email}
+                  placeholder="Email"
+                  onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, email: e.target.value } : x)) }))}
+                  style={{ ...inputStyle, marginBottom: 6 }}
+                />
+                <input
+                  value={c.notes}
+                  placeholder="Notes (optional)"
+                  onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, notes: e.target.value } : x)) }))}
+                  style={inputStyle}
+                />
+              </div>
+            ))}
+            <button
+              onClick={() => setF((p) => ({ ...p, contacts: [...(p.contacts || []), { id: uid(), name: "", position: "", email: "", phone: "", notes: "" }] }))}
+              style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 12 }}
+            >
+              + Add another contact
+            </button>
+
+            <Field label="Notes" value={f.notes} onChange={set("notes")} placeholder="relationship notes, how you connected…" />
+
+            {entry &&
+              (() => {
+                const related = relatedApplications(f.company, apps || []);
+                if (!related.length) return null;
+                return (
+                  <div style={{ marginTop: 4 }}>
+                    <Label>Related applications ({related.length})</Label>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {related.map((r) => (
+                        <div key={r.id} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "8px 10px", fontSize: 12 }}>
+                          <span style={{ fontWeight: 700 }}>{r.role || "Role not set"}</span>
+                          <span style={{ color: statusColor(r.status), marginLeft: 8, fontFamily: mono, fontSize: 11 }}>{statusLabel(r.status)}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>Linked automatically by matching company name.</div>
+                  </div>
+                );
+              })()}
           </>
         )}
 
