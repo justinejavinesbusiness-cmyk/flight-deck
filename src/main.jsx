@@ -363,7 +363,7 @@ function buildCycleSnapshot(s, g, cycleNumber) {
 /* multi-step follow-ups: a.followUps = [{days, done}] counted from `contacted` */
 const DEFAULT_FOLLOWUPS = [3, 7, 14];
 const normFollowUps = (a) => {
-  if (Array.isArray(a.followUps) && a.followUps.length) return a.followUps;
+  if (Array.isArray(a.followUps)) return a.followUps; /* respects both a populated AND a deliberately-cleared [] array */
   if (a.followUpDays != null) return [{ days: +a.followUpDays || 7, done: false }];
   return DEFAULT_FOLLOWUPS.map((d) => ({ days: d, done: false }));
 };
@@ -2450,11 +2450,26 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         />
                       </td>
                       <td
-                        style={{ ...td, fontFamily: mono, fontSize: 12, whiteSpace: "nowrap", color: due ? C.red : nf ? C.muted : C.green, cursor: "pointer" }}
-                        onClick={() => setModal({ kind: "application", entry: a })}
-                        title="Click to edit the follow-up schedule"
+                        style={{ ...td, fontFamily: mono, fontSize: 12, whiteSpace: "nowrap", color: due ? C.red : nf ? C.muted : C.green }}
                       >
-                        {nf ? `${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ cursor: "pointer" }} onClick={() => setModal({ kind: "application", entry: a })} title="Click to edit the follow-up schedule">
+                            {nf ? `${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}
+                          </span>
+                          {fus.length > 0 && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                updateAppField(a.id, "followUps", []);
+                                flash("Follow-ups cleared");
+                              }}
+                              title="No follow-up needed — clear all"
+                              style={{ background: "transparent", border: "none", color: C.muted, fontSize: 12, cursor: "pointer", padding: 0, lineHeight: 1, flexShrink: 0 }}
+                            >
+                              🚫
+                            </button>
+                          )}
+                        </div>
                       </td>
                       <td style={{ ...td, minWidth: 140 }}>{cellInput(a, "notes", { ph: "notes…" })}</td>
                       <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
@@ -2577,7 +2592,22 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         <span style={{ fontFamily: mono, fontSize: 12, color: C.muted }}>{a.contacted || "—"}</span>
                       </td>
                       <td style={{ ...td, fontFamily: mono, fontSize: 12, whiteSpace: "nowrap", color: due ? C.red : nf ? C.muted : C.green }}>
-                        {nf ? `${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span>{nf ? `${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}</span>
+                          {fus.length > 0 && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                updateAppField(a.id, "followUps", []);
+                                flash("Follow-ups cleared");
+                              }}
+                              title="No follow-up needed — clear all"
+                              style={{ background: "transparent", border: "none", color: C.muted, fontSize: 12, cursor: "pointer", padding: 0, lineHeight: 1, flexShrink: 0 }}
+                            >
+                              🚫
+                            </button>
+                          )}
+                        </div>
                       </td>
                       <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
                         <button
@@ -3624,7 +3654,20 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
             </div>
             <Field label="Date contacted / applied" type="date" value={f.contacted} onChange={set("contacted")} />
 
-            <Label>Follow-up schedule (days after contact)</Label>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <Label>Follow-up schedule (days after contact)</Label>
+              {(f.followUps || []).length > 0 && (
+                <button
+                  onClick={() => setF((p) => ({ ...p, followUps: [] }))}
+                  style={{ background: "transparent", border: "none", color: C.muted, fontSize: 11, textDecoration: "underline", cursor: "pointer", padding: 0, marginBottom: 4 }}
+                >
+                  🚫 No follow-up needed
+                </button>
+              )}
+            </div>
+            {(f.followUps || []).length === 0 && (
+              <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>No follow-ups scheduled for this one.</div>
+            )}
             {(f.followUps || []).map((fu, i) => {
               const d = f.contacted ? addDays(f.contacted, +fu.days || 0) : "";
               const due = d && !fu.done && d <= today();
