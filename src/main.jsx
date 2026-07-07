@@ -101,6 +101,25 @@ const OUTREACH_CHANNELS = ["Email", "Call", "Text", "Other"];
 /* "bad fit" reasons — multi-select, for companies that don't align on comp/values/etc */
 const BAD_FIT_REASONS = ["Salary too low", "Values mismatch", "Culture concerns", "Red flags in process", "Scope creep", "Other"];
 
+/* ---- account / contact relationship model ---- */
+const CONTACT_STATUSES = ["", "outreach", "replied", "discovery call", "ongoing", "closed"];
+const contactStatusLabel = (s) => (s ? s : "Not contacted yet");
+const contactStatusColor = (s) =>
+  s === "closed" ? C.muted : s === "ongoing" ? C.green : s === "discovery call" ? C.amber : s === "replied" || s === "outreach" ? C.blue : C.muted;
+const isContactBlankStatus = (c) => !c.status;
+const isContactOpen = (c) => c.status !== "closed";
+const isContactOutreached = (c) => !!c.status; /* any status set means real contact has happened */
+const isContactDue = (c) => {
+  if (isContactBlankStatus(c)) return false;
+  const n = nextFollowUp(c);
+  return !!(n && isContactOpen(c) && n.date <= today());
+};
+
+const ACCOUNT_STATUSES = ["", "closed", "bad fit"];
+const accountStatusLabel = (s) => (s === "closed" ? "closed" : s === "bad fit" ? "bad fit" : "active");
+const accountStatusColor = (s) => (s === "closed" ? C.muted : s === "bad fit" ? C.red : C.green);
+const isAccountOpen = (acc) => !acc.status;
+
 /* ---- content management model ---- */
 const CONTENT_STATUSES = ["idea", "draft", "design", "scheduled", "published"];
 const contentStatusLabel = (s) => (s ? s : "idea");
@@ -880,6 +899,7 @@ export default function FlightDeck() {
   const [pipeFilter, setPipeFilter] = useState("active");
   const [pipeSearch, setPipeSearch] = useState("");
   const [accSearch, setAccSearch] = useState("");
+  const [accFilter, setAccFilter] = useState("active");
   const [contentSearch, setContentSearch] = useState("");
   const [contentFilter, setContentFilter] = useState("all");
   const [pipeSourceFilter, setPipeSourceFilter] = useState("");
@@ -1105,6 +1125,11 @@ export default function FlightDeck() {
   /* ============ DERIVED ============ */
   const apps = state.applications;
   const dueList = useMemo(() => apps.filter(isDue), [apps]);
+  const dueContactsCount = useMemo(
+    () => (state.accounts || []).reduce((s, a) => s + (a.contacts || []).filter(isContactDue).length, 0),
+    [state.accounts]
+  );
+  const totalDueCount = dueList.length + dueContactsCount;
 
   const weekRows = useMemo(() => {
     const map = new Map();
@@ -1936,7 +1961,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 14 }}>
         {[
           ["ACTIVE", apps.filter(isOpenApp).length, C.ink],
-          ["DUE ⚑", dueList.length, dueList.length ? C.red : C.ink],
+          ["DUE ⚑", totalDueCount, totalDueCount ? C.red : C.ink],
           ["OFFERS", totals.offers, totals.offers > 0 ? C.green : C.ink],
           ["RUNWAY", months.toFixed(1) + "mo", zone.color],
         ].map(([k, v, col]) => (
@@ -2266,13 +2291,30 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .slice()
       .sort((a, b) => (b.contacted || "").localeCompare(a.contacted || ""));
 
+    const totalContacts = (state.accounts || []).reduce((s, a) => s + (a.contacts || []).length, 0);
+
     return (
       <>
+        {/* quick-glance counts — applications, contacts, due, accounts at a glance */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 14 }}>
+          {[
+            ["APPLICATIONS", apps.length, C.ink],
+            ["CONTACTS", totalContacts, C.ink],
+            ["DUE ⚑", totalDueCount, totalDueCount > 0 ? C.red : C.ink],
+            ["ACCOUNTS", (state.accounts || []).length, C.ink],
+          ].map(([k, v, col]) => (
+            <div key={k} style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
+              <div style={{ fontSize: 9, letterSpacing: "0.14em", color: C.muted }}>{k}</div>
+              <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 700, color: col }}>{v}</div>
+            </div>
+          ))}
+        </div>
+
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
           <div style={{ display: "flex", gap: 6 }}>
             {[
-              ["applications", "📋 Applications"],
-              ["accounts", "🏢 Accounts"],
+              ["applications", `📋 Applications (${apps.length})`],
+              ["accounts", `🏢 Accounts (${(state.accounts || []).length})`],
             ].map(([k, l]) => (
               <button
                 key={k}
@@ -2753,7 +2795,31 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   const renderAccounts = () => {
     const accounts = state.accounts || [];
+    const accFilters = [
+      { key: "active", label: `Active (${accounts.filter(isAccountOpen).length})` },
+      { key: "highConfidence", label: `⭐ High confidence (${accounts.filter((a) => a.highConfidence).length})` },
+      { key: "outreachedContacts", label: `Outreached contacts (${accounts.filter((a) => (a.contacts || []).some(isContactOutreached)).length})` },
+      { key: "dueContacts", label: `⚑ Due contacts (${accounts.filter((a) => (a.contacts || []).some(isContactDue)).length})` },
+      { key: "closed", label: `Closed (${accounts.filter((a) => a.status === "closed").length})` },
+      { key: "badFit", label: `🚫 Bad fit (${accounts.filter((a) => a.status === "bad fit").length})` },
+      { key: "all", label: `All (${accounts.length})` },
+    ];
     const shownAccounts = accounts
+      .filter((acc) =>
+        accFilter === "active"
+          ? isAccountOpen(acc)
+          : accFilter === "highConfidence"
+          ? !!acc.highConfidence
+          : accFilter === "outreachedContacts"
+          ? (acc.contacts || []).some(isContactOutreached)
+          : accFilter === "dueContacts"
+          ? (acc.contacts || []).some(isContactDue)
+          : accFilter === "closed"
+          ? acc.status === "closed"
+          : accFilter === "badFit"
+          ? acc.status === "bad fit"
+          : true
+      )
       .filter((acc) => {
         if (!accSearch.trim()) return true;
         const q = accSearch.trim().toLowerCase();
@@ -2782,21 +2848,35 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           )}
         </div>
 
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+          {accFilters.map((f) => (
+            <button
+              key={f.key}
+              onClick={() => setAccFilter(f.key)}
+              style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${accFilter === f.key ? C.amber : C.panelEdge}`, background: accFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: accFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+
         {shownAccounts.length === 0 && (
           <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
             {accounts.length === 0
               ? "No accounts tracked yet. Use + Track account to build a company-level relationship record — multiple contacts, one place."
-              : "Nothing matches this search."}
+              : "Nothing matches this search/filter."}
           </div>
         )}
 
         {rowsDesktop && (
           <div className="desktop-scroll-x" style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}>
-            <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1000 }}>
+            <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1150 }}>
               <thead>
                 <tr>
+                  <th style={{ ...th, width: 34 }}>⭐</th>
                   <th style={th}>Company / Website</th>
                   <th style={th}>Industry</th>
+                  <th style={th}>Status</th>
                   <th style={th}>Contacts</th>
                   <th style={th}>Related applications</th>
                   <th style={th}>Notes</th>
@@ -2808,9 +2888,20 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   const contacts = acc.contacts || [];
                   const primary = contacts[0];
                   const related = relatedApplications(acc.company, apps);
+                  const anyDue = contacts.some(isContactDue);
+                  const outreachedCount = contacts.filter(isContactOutreached).length;
                   return (
-                    <tr key={acc.id}>
-                      <td style={{ ...td, minWidth: 180 }}>
+                    <tr key={acc.id} style={{ background: anyDue ? "rgba(248,113,113,0.06)" : acc.highConfidence ? "rgba(245,185,66,0.05)" : "transparent" }}>
+                      <td style={{ ...td, textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => updateAccountField(acc.id, "highConfidence", !acc.highConfidence)}
+                          title={acc.highConfidence ? "High confidence — click to unmark" : "Mark as high confidence"}
+                          style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: 16, color: acc.highConfidence ? C.amber : C.panelEdge, padding: 0 }}
+                        >
+                          {acc.highConfidence ? "⭐" : "☆"}
+                        </button>
+                      </td>
+                      <td style={{ ...td, minWidth: 180, borderLeft: anyDue ? `3px solid ${C.red}` : "3px solid transparent" }}>
                         {cellInput(acc, "company", { ph: "Company", onCommit: updateAccountField })}
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           {cellInput(acc, "website", { ph: "website.com", onCommit: updateAccountField })}
@@ -2818,14 +2909,37 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         </div>
                       </td>
                       <td style={{ ...td, minWidth: 120 }}>{cellInput(acc, "industry", { ph: "Industry", onCommit: updateAccountField })}</td>
-                      <td style={{ ...td, minWidth: 160, cursor: "pointer" }} onClick={() => setModal({ kind: "account", entry: acc })}>
+                      <td style={{ ...td, minWidth: 110 }} onClick={(e) => e.stopPropagation()}>
+                        <select
+                          value={acc.status || ""}
+                          onChange={(e) => updateAccountField(acc.id, "status", e.target.value)}
+                          style={{ ...selMini, fontFamily: mono, background: C.bg, color: accountStatusColor(acc.status), border: `1px solid ${C.panelEdge}`, padding: "4px 6px", width: "100%" }}
+                        >
+                          {ACCOUNT_STATUSES.map((s) => (
+                            <option key={s || "blank"} value={s}>{accountStatusLabel(s)}</option>
+                          ))}
+                        </select>
+                        {acc.status === "bad fit" && (acc.badReasons || []).length > 0 && (
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 4 }}>
+                            {acc.badReasons.map((r) => (
+                              <span key={r} style={{ fontFamily: mono, fontSize: 8, color: C.red, background: "rgba(248,113,113,0.1)", borderRadius: 8, padding: "2px 6px", whiteSpace: "nowrap" }}>{r}</span>
+                            ))}
+                          </div>
+                        )}
+                      </td>
+                      <td style={{ ...td, minWidth: 170, cursor: "pointer" }} onClick={() => setModal({ kind: "account", entry: acc })}>
                         <div style={{ fontWeight: 700, fontSize: 13, color: contacts.length ? C.ink : C.muted }}>
                           {contacts.length} contact{contacts.length === 1 ? "" : "s"}
+                          {anyDue && <span style={{ color: C.red, marginLeft: 6 }}>⚑ due</span>}
                         </div>
                         {primary && (
                           <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
                             {primary.name || "Unnamed"}{primary.position ? ` · ${primary.position}` : ""}
+                            {primary.status && <span style={{ color: contactStatusColor(primary.status), marginLeft: 4 }}>· {primary.status}</span>}
                           </div>
+                        )}
+                        {outreachedCount > 0 && (
+                          <div style={{ fontFamily: mono, fontSize: 10, color: C.blue, marginTop: 2 }}>{outreachedCount} outreached</div>
                         )}
                       </td>
                       <td style={{ ...td, minWidth: 150 }}>
@@ -2868,6 +2982,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               const contacts = acc.contacts || [];
               const primary = contacts[0];
               const related = relatedApplications(acc.company, apps);
+              const anyDue = contacts.some(isContactDue);
+              const outreachedCount = contacts.filter(isContactOutreached).length;
               return (
                 <SwipeRow
                   key={acc.id}
@@ -2876,20 +2992,27 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   onDelete={() => askDeleteAccount(acc)}
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                    <div style={{ fontWeight: 700, fontSize: 14 }}>{acc.company || "Unnamed"}</div>
-                    <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, flexShrink: 0 }}>
-                      {contacts.length} contact{contacts.length === 1 ? "" : "s"}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      {acc.highConfidence && <span style={{ color: C.amber }}>⭐</span>}
+                      <div style={{ fontWeight: 700, fontSize: 14 }}>{acc.company || "Unnamed"}</div>
+                    </div>
+                    <div style={{ fontFamily: mono, fontSize: 11, color: anyDue ? C.red : C.muted, flexShrink: 0 }}>
+                      {contacts.length} contact{contacts.length === 1 ? "" : "s"}{anyDue ? " ⚑" : ""}
                     </div>
                   </div>
-                  {acc.industry && <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>{acc.industry}</div>}
+                  <div style={{ display: "flex", gap: 8, marginTop: 2, flexWrap: "wrap" }}>
+                    {acc.industry && <span style={{ fontSize: 12, color: C.muted }}>{acc.industry}</span>}
+                    {acc.status && <span style={{ fontFamily: mono, fontSize: 10, color: accountStatusColor(acc.status), textTransform: "uppercase" }}>{accountStatusLabel(acc.status)}</span>}
+                  </div>
                   {primary && (
                     <div style={{ fontSize: 12, color: C.ink, marginTop: 4 }}>
                       {primary.name || "Unnamed"}{primary.position ? ` · ${primary.position}` : ""}
                     </div>
                   )}
-                  {related.length > 0 && (
-                    <div style={{ fontSize: 11, color: C.blue, marginTop: 4 }}>{related.length} related application{related.length === 1 ? "" : "s"}</div>
-                  )}
+                  <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+                    {outreachedCount > 0 && <span style={{ fontSize: 11, color: C.blue }}>{outreachedCount} outreached</span>}
+                    {related.length > 0 && <span style={{ fontSize: 11, color: C.blue }}>{related.length} related app{related.length === 1 ? "" : "s"}</span>}
+                  </div>
                 </SwipeRow>
               );
             })}
@@ -3132,12 +3255,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         Fully automatic from the Pipeline — set an entry's status to "outreach" to count it there instead of Apps.
       </div>
 
-      {/* conversion: application/outreach -> closed deal */}
+      {/* conversion: application/outreach -> closed deal (now includes account-contact outreach/replies in the top-line number) */}
       {(() => {
-        const topOfFunnel = totals.apps + totals.outreach;
+        const allContacts = (state.accounts || []).flatMap((a) => a.contacts || []);
+        const contactsOutreached = allContacts.filter(isContactOutreached).length;
+        const contactsReplied = allContacts.filter((c) => ["replied", "discovery call", "ongoing"].includes(c.status)).length;
+        const topOfFunnel = totals.apps + totals.outreach + contactsOutreached;
         const pct = (num, den) => (den > 0 ? ((num / den) * 100).toFixed(1) : "0.0");
         const stages = [
-          ["Apps+Outreach → Replies", totals.replies, topOfFunnel],
+          ["Apps+Outreach → Replies", totals.replies, totals.apps + totals.outreach],
           ["Replies → Screens", totals.screens, totals.replies],
           ["Screens → Interviews", totals.interviews, totals.screens],
           ["Interviews → Offers", totals.offers, totals.interviews],
@@ -3151,7 +3277,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               </div>
             </div>
             <div style={{ fontSize: 11, color: C.muted, marginTop: 2, marginBottom: 10 }}>
-              {totals.offers} offer{totals.offers === 1 ? "" : "s"} from {topOfFunnel} total sent
+              {totals.offers} offer{totals.offers === 1 ? "" : "s"} from {topOfFunnel} total sent (apps, outreach, and account contacts combined)
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
               {stages.map(([label, num, den]) => (
@@ -3162,6 +3288,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   </span>
                 </div>
               ))}
+              {allContacts.length > 0 && (
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginTop: 4, paddingTop: 6, borderTop: `1px solid ${C.panelEdge}` }}>
+                  <span style={{ color: C.muted }}>Account contacts: outreach → reply</span>
+                  <span style={{ fontFamily: mono, color: contactsOutreached > 0 ? C.ink : C.muted }}>
+                    {contactsOutreached > 0 ? `${pct(contactsReplied, contactsOutreached)}%` : "—"}{" "}
+                    <span style={{ color: C.muted }}>({contactsReplied}/{contactsOutreached})</span>
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         );
@@ -3545,7 +3680,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             {[
               ["⌂", "Home", 0],
               ["🎯", "Goal", 1],
-              ["▦", "CRM", 2, dueList.length],
+              ["▦", "CRM", 2, totalDueCount],
               ["📝", "Content", 3],
               ["♡", "Mind", 4],
               ["⛽", "Fuel", 5],
@@ -3621,7 +3756,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           {[
             ["⌂", "Home", 0],
             ["🎯", "Goal", 1],
-            ["▦", "CRM", 2, dueList.length],
+            ["▦", "CRM", 2, totalDueCount],
             ["📝", "Content", 3],
             ["♡", "Mind", 4],
             ["⛽", "Fuel", 5],
@@ -3767,8 +3902,24 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
         company: entry?.company || "",
         website: entry?.website || "",
         industry: entry?.industry || "",
+        status: entry?.status || "",
+        highConfidence: entry?.highConfidence || false,
+        badReasons: entry?.badReasons ? [...entry.badReasons] : [],
         notes: entry?.notes || "",
-        contacts: entry?.contacts ? entry.contacts.map((c) => ({ ...c })) : [{ id: uid(), name: "", position: "", email: "", phone: "", notes: "" }],
+        contacts: entry?.contacts
+          ? entry.contacts.map((c) => ({
+              id: c.id || uid(),
+              name: c.name || "",
+              position: c.position || "",
+              email: c.email || "",
+              phone: c.phone || "",
+              notes: c.notes || "",
+              status: c.status || "",
+              outreachKind: c.outreachKind || "",
+              contacted: c.contacted || "",
+              followUps: Array.isArray(c.followUps) ? c.followUps.map((f) => ({ ...f })) : [],
+            }))
+          : [{ id: uid(), name: "", position: "", email: "", phone: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [] }],
       };
     if (kind === "content")
       return {
@@ -3859,7 +4010,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
     } else if (kind === "account") {
       onSave({
         ...f,
-        contacts: (f.contacts || []).filter((c) => c.name || c.position || c.email || c.phone || c.notes),
+        contacts: (f.contacts || []).filter((c) => c.name || c.position || c.email || c.phone || c.notes || c.status || c.outreachKind || c.contacted),
       });
     } else {
       onSave(f);
@@ -4454,57 +4605,219 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
 
         {kind === "account" && (
           <>
-            <Field label="Company name" value={f.company} onChange={set("company")} placeholder="e.g. Acme SaaS Inc." />
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: 12 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <Field label="Company name" value={f.company} onChange={set("company")} placeholder="e.g. Acme SaaS Inc." />
+              </div>
+              <button
+                onClick={() => set("highConfidence")(!f.highConfidence)}
+                title={f.highConfidence ? "High confidence — tap to unmark" : "Mark as high confidence"}
+                style={{
+                  flexShrink: 0,
+                  marginBottom: 12,
+                  width: 42,
+                  height: 42,
+                  borderRadius: 10,
+                  border: `1px solid ${f.highConfidence ? C.amber : C.panelEdge}`,
+                  background: f.highConfidence ? "rgba(245,185,66,0.14)" : "transparent",
+                  color: f.highConfidence ? C.amber : C.muted,
+                  fontSize: 18,
+                  cursor: "pointer",
+                }}
+              >
+                {f.highConfidence ? "⭐" : "☆"}
+              </button>
+            </div>
             <Field label="Website" value={f.website} onChange={set("website")} placeholder="https://acme.com" />
             <Field label="Industry" value={f.industry} onChange={set("industry")} placeholder="e.g. Fintech, SaaS" />
 
-            <Label>Contacts</Label>
-            {(f.contacts || []).map((c, i) => (
-              <div key={c.id || i} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10, marginBottom: 8 }}>
-                <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-                  <input
-                    value={c.name}
-                    placeholder="Contact name"
-                    onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)) }))}
-                    style={{ ...inputStyle, flex: 1 }}
-                  />
-                  <button
-                    onClick={() => setF((p) => ({ ...p, contacts: p.contacts.filter((_, j) => j !== i) }))}
-                    style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0 }}
-                  >
-                    ×
-                  </button>
+            <div style={{ marginBottom: 12 }}>
+              <Label>Account status</Label>
+              <select value={f.status} onChange={(e) => set("status")(e.target.value)} style={selectStyle}>
+                <option value="">active — still nurturing</option>
+                <option value="closed">closed — they rejected / dead end</option>
+                <option value="bad fit">bad fit</option>
+              </select>
+            </div>
+            {f.status === "bad fit" && (
+              <div style={{ marginBottom: 12 }}>
+                <Label>Why is this a bad fit? (select all that apply)</Label>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+                  {BAD_FIT_REASONS.map((r) => {
+                    const checked = f.badReasons.includes(r);
+                    return (
+                      <button
+                        key={r}
+                        onClick={() => setF((p) => ({ ...p, badReasons: checked ? p.badReasons.filter((x) => x !== r) : [...p.badReasons, r] }))}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          textAlign: "left",
+                          fontFamily: sans,
+                          fontSize: 13,
+                          fontWeight: checked ? 700 : 500,
+                          padding: "9px 12px",
+                          borderRadius: 10,
+                          cursor: "pointer",
+                          border: `1px solid ${checked ? C.red : C.panelEdge}`,
+                          background: checked ? "rgba(248,113,113,0.1)" : "transparent",
+                          color: checked ? C.red : C.muted,
+                        }}
+                      >
+                        <span style={{ fontSize: 14 }}>{checked ? "☑" : "☐"}</span>
+                        {r}
+                      </button>
+                    );
+                  })}
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 6 }}>
-                  <input
-                    value={c.position}
-                    placeholder="Position / title"
-                    onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, position: e.target.value } : x)) }))}
-                    style={inputStyle}
-                  />
-                  <input
-                    value={c.phone}
-                    placeholder="Phone number"
-                    onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, phone: e.target.value } : x)) }))}
-                    style={inputStyle}
-                  />
-                </div>
-                <input
-                  value={c.email}
-                  placeholder="Email"
-                  onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, email: e.target.value } : x)) }))}
-                  style={{ ...inputStyle, marginBottom: 6 }}
-                />
-                <input
-                  value={c.notes}
-                  placeholder="Notes (optional)"
-                  onChange={(e) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, notes: e.target.value } : x)) }))}
-                  style={inputStyle}
-                />
               </div>
-            ))}
+            )}
+
+            <Label>Contacts</Label>
+            {(f.contacts || []).map((c, i) => {
+              const setContact = (patch) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, ...patch } : x)) }));
+              const fus = c.followUps || [];
+              return (
+                <div key={c.id || i} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+                    <input
+                      value={c.name}
+                      placeholder="Contact name"
+                      onChange={(e) => setContact({ name: e.target.value })}
+                      style={{ ...inputStyle, flex: 1 }}
+                    />
+                    <button
+                      onClick={() => setF((p) => ({ ...p, contacts: p.contacts.filter((_, j) => j !== i) }))}
+                      style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0 }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 6 }}>
+                    <input
+                      value={c.position}
+                      placeholder="Position / title"
+                      onChange={(e) => setContact({ position: e.target.value })}
+                      style={inputStyle}
+                    />
+                    <input
+                      value={c.phone}
+                      placeholder="Phone number"
+                      onChange={(e) => setContact({ phone: e.target.value })}
+                      style={inputStyle}
+                    />
+                  </div>
+                  <input
+                    value={c.email}
+                    placeholder="Email"
+                    onChange={(e) => setContact({ email: e.target.value })}
+                    style={{ ...inputStyle, marginBottom: 6 }}
+                  />
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 6 }}>
+                    <select
+                      value={c.status}
+                      onChange={(e) => setContact({ status: e.target.value })}
+                      style={{ ...selectStyle, fontSize: 13, padding: "8px 10px", color: c.status ? contactStatusColor(c.status) : C.muted }}
+                    >
+                      {CONTACT_STATUSES.map((s) => (
+                        <option key={s || "blank"} value={s}>{contactStatusLabel(s)}</option>
+                      ))}
+                    </select>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {OUTREACH_KINDS.map((k) => (
+                        <button
+                          key={k}
+                          onClick={() => setContact({ outreachKind: c.outreachKind === k ? "" : k })}
+                          style={{
+                            flex: 1,
+                            fontFamily: sans,
+                            fontSize: 12,
+                            fontWeight: 700,
+                            padding: "8px 6px",
+                            borderRadius: 8,
+                            cursor: "pointer",
+                            border: `1px solid ${c.outreachKind === k ? outreachKindColor(k) : C.panelEdge}`,
+                            background: c.outreachKind === k ? "rgba(245,185,66,0.1)" : "transparent",
+                            color: c.outreachKind === k ? outreachKindColor(k) : C.muted,
+                            textTransform: "capitalize",
+                          }}
+                        >
+                          {k}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <span style={{ fontSize: 11, color: C.muted, flexShrink: 0 }}>Contacted:</span>
+                    <input
+                      type="date"
+                      value={c.contacted}
+                      onChange={(e) => {
+                        const newDate = e.target.value;
+                        const needsDefaults = newDate && fus.length === 0;
+                        setContact({
+                          contacted: newDate,
+                          followUps: needsDefaults ? DEFAULT_FOLLOWUPS.map((d) => ({ days: d, done: false })) : fus,
+                        });
+                      }}
+                      style={{ ...inputStyle, width: "auto", maxWidth: 160, colorScheme: "dark", padding: "6px 8px", fontSize: 12 }}
+                    />
+                  </div>
+
+                  {fus.length > 0 && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+                      <span style={{ fontSize: 10, color: C.muted }}>Follow-ups:</span>
+                      {fus.map((fu, fi) => {
+                        const due = c.contacted ? addDays(c.contacted, fu.days) : "";
+                        return (
+                          <button
+                            key={fi}
+                            onClick={() => setContact({ followUps: fus.map((x, xi) => (xi === fi ? { ...x, done: !x.done } : x)) })}
+                            title={due ? `Due ${due}` : ""}
+                            style={{
+                              fontFamily: mono,
+                              fontSize: 10,
+                              padding: "3px 8px",
+                              borderRadius: 10,
+                              border: `1px solid ${fu.done ? C.green : C.panelEdge}`,
+                              background: fu.done ? "rgba(74,222,128,0.1)" : "transparent",
+                              color: fu.done ? C.green : C.muted,
+                              cursor: "pointer",
+                            }}
+                          >
+                            {fu.done ? "✓" : "○"} {fu.days}d
+                          </button>
+                        );
+                      })}
+                      <button
+                        onClick={() => setContact({ followUps: [] })}
+                        title="No follow-up needed — clear all"
+                        style={{ background: "transparent", border: "none", color: C.muted, fontSize: 11, cursor: "pointer", padding: 0 }}
+                      >
+                        🚫
+                      </button>
+                    </div>
+                  )}
+
+                  <input
+                    value={c.notes}
+                    placeholder="Notes (optional)"
+                    onChange={(e) => setContact({ notes: e.target.value })}
+                    style={{ ...inputStyle, marginTop: 6 }}
+                  />
+                </div>
+              );
+            })}
             <button
-              onClick={() => setF((p) => ({ ...p, contacts: [...(p.contacts || []), { id: uid(), name: "", position: "", email: "", phone: "", notes: "" }] }))}
+              onClick={() =>
+                setF((p) => ({
+                  ...p,
+                  contacts: [...(p.contacts || []), { id: uid(), name: "", position: "", email: "", phone: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [] }],
+                }))
+              }
               style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 12 }}
             >
               + Add another contact
