@@ -2377,6 +2377,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
         {shown.length > 0 && isDesktop && (
           <div
+            className="desktop-scroll-x"
             style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}
           >
             <datalist id="jobboard-suggestions">
@@ -2790,7 +2791,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         )}
 
         {rowsDesktop && (
-          <div style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}>
+          <div className="desktop-scroll-x" style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}>
             <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1000 }}>
               <thead>
                 <tr>
@@ -2987,7 +2988,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         )}
 
         {shown.length > 0 && isDesktop && (
-          <div style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}>
+          <div className="desktop-scroll-x" style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}>
             <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1100 }}>
               <thead>
                 <tr>
@@ -3502,6 +3503,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         input[type="date"]::-webkit-datetime-edit { padding: 0; }
         html, body { margin: 0; padding: 0; background: ${C.bg}; overflow-x: hidden; }
         button { -webkit-tap-highlight-color: transparent; }
+        /* desktop spreadsheets (CRM applications/accounts, Content) show a real
+           horizontal scrollbar — wide tables need a visible, draggable handle,
+           unlike the rest of the app which stays scrollbar-free */
+        .desktop-scroll-x { scrollbar-width: thin; scrollbar-color: ${C.panelEdge} transparent; -ms-overflow-style: auto; }
+        .desktop-scroll-x::-webkit-scrollbar { display: block; height: 10px; }
+        .desktop-scroll-x::-webkit-scrollbar-track { background: transparent; }
+        .desktop-scroll-x::-webkit-scrollbar-thumb { background: ${C.panelEdge}; border-radius: 6px; }
+        .desktop-scroll-x::-webkit-scrollbar-thumb:hover { background: ${C.muted}; }
         @media (hover: hover) {
           button:hover { filter: brightness(1.12); }
           tbody tr:hover { background: rgba(125,176,247,0.05) !important; }
