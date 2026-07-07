@@ -751,7 +751,11 @@ function Field({ label, value, onChange, type = "text", placeholder }) {
         value={value}
         placeholder={placeholder || ""}
         onChange={(e) => onChange(e.target.value)}
-        style={{ ...inputStyle, fontFamily: type === "number" ? mono : sans }}
+        style={{
+          ...inputStyle,
+          fontFamily: type === "number" ? mono : sans,
+          ...(type === "date" ? { width: "auto", maxWidth: 190, colorScheme: "dark", padding: "9px 10px" } : {}),
+        }}
       />
     </div>
   );
@@ -3414,6 +3418,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         ::-webkit-scrollbar { display: none; }
         * { scrollbar-width: none; -ms-overflow-style: none; }
         input, textarea, select { font-size: 16px !important; max-width: 100%; box-sizing: border-box; }
+        input[type="date"] { width: auto; }
+        input[type="date"]::-webkit-calendar-picker-indicator { padding: 3px; margin-left: 4px; }
+        input[type="date"]::-webkit-datetime-edit { padding: 0; }
         html, body { margin: 0; padding: 0; background: ${C.bg}; overflow-x: hidden; }
         button { -webkit-tap-highlight-color: transparent; }
         @media (hover: hover) {
