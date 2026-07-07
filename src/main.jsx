@@ -36,11 +36,12 @@ const C = {
   blue: "#7DB0F7",
 };
 
-const MODES = ["DASHBOARD", "GOAL", "PIPELINE", "EMOTIONS", "RUNWAY", "HISTORY"];
+const MODES = ["DASHBOARD", "GOAL", "PIPELINE", "CONTENT", "EMOTIONS", "RUNWAY", "HISTORY"];
 const TITLES = {
   DASHBOARD: "Dashboard",
   GOAL: "Goal Planner",
   PIPELINE: "Pipeline (CRM)",
+  CONTENT: "Content",
   EMOTIONS: "Mind",
   RUNWAY: "Runway Gauge",
   HISTORY: "Accomplishments",
@@ -99,6 +100,14 @@ const OUTREACH_KINDS = ["warm", "cold"];
 const OUTREACH_CHANNELS = ["Email", "Call", "Text", "Other"];
 /* "bad fit" reasons — multi-select, for companies that don't align on comp/values/etc */
 const BAD_FIT_REASONS = ["Salary too low", "Values mismatch", "Culture concerns", "Red flags in process", "Scope creep", "Other"];
+
+/* ---- content management model ---- */
+const CONTENT_STATUSES = ["idea", "draft", "design", "scheduled", "published"];
+const contentStatusLabel = (s) => (s ? s : "idea");
+const contentStatusColor = (s) =>
+  s === "published" ? C.green : s === "scheduled" ? C.amber : s === "design" ? C.blue : s === "draft" ? C.ink : C.muted;
+const CONTENT_TYPES = ["Blog", "Carousel", "Static post", "TikTok video", "Long-form video", "Short-form video", "Newsletter", "Other"];
+const CONTENT_PLATFORMS = ["LinkedIn", "Instagram", "TikTok", "X / Twitter", "YouTube", "Facebook", "Blog/Website", "Other"];
 const STAGE_IDX = { "": -2, outreach: -1, applied: 0, "followed up": 1, replied: 2, screening: 3, interview: 4, "final round": 5, offer: 6, "bad fit": -3, rejected: -3 };
 const statusLabel = (s) => (s ? s : "Not applied yet");
 const isOutreach = (a) => a.status === "outreach";
@@ -411,6 +420,8 @@ function rolloverCoach(c, todayStr) {
 const DEFAULT_STATE = {
   applications: [],
   accounts: [],
+  content: [],
+  contentGoal: { perWeek: 3 },
   funnel: [],
   emotions: [],
   decisions: [],
@@ -432,6 +443,8 @@ function migrate(saved) {
   const s = { ...DEFAULT_STATE, ...saved };
   if (!Array.isArray(s.applications)) s.applications = [];
   if (!Array.isArray(s.accounts)) s.accounts = [];
+  if (!Array.isArray(s.content)) s.content = [];
+  if (!s.contentGoal || typeof s.contentGoal !== "object") s.contentGoal = { perWeek: 3 };
   if (!Array.isArray(s.accomplishments)) s.accomplishments = [];
   if (!Array.isArray(s.supportSessions)) s.supportSessions = [];
   if (!s.settings || typeof s.settings !== "object") s.settings = { checkinDay: 1 };
@@ -472,6 +485,8 @@ function mergeStates(localS, remoteS) {
     ...remoteS,
     applications: unionById(localS.applications, remoteS.applications),
     accounts: unionById(localS.accounts, remoteS.accounts),
+    content: unionById(localS.content, remoteS.content),
+    contentGoal: remoteS.contentGoal || localS.contentGoal || { perWeek: 3 },
     funnel: unionById(localS.funnel, remoteS.funnel),
     emotions: unionById(localS.emotions, remoteS.emotions),
     decisions: unionById(localS.decisions, remoteS.decisions),
@@ -842,6 +857,8 @@ export default function FlightDeck() {
   const [pipeFilter, setPipeFilter] = useState("active");
   const [pipeSearch, setPipeSearch] = useState("");
   const [accSearch, setAccSearch] = useState("");
+  const [contentSearch, setContentSearch] = useState("");
+  const [contentFilter, setContentFilter] = useState("all");
   const [pipeSourceFilter, setPipeSourceFilter] = useState("");
   const [pipeStatusFilter, setPipeStatusFilter] = useState("");
   const [donutMode, setDonutMode] = useState("status");
@@ -1560,6 +1577,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     mutate((s) => ({ ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
   const updateAccountField = (id, field, value) =>
     mutate((s) => ({ ...s, accounts: s.accounts.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
+  const updateContentField = (id, field, value) =>
+    mutate((s) => ({ ...s, content: s.content.map((c) => (c.id === id ? { ...c, [field]: value } : c)) }));
+  const setContentGoalPerWeek = (n) =>
+    mutate((s) => ({ ...s, contentGoal: { ...s.contentGoal, perWeek: Math.max(0, Math.round(+n || 0)) } }));
 
   const saveModal = (data) => {
     const { kind, entry } = modal;
@@ -1599,6 +1620,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         entry ? "Account updated" : "Account tracked"
       );
       if (!entry) setCrmView("accounts"); /* land on the Accounts table after creating one */
+    } else if (kind === "content") {
+      mutate(
+        (s) => ({
+          ...s,
+          content: entry
+            ? s.content.map((c) => (c.id === entry.id ? { ...c, ...data } : c))
+            : [{ id: uid(), ...data }, ...s.content],
+        }),
+        entry ? "Content updated" : "Content added"
+      );
     } else if (kind === "decision") {
       mutate(
         (s) => ({
@@ -2788,6 +2819,214 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     );
   };
 
+  const renderContent = () => {
+    const items = state.content || [];
+    const perWeek = state.contentGoal?.perWeek || 0;
+    const thisWeekStart = iso(mondayOf(new Date()));
+    const thisWeekLabel = weekLabel(mondayOf(new Date()));
+    const doneThisWeek = items.filter((c) => c.date && weekStartOfDate(c.date) === thisWeekStart).length;
+    const weekMet = perWeek > 0 && doneThisWeek >= perWeek;
+
+    const shown = items
+      .filter((c) => contentFilter === "all" || (c.status || "idea") === contentFilter)
+      .filter((c) => {
+        if (!contentSearch.trim()) return true;
+        const q = contentSearch.trim().toLowerCase();
+        return [c.title, c.type, c.link, c.notes, ...(c.platforms || [])].filter(Boolean).some((f) => f.toLowerCase().includes(q));
+      })
+      .slice()
+      .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+    return (
+      <>
+        {/* weekly content goal */}
+        <div style={{ background: C.panel, border: `1px solid ${weekMet ? C.green : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <Label>📝 Content goal — {thisWeekLabel}</Label>
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 6 }}>
+            <div style={{ fontFamily: mono, fontSize: 36, fontWeight: 800, color: weekMet ? C.green : C.amber, lineHeight: 1.1 }}>
+              {doneThisWeek} / {perWeek}
+            </div>
+            <div style={{ fontSize: 13, color: C.muted, display: "flex", alignItems: "center", gap: 6 }}>
+              content this week
+              <input
+                type="number"
+                defaultValue={perWeek}
+                onBlur={(e) => e.target.value !== String(perWeek) && setContentGoalPerWeek(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                title="Edit weekly target"
+                style={{ width: 44, fontSize: 13, fontFamily: mono, background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 6, padding: "3px 6px", color: C.ink, outline: "none" }}
+              />
+              /wk
+            </div>
+          </div>
+          {perWeek > 0 && (
+            <div style={{ height: 8, background: C.bg, borderRadius: 4, marginTop: 10, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
+              <div style={{ height: "100%", width: `${Math.min(100, (doneThisWeek / perWeek) * 100)}%`, background: weekMet ? C.green : C.amber, borderRadius: 4, transition: "width 0.3s ease" }} />
+            </div>
+          )}
+        </div>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <input
+            value={contentSearch}
+            onChange={(e) => setContentSearch(e.target.value)}
+            placeholder="🔎 Search title, type, platform…"
+            style={{ ...inputStyle, flex: 1 }}
+          />
+          {contentSearch && (
+            <Btn ghost onClick={() => setContentSearch("")} style={{ padding: "10px 14px" }}>
+              Clear
+            </Btn>
+          )}
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {["all", ...CONTENT_STATUSES].map((s) => (
+              <button
+                key={s}
+                onClick={() => setContentFilter(s)}
+                style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${contentFilter === s ? C.amber : C.panelEdge}`, background: contentFilter === s ? "rgba(245,185,66,0.12)" : "transparent", color: contentFilter === s ? C.amber : C.muted, cursor: "pointer", textTransform: "capitalize" }}
+              >
+                {s === "all" ? `All (${items.length})` : `${s} (${items.filter((c) => (c.status || "idea") === s).length})`}
+              </button>
+            ))}
+          </div>
+          <Btn onClick={() => setModal({ kind: "content", entry: null })}>+ Add content</Btn>
+        </div>
+
+        {shown.length === 0 && (
+          <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
+            {items.length === 0 ? "No content tracked yet. Add your first piece — blog, video, carousel, whatever you're making." : "Nothing matches this search/filter."}
+          </div>
+        )}
+
+        {shown.length > 0 && isDesktop && (
+          <div style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12 }}>
+            <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1100 }}>
+              <thead>
+                <tr>
+                  <th style={th}>Title</th>
+                  <th style={th}>Status</th>
+                  <th style={th}>Type</th>
+                  <th style={th}>Platforms</th>
+                  <th style={th}>Link</th>
+                  <th style={th}>Date</th>
+                  <th style={th}>Notes</th>
+                  <th style={{ ...th, width: 50 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((c) => (
+                  <tr key={c.id}>
+                    <td style={{ ...td, minWidth: 170 }}>{cellInput(c, "title", { ph: "Title", onCommit: updateContentField })}</td>
+                    <td style={{ ...td, minWidth: 110 }} onClick={(e) => e.stopPropagation()}>
+                      <select
+                        value={c.status || "idea"}
+                        onChange={(e) => updateContentField(c.id, "status", e.target.value)}
+                        style={{ ...selMini, fontFamily: mono, background: C.bg, color: contentStatusColor(c.status), border: `1px solid ${C.panelEdge}`, padding: "4px 6px", width: "100%" }}
+                      >
+                        {CONTENT_STATUSES.map((s) => (
+                          <option key={s} value={s}>{s}</option>
+                        ))}
+                      </select>
+                    </td>
+                    <td style={{ ...td, minWidth: 130 }} onClick={(e) => e.stopPropagation()}>
+                      <select
+                        value={c.type || ""}
+                        onChange={(e) => updateContentField(c.id, "type", e.target.value)}
+                        style={{ ...selMini, color: c.type ? C.ink : C.muted, width: "100%" }}
+                      >
+                        <option value="">—</option>
+                        {CONTENT_TYPES.map((ty) => (
+                          <option key={ty} value={ty} style={{ background: C.panel }}>{ty}</option>
+                        ))}
+                      </select>
+                    </td>
+                    <td style={{ ...td, minWidth: 160 }} onClick={(e) => e.stopPropagation()}>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+                        {CONTENT_PLATFORMS.map((p) => {
+                          const active = (c.platforms || []).includes(p);
+                          return (
+                            <button
+                              key={p}
+                              onClick={() => {
+                                const next = active ? (c.platforms || []).filter((x) => x !== p) : [...(c.platforms || []), p];
+                                updateContentField(c.id, "platforms", next);
+                              }}
+                              style={{ fontSize: 9, fontFamily: mono, padding: "2px 6px", borderRadius: 8, border: `1px solid ${active ? C.blue : C.panelEdge}`, background: active ? "rgba(125,176,247,0.14)" : "transparent", color: active ? C.blue : C.muted, cursor: "pointer" }}
+                            >
+                              {p}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </td>
+                    <td style={{ ...td, minWidth: 120 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                        {cellInput(c, "link", { ph: "https://…", onCommit: updateContentField })}
+                        {c.link && openLink(c.link, { title: "Open published content" })}
+                      </div>
+                    </td>
+                    <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
+                      <input
+                        key={c.id + "date" + (c.date || "")}
+                        type="date"
+                        defaultValue={c.date || ""}
+                        onChange={(e) => updateContentField(c.id, "date", e.target.value)}
+                        style={{ fontSize: 13, fontFamily: mono, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.muted, padding: "4px 2px", outline: "none", colorScheme: "dark" }}
+                      />
+                    </td>
+                    <td style={{ ...td, minWidth: 140 }}>{cellInput(c, "notes", { ph: "notes…", onCommit: updateContentField })}</td>
+                    <td style={td} onClick={(e) => e.stopPropagation()}>
+                      <button
+                        onClick={() => mutate((s) => ({ ...s, content: s.content.filter((x) => x.id !== c.id) }), "Content deleted")}
+                        title="Delete"
+                        style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
+                      >
+                        ×
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {shown.length > 0 && !isDesktop && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {shown.map((c) => (
+              <SwipeRow
+                key={c.id}
+                showX={false}
+                onTap={() => setModal({ kind: "content", entry: c })}
+                onDelete={() => mutate((s) => ({ ...s, content: s.content.filter((x) => x.id !== c.id) }), "Content deleted")}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{c.title || "Untitled"}</div>
+                  <span style={{ fontFamily: mono, fontSize: 10, color: contentStatusColor(c.status), textTransform: "uppercase", flexShrink: 0 }}>
+                    {contentStatusLabel(c.status)}
+                  </span>
+                </div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
+                  {[c.type, (c.platforms || []).join(", ")].filter(Boolean).join(" · ") || "—"}
+                </div>
+                {c.date && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>{c.date}</div>}
+              </SwipeRow>
+            ))}
+          </div>
+        )}
+
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
+          {isDesktop ? "Click any cell to edit · click platform tags to toggle them." : "Tap a card to edit."}
+        </div>
+      </>
+    );
+  };
+
   const renderFunnelSection = () => (
     <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 14 }}>
@@ -3144,7 +3383,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     </>
   );
 
-  const SECTIONS = { DASHBOARD: renderDashboard, GOAL: renderGoal, PIPELINE: renderPipeline, EMOTIONS: renderEmotions, RUNWAY: renderRunway, HISTORY: renderHistory };
+  const SECTIONS = { DASHBOARD: renderDashboard, GOAL: renderGoal, PIPELINE: renderPipeline, CONTENT: renderContent, EMOTIONS: renderEmotions, RUNWAY: renderRunway, HISTORY: renderHistory };
 
   if (!loaded)
     return (
@@ -3183,7 +3422,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         }
       `}</style>
 
-      <div style={{ width: "100%", maxWidth: isDesktop ? (MODES[mode] === "PIPELINE" ? 1800 : 900) : 560, margin: "0 auto", flex: 1, display: "flex", flexDirection: "column", transition: "max-width 0.2s ease" }}>
+      <div style={{ width: "100%", maxWidth: isDesktop ? (["PIPELINE", "CONTENT"].includes(MODES[mode]) ? 1800 : 900) : 560, margin: "0 auto", flex: 1, display: "flex", flexDirection: "column", transition: "max-width 0.2s ease" }}>
         {/* header */}
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
           <div>
@@ -3212,9 +3451,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               ["⌂", "Home", 0],
               ["🎯", "Goal", 1],
               ["▦", "CRM", 2, dueList.length],
-              ["♡", "Mind", 3],
-              ["⛽", "Fuel", 4],
-              ["★", "Wins", 5],
+              ["📝", "Content", 3],
+              ["♡", "Mind", 4],
+              ["⛽", "Fuel", 5],
+              ["★", "Wins", 6],
             ].map(([icon, label, i, badge]) => (
               <button
                 key={label}
@@ -3287,9 +3527,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             ["⌂", "Home", 0],
             ["🎯", "Goal", 1],
             ["▦", "CRM", 2, dueList.length],
-            ["♡", "Mind", 3],
-            ["⛽", "Fuel", 4],
-            ["★", "Wins", 5],
+            ["📝", "Content", 3],
+            ["♡", "Mind", 4],
+            ["⛽", "Fuel", 5],
+            ["★", "Wins", 6],
           ].map(([icon, label, i, badge]) => (
             <button
               key={label}
@@ -3427,6 +3668,16 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
         notes: entry?.notes || "",
         contacts: entry?.contacts ? entry.contacts.map((c) => ({ ...c })) : [{ id: uid(), name: "", position: "", email: "", phone: "", notes: "" }],
       };
+    if (kind === "content")
+      return {
+        title: entry?.title || "",
+        status: entry?.status || "idea",
+        type: entry?.type || "",
+        platforms: entry?.platforms ? [...entry.platforms] : [],
+        link: entry?.link || "",
+        date: entry?.date || today(),
+        notes: entry?.notes || "",
+      };
     return { fund: entry?.fund ?? "", expenses: entry?.expenses ?? "" };
   });
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
@@ -3492,6 +3743,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
     goal: entry ? "Edit goal" : "Set a goal",
     winSnapshot: "🏆 Snapshot this win",
     account: entry ? "Edit account" : "Track an account",
+    content: entry ? "Edit content" : "Add content",
     runway: "Update runway numbers",
   };
 
@@ -4177,6 +4429,63 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
                   </div>
                 );
               })()}
+          </>
+        )}
+
+        {kind === "content" && (
+          <>
+            <Field label="Title" value={f.title} onChange={set("title")} placeholder="e.g. 5 portfolio mistakes to avoid" />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <div style={{ marginBottom: 12 }}>
+                <Label>Status</Label>
+                <select value={f.status} onChange={(e) => set("status")(e.target.value)} style={selectStyle}>
+                  {CONTENT_STATUSES.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              </div>
+              <div style={{ marginBottom: 12 }}>
+                <Label>Type / format</Label>
+                <select value={f.type} onChange={(e) => set("type")(e.target.value)} style={selectStyle}>
+                  <option value="">— select —</option>
+                  {CONTENT_TYPES.map((ty) => (
+                    <option key={ty} value={ty}>{ty}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <Field label="Link to the content (if published)" value={f.link} onChange={set("link")} placeholder="https://…" />
+            <Field label="Date" type="date" value={f.date} onChange={set("date")} />
+
+            <div style={{ marginBottom: 12 }}>
+              <Label>Platforms (select all that apply)</Label>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 4 }}>
+                {CONTENT_PLATFORMS.map((p) => {
+                  const active = f.platforms.includes(p);
+                  return (
+                    <button
+                      key={p}
+                      onClick={() => set("platforms")(active ? f.platforms.filter((x) => x !== p) : [...f.platforms, p])}
+                      style={{
+                        fontFamily: sans,
+                        fontSize: 12,
+                        fontWeight: 700,
+                        padding: "7px 12px",
+                        borderRadius: 20,
+                        border: `1px solid ${active ? C.blue : C.panelEdge}`,
+                        background: active ? "rgba(125,176,247,0.14)" : "transparent",
+                        color: active ? C.blue : C.muted,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {p}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <Field label="Notes" value={f.notes} onChange={set("notes")} placeholder="ideas, script notes, next step…" />
           </>
         )}
 
