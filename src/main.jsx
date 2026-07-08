@@ -2538,6 +2538,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         if (e.key === "Enter") e.currentTarget.blur();
       }}
       onBlur={(e) => {
+        e.target.style.border = "1px solid transparent";
         const v = e.target.value;
         if (v !== (a[field] ?? "")) (opts.onCommit || updateAppField)(a.id, field, v);
       }}
@@ -2917,6 +2918,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                                 defaultValue={a.jobBoardName || ""}
                                 placeholder="Which board?"
                                 onBlur={(e) => {
+                                  e.target.style.border = "1px solid transparent";
                                   if (e.target.value !== (a.jobBoardName || "")) updateAppField(a.id, "jobBoardName", e.target.value);
                                 }}
                                 onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
@@ -3253,7 +3255,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .filter((acc) => {
         if (!accSearch.trim()) return true;
         const q = accSearch.trim().toLowerCase();
-        const contactMatch = (acc.contacts || []).some((c) => [c.name, c.email, c.position].filter(Boolean).some((f) => f.toLowerCase().includes(q)));
+        const contactMatch = (acc.contacts || []).some((c) => [c.name, c.email, c.position, c.linkedin].filter(Boolean).some((f) => f.toLowerCase().includes(q)));
         return [acc.company, acc.website, acc.industry, acc.notes].filter(Boolean).some((f) => f.toLowerCase().includes(q)) || contactMatch;
       })
       .slice()
@@ -3271,7 +3273,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           .filter((c) => {
             if (!accSearch.trim()) return true;
             const q = accSearch.trim().toLowerCase();
-            return [c.name, c.email, c.position, c._company].filter(Boolean).some((f) => f.toLowerCase().includes(q));
+            return [c.name, c.email, c.position, c._company, c.linkedin].filter(Boolean).some((f) => f.toLowerCase().includes(q));
           })
           .sort((a, b) => a._company.localeCompare(b._company))
       : [];
@@ -3398,6 +3400,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {nf ? `Next: ${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : `all done (${fus.length})`}
                         </span>
                       )}
+                      {c.linkedin && (
+                        <a
+                          href={c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          title="Open LinkedIn profile"
+                          onClick={(e) => e.stopPropagation()}
+                          style={{ color: C.blue, fontSize: 11, textDecoration: "none" }}
+                        >
+                          🔗 LinkedIn
+                        </a>
+                      )}
                     </div>
                   </div>
                 );
@@ -3483,9 +3497,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {anyDue && <span style={{ color: C.red, marginLeft: 6 }}>⚑ due</span>}
                         </div>
                         {primary && (
-                          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
-                            {primary.name || "Unnamed"}{primary.position ? ` · ${primary.position}` : ""}
-                            {primary.status && <span style={{ color: contactStatusColor(primary.status), marginLeft: 4 }}>· {primary.status}</span>}
+                          <div style={{ fontSize: 11, color: C.muted, marginTop: 2, display: "flex", alignItems: "center", gap: 4 }}>
+                            <span>
+                              {primary.name || "Unnamed"}{primary.position ? ` · ${primary.position}` : ""}
+                              {primary.status && <span style={{ color: contactStatusColor(primary.status), marginLeft: 4 }}>· {primary.status}</span>}
+                            </span>
+                            {primary.linkedin && (
+                              <a
+                                href={primary.linkedin.startsWith("http") ? primary.linkedin : `https://${primary.linkedin}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                title="Open LinkedIn profile"
+                                onClick={(e) => e.stopPropagation()}
+                                style={{ color: C.blue, textDecoration: "none", flexShrink: 0 }}
+                              >
+                                🔗
+                              </a>
+                            )}
                           </div>
                         )}
                         {outreachedCount > 0 && (
@@ -4496,6 +4524,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
               position: c.position || "",
               email: c.email || "",
               phone: c.phone || "",
+              linkedin: c.linkedin || "",
               notes: c.notes || "",
               status: c.status || "",
               outreachKind: c.outreachKind || "",
@@ -4503,7 +4532,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
               followUps: Array.isArray(c.followUps) ? c.followUps.map((f) => ({ ...f })) : [],
               linkedApplicationId: c.linkedApplicationId || null,
             }))
-          : [{ id: uid(), name: "", position: "", email: "", phone: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], linkedApplicationId: null }],
+          : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], linkedApplicationId: null }],
       };
     if (kind === "content")
       return {
@@ -5300,12 +5329,33 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
                       style={inputStyle}
                     />
                   </div>
-                  <input
-                    value={c.email}
-                    placeholder="Email"
-                    onChange={(e) => setContact({ email: e.target.value })}
-                    style={{ ...inputStyle, marginBottom: 6 }}
-                  />
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                    <input
+                      value={c.email}
+                      placeholder="Email"
+                      onChange={(e) => setContact({ email: e.target.value })}
+                      style={{ ...inputStyle, flex: 1 }}
+                    />
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                    <input
+                      value={c.linkedin}
+                      placeholder="LinkedIn profile URL"
+                      onChange={(e) => setContact({ linkedin: e.target.value })}
+                      style={{ ...inputStyle, flex: 1 }}
+                    />
+                    {c.linkedin && (
+                      <a
+                        href={c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        title="Open LinkedIn profile"
+                        style={{ color: C.blue, fontSize: 15, flexShrink: 0, textDecoration: "none" }}
+                      >
+                        🔗
+                      </a>
+                    )}
+                  </div>
 
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 6 }}>
                     <select
@@ -5407,7 +5457,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
               onClick={() =>
                 setF((p) => ({
                   ...p,
-                  contacts: [...(p.contacts || []), { id: uid(), name: "", position: "", email: "", phone: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], linkedApplicationId: null }],
+                  contacts: [...(p.contacts || []), { id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], linkedApplicationId: null }],
                 }))
               }
               style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 12 }}
