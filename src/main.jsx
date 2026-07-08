@@ -120,6 +120,63 @@ const accountStatusLabel = (s) => (s === "closed" ? "closed" : s === "bad fit" ?
 const accountStatusColor = (s) => (s === "closed" ? C.muted : s === "bad fit" ? C.red : C.green);
 const isAccountOpen = (acc) => !acc.status;
 
+/* ---- syncing account-contact outreach into the real pipeline ----
+   Outreaching a contact is real outreach — it should count everywhere an
+   application does (funnel, goals, conversion, donuts) without every one of
+   those systems needing special-cased contact-awareness. So instead of
+   merging counts in parallel, each outreached contact gets a real, linked
+   entry in state.applications (source "Accounts", fromAccountContact: true),
+   kept in sync as the contact's own status/tags/follow-ups change. */
+const CONTACT_TO_APP_STATUS = { "": "", outreach: "outreach", replied: "replied", "discovery call": "screening", ongoing: "interview", closed: "rejected" };
+const mapContactStatusToAppStatus = (contactStatus) => CONTACT_TO_APP_STATUS[contactStatus] ?? "";
+/* pure: given an account's OLD and NEW contact lists plus the current applications
+   array, returns the updated contacts (with linkedApplicationId set/cleared) and
+   the updated applications array (linked entries created/updated/removed). */
+function syncContactsToApplications(accountCompany, oldContacts, newContacts, applications) {
+  let apps = applications.slice();
+  const newIds = new Set((newContacts || []).map((c) => c.id));
+
+  /* a contact that no longer exists on the account loses its linked application too */
+  (oldContacts || []).forEach((oc) => {
+    if (!newIds.has(oc.id) && oc.linkedApplicationId) {
+      apps = apps.filter((a) => a.id !== oc.linkedApplicationId);
+    }
+  });
+
+  const updatedContacts = (newContacts || []).map((c) => {
+    const hasLink = !!(c.linkedApplicationId && apps.some((a) => a.id === c.linkedApplicationId));
+
+    if (!c.status) {
+      /* reverted to "not contacted" — the linked pipeline entry no longer applies */
+      if (hasLink) apps = apps.filter((a) => a.id !== c.linkedApplicationId);
+      return { ...c, linkedApplicationId: null };
+    }
+
+    const payload = {
+      company: accountCompany,
+      contact: c.name,
+      email: c.email,
+      source: "Accounts",
+      status: mapContactStatusToAppStatus(c.status),
+      contacted: c.contacted,
+      outreachKind: c.outreachKind,
+      followUps: c.followUps || [],
+      notes: c.notes,
+      fromAccountContact: true,
+    };
+
+    if (hasLink) {
+      apps = apps.map((a) => (a.id === c.linkedApplicationId ? { ...a, ...payload } : a));
+      return c;
+    }
+    const newId = uid();
+    apps = [{ id: newId, ...payload }, ...apps];
+    return { ...c, linkedApplicationId: newId };
+  });
+
+  return { contacts: updatedContacts, applications: apps };
+}
+
 /* ---- content management model ---- */
 const CONTENT_STATUSES = ["idea", "draft", "design", "scheduled", "published"];
 const contentStatusLabel = (s) => (s ? s : "idea");
@@ -403,6 +460,121 @@ function buildCycleSnapshot(s, g, cycleNumber) {
     },
     aiReport: null,
   };
+}
+
+/* ---- cross-domain synthesis ----
+   Pure, deterministic pattern-noticing across runway, goal pace, emotional
+   check-ins, content, and bad-fit reasons. Deliberately NOT an AI call for
+   the underlying facts — every number here is computed directly from real
+   data, gated behind a minimum sample size, and phrased with fixed language
+   ("worth noticing", "coincides with") that never claims causation, never
+   issues a directive, and never suggests lowering the compensation floor
+   (that decision runs on runway math alone, per the existing rules). An
+   optional AI narrative can comment ON TOP of these pre-verified facts, but
+   never replaces them or introduces new claims. */
+function computeSynthesis(state, apps, zone) {
+  const observations = [];
+
+  /* 1. Runway zone vs current goal pace — a snapshot check, not a trend */
+  if (state.goal) {
+    const runwayTight = zone.name === "TIMELINE COMPRESSES" || zone.name === "DELIBERATE DECISION ZONE";
+    const runwayHealthy = zone.name === "FULL LEVERAGE";
+    if (runwayTight && state.goal.aggressiveness === "chill") {
+      observations.push({
+        id: "runway-pace-mismatch",
+        icon: "⚠️",
+        kind: "watch",
+        title: "Runway has tightened, pace hasn't",
+        detail: `Your runway zone is "${zone.name}" but your goal is set to Chill pace. Worth checking whether Steady or Aggressive fits your timeline better now — this is about pace, not about lowering the floor.`,
+      });
+    } else if (runwayHealthy && state.goal.aggressiveness === "aggressive") {
+      observations.push({
+        id: "runway-pace-room",
+        icon: "🌿",
+        kind: "info",
+        title: "You may have more room than your pace assumes",
+        detail: `Runway is at "${zone.name}" — if Aggressive pace feels like a grind, there's room to ease to Steady without real risk to your timeline.`,
+      });
+    }
+  }
+
+  /* 2. Emotional intensity during the active goal window vs. before it started */
+  if (state.goal && (state.supportSessions || []).length >= 4) {
+    const inCycle = state.supportSessions.filter((s) => s.date >= state.goal.startDate && s.intensity != null);
+    const before = state.supportSessions.filter((s) => s.date < state.goal.startDate && s.intensity != null);
+    if (inCycle.length >= 2 && before.length >= 2) {
+      const avg = (arr) => arr.reduce((sum, x) => sum + (+x.intensity || 0), 0) / arr.length;
+      const inAvg = avg(inCycle);
+      const beforeAvg = avg(before);
+      if (Math.abs(inAvg - beforeAvg) >= 1.5) {
+        observations.push({
+          id: "intensity-cycle",
+          icon: inAvg > beforeAvg ? "📈" : "📉",
+          kind: "watch",
+          title: inAvg > beforeAvg ? "Intensity is running higher this cycle" : "Intensity is running lower this cycle",
+          detail: `Since this goal started, logged emotional intensity has averaged ${inAvg.toFixed(1)}/10, versus ${beforeAvg.toFixed(1)}/10 before it. Worth being aware of — a coincidence in timing, not a diagnosis of why.`,
+        });
+      }
+    }
+  }
+
+  /* 3. Content publish dates vs. nearby contact outreach — temporal proximity only, never causal */
+  const published = (state.content || []).filter((c) => c.status === "published" && c.date);
+  const allContacts = (state.accounts || []).flatMap((a) => a.contacts || []);
+  if (published.length >= 1 && allContacts.length >= 1) {
+    let nearCount = 0;
+    published.forEach((c) => {
+      const windowEnd = addDays(c.date, 7);
+      if (allContacts.some((ct) => ct.contacted && ct.contacted >= c.date && ct.contacted <= windowEnd)) nearCount++;
+    });
+    if (nearCount > 0) {
+      observations.push({
+        id: "content-contact-proximity",
+        icon: "📝",
+        kind: "positive",
+        title: "Contact activity near your published content",
+        detail: `${nearCount} of ${published.length} published piece${published.length === 1 ? "" : "s"} had new contact outreach within a week after. Could be coincidence, could be visibility — worth noticing, not a reason to publish for conversion.`,
+      });
+    }
+  }
+
+  /* 4. Bad-fit reason concentration — real repeated signal, gated at 3+ occurrences */
+  const allBadReasons = [
+    ...apps.filter((a) => a.status === "bad fit").flatMap((a) => a.badReasons || []),
+    ...(state.accounts || []).filter((a) => a.status === "bad fit").flatMap((a) => a.badReasons || []),
+  ];
+  if (allBadReasons.length >= 3) {
+    const counts = {};
+    allBadReasons.forEach((r) => (counts[r] = (counts[r] || 0) + 1));
+    const [topReason, topCount] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+    if (topCount / allBadReasons.length >= 0.5) {
+      observations.push({
+        id: "bad-fit-concentration",
+        icon: "📊",
+        kind: "watch",
+        title: `"${topReason}" keeps coming up`,
+        detail: `${topCount} of ${allBadReasons.length} bad-fit taggings cite "${topReason}". That's real, repeated market signal — evidence for negotiating harder or targeting differently, not a reason to lower your floor.`,
+      });
+    }
+  }
+
+  /* 5. Past-cycle benchmark, shown only when there's no active goal to suggest a starting target */
+  const pastCycles = (state.accomplishments || []).filter((a) => (a.category === "Past Wins" || a.category === "Cycle Complete") && a.snapshot);
+  if (!state.goal && pastCycles.length > 0) {
+    const snap = pastCycles[0].snapshot;
+    const total = (snap.apps ?? snap.funnel?.applications ?? 0) + (snap.outreach ?? snap.funnel?.outreach ?? 0);
+    if (total > 0) {
+      observations.push({
+        id: "past-cycle-benchmark",
+        icon: "📌",
+        kind: "info",
+        title: "Your own past benchmark",
+        detail: `Last time, it took ${total} applications+outreach combined to land an offer. Worth using as a starting point for a new goal target instead of guessing from scratch.`,
+      });
+    }
+  }
+
+  return observations;
 }
 
 
@@ -893,6 +1065,9 @@ export default function FlightDeck() {
   const [focusModalOpen, setFocusModalOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null); /* { kind: "application"|"account", id, label } */
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false);
+  const [patternsModalOpen, setPatternsModalOpen] = useState(false);
+  const [patternsNarrative, setPatternsNarrative] = useState("");
+  const [patternsNarrativeLoading, setPatternsNarrativeLoading] = useState(false);
   const [toast, setToast] = useState("");
   const [syncStatus, setSyncStatus] = useState("local");
   const [crmView, setCrmView] = useState("applications"); /* toggle inside the CRM tab: applications <-> accounts */
@@ -904,6 +1079,8 @@ export default function FlightDeck() {
   const [contentFilter, setContentFilter] = useState("all");
   const [pipeSourceFilter, setPipeSourceFilter] = useState("");
   const [pipeStatusFilter, setPipeStatusFilter] = useState("");
+  const [pipeFilterPanelOpen, setPipeFilterPanelOpen] = useState(false);
+  const [accFilterPanelOpen, setAccFilterPanelOpen] = useState(false);
   const [donutMode, setDonutMode] = useState("status");
   const [historyGroup, setHistoryGroup] = useState("date");
   const [coachLoading, setCoachLoading] = useState(null);
@@ -1202,9 +1379,12 @@ export default function FlightDeck() {
       ? { name: "TIMELINE COMPRESSES", color: "#FB923C", note: "Floor holds. Accept strong at-floor offers faster. Add interim income." }
       : { name: "DELIBERATE DECISION ZONE", color: C.red, note: "Only zone where lowering the floor is legitimate — written, dated, numbers attached." };
 
-  /* watch goal progress: celebrate every 5% milestone (targets > 250), and
-     snapshot the whole cycle once the goal is fully achieved — regardless of
-     whether it ended in a job or not. Runs quietly in the background. */
+  /* watch goal progress: celebrate every 2.5% milestone (2% for targets beyond
+     1000) once the target exceeds 250, and snapshot the whole cycle once the
+     goal is fully achieved — regardless of whether it ended in a job or not.
+     Runs quietly in the background. Milestones are tracked as integer indices
+     (not raw percentages) to avoid floating-point comparison issues with the
+     2.5% step. */
   useEffect(() => {
     if (!state.goal) return;
     const g = computeGoal(state.goal, apps);
@@ -1214,20 +1394,23 @@ export default function FlightDeck() {
     const newWins = [];
 
     if (state.goal.target > 250) {
-      const currentPct = Math.min(100, Math.floor(g.pctComplete / 5) * 5);
-      const toAward = [];
-      for (let m = 5; m <= currentPct; m += 5) {
-        if (!already.includes(m)) toAward.push(m);
+      const increment = state.goal.target > 1000 ? 2 : 2.5;
+      const maxIndex = Math.floor(100 / increment);
+      const currentIndex = Math.min(maxIndex, Math.floor(g.pctComplete / increment));
+      const toAwardIdx = [];
+      for (let i = 1; i <= currentIndex; i++) {
+        if (!already.includes(i)) toAwardIdx.push(i);
       }
-      if (toAward.length) {
-        newMilestones = [...already, ...toAward];
-        toAward.forEach((m) => {
+      if (toAwardIdx.length) {
+        newMilestones = [...already, ...toAwardIdx];
+        toAwardIdx.forEach((i) => {
+          const pctValue = +(i * increment).toFixed(1);
           const msg = MILESTONE_MESSAGES[Math.floor(Math.random() * MILESTONE_MESSAGES.length)];
           newWins.push({
             id: uid(),
             date: today(),
             category: "Milestone",
-            text: `🎉 ${m}% of your goal complete (${Math.round((state.goal.target * m) / 100)}/${state.goal.target})! ${msg}`,
+            text: `🎉 ${pctValue}% of your goal complete (${Math.round((state.goal.target * pctValue) / 100)}/${state.goal.target})! ${msg}`,
           });
         });
       }
@@ -1351,6 +1534,7 @@ Non-negotiable playbook rules you must coach within:
 - If an active goal is set, use its stated "today's target" (which may still be ramping up) and deadline instead of the generic weekly benchmark for volume advice — prioritize hitting today's specific number and flag clearly if behind pace.
 - If past wins exist, treat their snapshot numbers as this person's own proven benchmark (e.g. "last time it took you N applications") rather than generic statistics — it's more convincing evidence than population averages.
 - Content (blog posts, videos, carousels, etc.) is a SEPARATE track from the job search — it exists purely for meaningful nurturing and staying visible to their network, NOT as a lead-generation or conversion tactic. Never suggest content "to get more interviews" or tie its success to job-search metrics. If mentioning content at all, frame it around consistency and genuine presence, and only bring it up when it's actually relevant (e.g. behind on the weekly content goal) — don't force it into every briefing.
+- When connecting patterns across different tracked domains (runway, goal pace, emotional intensity, content, bad-fit reasons), always frame it as an observed coincidence or correlation worth being aware of — never as causation, a verdict, or a diagnosis. Never use any cross-domain pattern to suggest lowering the compensation floor; that decision runs strictly on runway math per the existing rules, regardless of what any other signal shows.
 Tone: direct, warm, concrete, zero fluff, zero generic motivation. Reference their actual numbers and company names.`;
 
   const callClaude = async (task, format) => {
@@ -1401,6 +1585,40 @@ Respond with ONLY valid JSON, no markdown fences, no preamble, exactly this shap
       mutate((s) => ({ ...s, accomplishments: s.accomplishments.map((a) => (a.id === entryId ? { ...a, aiReportLoading: false } : a)) }));
       flash("Couldn't generate the report — check connection and retry.");
     }
+  };
+
+  /* optional reflective narrative ON TOP OF the pre-computed, already-true
+     synthesis observations — the prompt forbids introducing any new
+     correlation, claim, or number not already present in the list, and
+     forbids ever suggesting the compensation floor be lowered. This keeps
+     the model's role strictly to framing/tone, never to fact-finding. */
+  const generatePatternsNarrative = async (observations) => {
+    setPatternsNarrativeLoading(true);
+    try {
+      const prompt = `Below is a list of pre-computed, already-verified observations from a job search tracker. Each one is a real correlation or coincidence in the person's own data — you are NOT being asked to find patterns, only to write a short (2-4 sentence), warm, grounded reflection connecting the ones given. Hard rules: reference ONLY the observations listed below, do not introduce any new correlation, claim, or number that isn't already stated here; never claim causation (frame everything as "worth noticing" or "coincides with", matching the tone already used); never suggest lowering the compensation floor under any circumstance — if runway or bad-fit signals come up, treat them as pace or targeting questions only, never floor questions. If the list is empty, just say things look steady right now, briefly.
+
+OBSERVATIONS:
+${JSON.stringify(observations, null, 2)}
+
+Respond with ONLY valid JSON, no markdown fences, no preamble, exactly this shape:
+{"narrative": "..."}`;
+      const res = await fetch("/api/coach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      const text = (data.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
+      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      setPatternsNarrative(parsed.narrative || "");
+    } catch (e) {
+      flash("Couldn't reach the coach — check connection and retry.");
+    }
+    setPatternsNarrativeLoading(false);
   };
 
   const runDaily = async () => {
@@ -1674,7 +1892,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     if (kind === "application") {
       mutate((s) => ({ ...s, applications: s.applications.filter((x) => x.id !== id) }), `Deleted ${label}`);
     } else if (kind === "account") {
-      mutate((s) => ({ ...s, accounts: s.accounts.filter((x) => x.id !== id) }), `Deleted ${label}`);
+      mutate((s) => {
+        const acc = s.accounts.find((x) => x.id === id);
+        const linkedIds = new Set((acc?.contacts || []).map((c) => c.linkedApplicationId).filter(Boolean));
+        return {
+          ...s,
+          accounts: s.accounts.filter((x) => x.id !== id),
+          applications: linkedIds.size ? s.applications.filter((a) => !linkedIds.has(a.id)) : s.applications,
+        };
+      }, `Deleted ${label}`);
     }
     setConfirmDelete(null);
   };
@@ -1707,16 +1933,33 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       );
       if (winMsg) setTimeout(() => flash(winMsg), 400);
     } else if (kind === "account") {
-      mutate(
-        (s) => ({
-          ...s,
-          accounts: entry
-            ? s.accounts.map((a) => (a.id === entry.id ? { ...a, ...data } : a))
-            : [{ id: uid(), ...data }, ...s.accounts],
-        }),
-        entry ? "Account updated" : "Account tracked"
-      );
+      let winMsg = "";
+      mutate((s) => {
+        const oldContacts = entry?.contacts || [];
+        const oldAppsById = new Map(s.applications.map((a) => [a.id, a]));
+        const { contacts: newContacts, applications: syncedApps } = syncContactsToApplications(data.company, oldContacts, data.contacts || [], s.applications);
+
+        let addWins = [];
+        const finalApps = syncedApps.map((a) => {
+          if (!a.fromAccountContact) return a;
+          const prev = oldAppsById.get(a.id) || { status: "", milestonesLogged: [] };
+          const m = computeMilestoneWins(prev, a.status);
+          if (m) {
+            addWins = [...addWins, ...m.wins];
+            return { ...a, milestonesLogged: m.milestonesLogged };
+          }
+          return { ...a, milestonesLogged: prev.milestonesLogged || [] };
+        });
+
+        const accounts = entry
+          ? s.accounts.map((acc) => (acc.id === entry.id ? { ...acc, ...data, contacts: newContacts } : acc))
+          : [{ id: uid(), ...data, contacts: newContacts }, ...s.accounts];
+
+        if (addWins.length) winMsg = addWins.map((w) => w.text).join(" · ");
+        return { ...s, accounts, applications: finalApps, accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments };
+      }, entry ? "Account updated" : "Account tracked");
       if (!entry) setCrmView("accounts"); /* land on the Accounts table after creating one */
+      if (winMsg) setTimeout(() => flash(winMsg), 400);
     } else if (kind === "content") {
       let winMsg = "";
       mutate((s) => {
@@ -1933,11 +2176,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         </div>
       )}
 
-      {/* today's focus & weekly review — popup modules, right below Today's Goal */}
-      <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+      {/* today's focus, weekly review, & patterns — popup modules, right below Today's Goal */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
         <button
           onClick={() => setFocusModalOpen(true)}
-          style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "14px 12px", cursor: "pointer", textAlign: "left" }}
+          style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "14px 10px", cursor: "pointer", textAlign: "left" }}
         >
           <div style={{ fontSize: 20, marginBottom: 4 }}>📋</div>
           <div style={{ fontSize: 13, fontWeight: 700, color: C.ink }}>Today's Focus</div>
@@ -1947,12 +2190,25 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         </button>
         <button
           onClick={() => setWeeklyModalOpen(true)}
-          style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "14px 12px", cursor: "pointer", textAlign: "left" }}
+          style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "14px 10px", cursor: "pointer", textAlign: "left" }}
         >
           <div style={{ fontSize: 20, marginBottom: 4 }}>📊</div>
           <div style={{ fontSize: 13, fontWeight: 700, color: C.ink }}>Weekly Review</div>
           <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
             {coach.weeklyDate ? `Last run ${coach.weeklyDate}` : "Run every Friday"}
+          </div>
+        </button>
+        <button
+          onClick={() => setPatternsModalOpen(true)}
+          style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "14px 10px", cursor: "pointer", textAlign: "left" }}
+        >
+          <div style={{ fontSize: 20, marginBottom: 4 }}>🧭</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.ink }}>Patterns</div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+            {(() => {
+              const n = computeSynthesis(state, apps, zone).length;
+              return n > 0 ? `${n} to see` : "All quiet";
+            })()}
           </div>
         </button>
       </div>
@@ -2004,6 +2260,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   apps.forEach((a) => {
                     if (a.source === "Job board") {
                       bump(a.jobBoardName ? a.jobBoardName : "Job board (unspecified)");
+                    } else if (a.source === "Accounts") {
+                      bump("Accounts");
                     } else if (a.source && APP_SOURCES.includes(a.source)) {
                       bump(a.source);
                     } else {
@@ -2012,20 +2270,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   });
                   return Array.from(buckets.entries()).map(([label, value]) => ({ label, value }));
                 })()
-              : (() => {
-                  const allContacts = (state.accounts || []).flatMap((a) => a.contacts || []);
-                  const appWarm = apps.filter((a) => a.outreachKind === "warm").length;
-                  const appCold = apps.filter((a) => a.outreachKind === "cold").length;
-                  const appUntagged = apps.filter((a) => isOutreach(a) && !a.outreachKind).length;
-                  const contactWarm = allContacts.filter((c) => c.outreachKind === "warm").length;
-                  const contactCold = allContacts.filter((c) => c.outreachKind === "cold").length;
-                  const contactUntagged = allContacts.filter((c) => isContactOutreached(c) && !c.outreachKind).length;
-                  return [
-                    { label: "Warm", value: appWarm + contactWarm },
-                    { label: "Cold", value: appCold + contactCold },
-                    { label: "Untagged (in outreach)", value: appUntagged + contactUntagged },
-                  ];
-                })()
+              : [
+                  { label: "Warm", value: apps.filter((a) => a.outreachKind === "warm").length },
+                  { label: "Cold", value: apps.filter((a) => a.outreachKind === "cold").length },
+                  { label: "Untagged (in outreach)", value: apps.filter((a) => isOutreach(a) && !a.outreachKind).length },
+                ]
           }
         />
         {donutMode === "source" && (
@@ -2035,7 +2284,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         )}
         {donutMode === "outreach" && (
           <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
-            Includes both application outreach and account contacts. Warm/cold tags are kept even after status moves on (e.g. to applied/replied). "Untagged" is only entries still sitting in outreach status. Warm converts 4–10x better than cold.
+            Outreached account contacts are included automatically (they sync into the pipeline). Warm/cold tags are kept even after status moves on. "Untagged" is only entries still sitting in outreach status. Warm converts 4–10x better than cold.
           </div>
         )}
       </div>
@@ -2301,13 +2550,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .sort((a, b) => (b.contacted || "").localeCompare(a.contacted || ""));
 
     const totalContacts = (state.accounts || []).reduce((s, a) => s + (a.contacts || []).length, 0);
+    const realApplicationsCount = apps.filter((a) => !a.fromAccountContact).length;
 
     return (
       <>
         {/* quick-glance counts — applications, contacts, due, accounts at a glance */}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 14 }}>
           {[
-            ["APPLICATIONS", apps.length, C.ink],
+            ["APPLICATIONS", realApplicationsCount, C.ink],
             ["CONTACTS", totalContacts, C.ink],
             ["DUE ⚑", totalDueCount, totalDueCount > 0 ? C.red : C.ink],
             ["ACCOUNTS", (state.accounts || []).length, C.ink],
@@ -2322,7 +2572,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
           <div style={{ display: "flex", gap: 6 }}>
             {[
-              ["applications", `📋 Applications (${apps.length})`],
+              ["applications", `📋 Applications (${realApplicationsCount})`],
               ["accounts", `🏢 Accounts (${(state.accounts || []).length})`],
             ].map(([k, l]) => (
               <button
@@ -2365,58 +2615,167 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           )}
         </div>
 
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {filters.map((f) => (
-              <button
-                key={f.key}
-                onClick={() => setPipeFilter(f.key)}
-                style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${pipeFilter === f.key ? C.amber : C.panelEdge}`, background: pipeFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: pipeFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
-              >
-                {f.label}
-              </button>
-            ))}
-          </div>
-        </div>
+        {isDesktop ? (
+          <>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {filters.map((f) => (
+                  <button
+                    key={f.key}
+                    onClick={() => setPipeFilter(f.key)}
+                    style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${pipeFilter === f.key ? C.amber : C.panelEdge}`, background: pipeFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: pipeFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            </div>
 
-        <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
-          <select
-            value={pipeSourceFilter}
-            onChange={(e) => setPipeSourceFilter(e.target.value)}
-            style={{ ...selMini, border: `1px solid ${pipeSourceFilter ? C.amber : C.panelEdge}`, color: pipeSourceFilter ? C.amber : C.muted, padding: "6px 10px", borderRadius: 20 }}
-          >
-            <option value="">Filter: any source</option>
-            {APP_SOURCES.map((s) => (
-              <option key={s} value={s} style={{ background: C.panel, color: C.ink }}>
-                {s}
-              </option>
-            ))}
-          </select>
-          <select
-            value={pipeStatusFilter}
-            onChange={(e) => setPipeStatusFilter(e.target.value)}
-            style={{ ...selMini, border: `1px solid ${pipeStatusFilter ? C.amber : C.panelEdge}`, color: pipeStatusFilter ? C.amber : C.muted, padding: "6px 10px", borderRadius: 20 }}
-          >
-            <option value="">Filter: any status</option>
-            {APP_STATUSES.map((s) => (
-              <option key={s || "blank"} value={s} style={{ background: C.panel, color: C.ink }}>
-                {statusLabel(s)}
-              </option>
-            ))}
-          </select>
-          {(pipeSourceFilter || pipeStatusFilter) && (
-            <Btn
-              ghost
-              onClick={() => {
-                setPipeSourceFilter("");
-                setPipeStatusFilter("");
+            <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+              <select
+                value={pipeSourceFilter}
+                onChange={(e) => setPipeSourceFilter(e.target.value)}
+                style={{ ...selMini, border: `1px solid ${pipeSourceFilter ? C.amber : C.panelEdge}`, color: pipeSourceFilter ? C.amber : C.muted, padding: "6px 10px", borderRadius: 20 }}
+              >
+                <option value="">Filter: any source</option>
+                {APP_SOURCES.map((s) => (
+                  <option key={s} value={s} style={{ background: C.panel, color: C.ink }}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+              <select
+                value={pipeStatusFilter}
+                onChange={(e) => setPipeStatusFilter(e.target.value)}
+                style={{ ...selMini, border: `1px solid ${pipeStatusFilter ? C.amber : C.panelEdge}`, color: pipeStatusFilter ? C.amber : C.muted, padding: "6px 10px", borderRadius: 20 }}
+              >
+                <option value="">Filter: any status</option>
+                {APP_STATUSES.map((s) => (
+                  <option key={s || "blank"} value={s} style={{ background: C.panel, color: C.ink }}>
+                    {statusLabel(s)}
+                  </option>
+                ))}
+              </select>
+              {(pipeSourceFilter || pipeStatusFilter) && (
+                <Btn
+                  ghost
+                  onClick={() => {
+                    setPipeSourceFilter("");
+                    setPipeStatusFilter("");
+                  }}
+                  style={{ padding: "6px 12px", fontSize: 11 }}
+                >
+                  Clear filters
+                </Btn>
+              )}
+            </div>
+          </>
+        ) : (
+          <div style={{ marginBottom: 10 }}>
+            <button
+              onClick={() => setPipeFilterPanelOpen(true)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                fontFamily: sans,
+                fontSize: 12,
+                fontWeight: 700,
+                padding: "8px 14px",
+                borderRadius: 20,
+                border: `1px solid ${pipeSourceFilter || pipeStatusFilter ? C.amber : C.panelEdge}`,
+                background: "transparent",
+                color: pipeSourceFilter || pipeStatusFilter ? C.amber : C.muted,
+                cursor: "pointer",
               }}
-              style={{ padding: "6px 12px", fontSize: 11 }}
             >
-              Clear filters
-            </Btn>
-          )}
-        </div>
+              🔍 {filters.find((f) => f.key === pipeFilter)?.label || "Filter"}
+              {(pipeSourceFilter || pipeStatusFilter) && <span style={{ fontFamily: mono, fontSize: 9 }}>+more</span>}
+            </button>
+
+            {pipeFilterPanelOpen && (
+              <div
+                onClick={() => setPipeFilterPanelOpen(false)}
+                style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 55 }}
+              >
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  style={{ width: "100%", maxWidth: 560, maxHeight: "75vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderTopLeftRadius: 20, borderTopRightRadius: 20, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+                >
+                  <div style={{ padding: "18px 20px 10px", flexShrink: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ fontSize: 16, fontWeight: 800 }}>Filters</div>
+                    <button onClick={() => setPipeFilterPanelOpen(false)} style={{ background: "transparent", border: "none", color: C.muted, fontSize: 20, cursor: "pointer" }}>×</button>
+                  </div>
+                  <div style={{ flex: 1, overflowY: "auto", padding: "0 20px 20px" }}>
+                    <Label>Show</Label>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>
+                      {filters.map((f) => (
+                        <button
+                          key={f.key}
+                          onClick={() => {
+                            setPipeFilter(f.key);
+                            setPipeFilterPanelOpen(false);
+                          }}
+                          style={{
+                            textAlign: "left",
+                            fontFamily: sans,
+                            fontSize: 13,
+                            fontWeight: pipeFilter === f.key ? 700 : 500,
+                            padding: "10px 12px",
+                            borderRadius: 10,
+                            border: `1px solid ${pipeFilter === f.key ? C.amber : C.panelEdge}`,
+                            background: pipeFilter === f.key ? "rgba(245,185,66,0.1)" : "transparent",
+                            color: pipeFilter === f.key ? C.amber : C.ink,
+                            cursor: "pointer",
+                          }}
+                        >
+                          {f.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <Label>Source</Label>
+                    <select
+                      value={pipeSourceFilter}
+                      onChange={(e) => setPipeSourceFilter(e.target.value)}
+                      style={{ ...inputStyle, marginBottom: 12 }}
+                    >
+                      <option value="">Any source</option>
+                      {APP_SOURCES.map((s) => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+
+                    <Label>Status</Label>
+                    <select
+                      value={pipeStatusFilter}
+                      onChange={(e) => setPipeStatusFilter(e.target.value)}
+                      style={{ ...inputStyle, marginBottom: 16 }}
+                    >
+                      <option value="">Any status</option>
+                      {APP_STATUSES.map((s) => (
+                        <option key={s || "blank"} value={s}>{statusLabel(s)}</option>
+                      ))}
+                    </select>
+
+                    {(pipeSourceFilter || pipeStatusFilter) && (
+                      <Btn
+                        ghost
+                        onClick={() => {
+                          setPipeSourceFilter("");
+                          setPipeStatusFilter("");
+                        }}
+                        style={{ width: "100%" }}
+                      >
+                        Clear source/status filters
+                      </Btn>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {shown.length === 0 && (
           <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
@@ -2481,31 +2840,39 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       </td>
                       <td style={{ ...td, minWidth: 130 }}>{cellInput(a, "role", { ph: "Role applied for" })}</td>
                       <td style={{ ...td, minWidth: 130 }} onClick={(e) => e.stopPropagation()}>
-                        <select
-                          value={a.source || ""}
-                          onChange={(e) => updateAppField(a.id, "source", e.target.value)}
-                          style={{ ...selMini, color: a.source ? C.ink : C.muted, width: "100%" }}
-                        >
-                          <option value="">—</option>
-                          {APP_SOURCES.map((s) => (
-                            <option key={s} value={s} style={{ background: C.panel }}>
-                              {s}
-                            </option>
-                          ))}
-                        </select>
-                        {a.source === "Job board" && (
-                          <input
-                            key={a.id + "board" + (a.jobBoardName || "")}
-                            list="jobboard-suggestions"
-                            defaultValue={a.jobBoardName || ""}
-                            placeholder="Which board?"
-                            onBlur={(e) => {
-                              if (e.target.value !== (a.jobBoardName || "")) updateAppField(a.id, "jobBoardName", e.target.value);
-                            }}
-                            onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
-                            style={{ width: "100%", boxSizing: "border-box", fontSize: 12, fontFamily: mono, color: C.blue, background: "transparent", border: "1px solid transparent", borderRadius: 6, padding: "3px 4px", outline: "none", marginTop: 2 }}
-                            onFocus={(e) => (e.target.style.border = `1px solid ${C.blue}`)}
-                          />
+                        {a.fromAccountContact ? (
+                          <div title="Synced from Accounts — edit this contact there" style={{ fontFamily: mono, fontSize: 11, color: C.blue, display: "flex", alignItems: "center", gap: 4 }}>
+                            🏢 Accounts
+                          </div>
+                        ) : (
+                          <>
+                            <select
+                              value={a.source || ""}
+                              onChange={(e) => updateAppField(a.id, "source", e.target.value)}
+                              style={{ ...selMini, color: a.source ? C.ink : C.muted, width: "100%" }}
+                            >
+                              <option value="">—</option>
+                              {APP_SOURCES.map((s) => (
+                                <option key={s} value={s} style={{ background: C.panel }}>
+                                  {s}
+                                </option>
+                              ))}
+                            </select>
+                            {a.source === "Job board" && (
+                              <input
+                                key={a.id + "board" + (a.jobBoardName || "")}
+                                list="jobboard-suggestions"
+                                defaultValue={a.jobBoardName || ""}
+                                placeholder="Which board?"
+                                onBlur={(e) => {
+                                  if (e.target.value !== (a.jobBoardName || "")) updateAppField(a.id, "jobBoardName", e.target.value);
+                                }}
+                                onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                                style={{ width: "100%", boxSizing: "border-box", fontSize: 12, fontFamily: mono, color: C.blue, background: "transparent", border: "1px solid transparent", borderRadius: 6, padding: "3px 4px", outline: "none", marginTop: 2 }}
+                                onFocus={(e) => (e.target.style.border = `1px solid ${C.blue}`)}
+                              />
+                            )}
+                          </>
                         )}
                       </td>
                       <td style={{ ...td, minWidth: 110 }}>{cellInput(a, "contact", { ph: "Name" })}</td>
@@ -2708,7 +3075,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         )}
                       </td>
                       <td style={td}>
-                        <span style={{ fontSize: 12, color: a.source ? C.ink : C.muted }}>{a.source || "—"}</span>
+                        <span style={{ fontSize: 12, color: a.fromAccountContact ? C.blue : a.source ? C.ink : C.muted }}>
+                          {a.fromAccountContact ? "🏢 Accounts" : a.source || "—"}
+                        </span>
                         {a.source === "Job board" && a.jobBoardName && (
                           <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.06em", color: C.blue, marginTop: 3 }}>{a.jobBoardName}</div>
                         )}
@@ -2840,6 +3209,20 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
+    const isContactFilterView = accFilter === "outreachedContacts" || accFilter === "dueContacts";
+
+    /* flat contact list for the Outreached/Due filters — shows people, not company rows */
+    const flatContacts = isContactFilterView
+      ? accounts
+          .flatMap((acc) => (acc.contacts || []).map((c) => ({ ...c, _company: acc.company || "Unnamed", _accountId: acc.id })))
+          .filter((c) => (accFilter === "outreachedContacts" ? isContactOutreached(c) : isContactDue(c)))
+          .filter((c) => {
+            if (!accSearch.trim()) return true;
+            const q = accSearch.trim().toLowerCase();
+            return [c.name, c.email, c.position, c._company].filter(Boolean).some((f) => f.toLowerCase().includes(q));
+          })
+          .sort((a, b) => a._company.localeCompare(b._company))
+      : [];
 
     return (
       <>
@@ -2857,18 +3240,121 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           )}
         </div>
 
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
-          {accFilters.map((f) => (
+        {isDesktop ? (
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+            {accFilters.map((f) => (
+              <button
+                key={f.key}
+                onClick={() => setAccFilter(f.key)}
+                style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${accFilter === f.key ? C.amber : C.panelEdge}`, background: accFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: accFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div style={{ marginBottom: 12 }}>
             <button
-              key={f.key}
-              onClick={() => setAccFilter(f.key)}
-              style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${accFilter === f.key ? C.amber : C.panelEdge}`, background: accFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: accFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
+              onClick={() => setAccFilterPanelOpen(true)}
+              style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "8px 14px", borderRadius: 20, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, cursor: "pointer" }}
             >
-              {f.label}
+              🔍 {accFilters.find((f) => f.key === accFilter)?.label || "Filter"}
             </button>
-          ))}
-        </div>
 
+            {accFilterPanelOpen && (
+              <div
+                onClick={() => setAccFilterPanelOpen(false)}
+                style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 55 }}
+              >
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  style={{ width: "100%", maxWidth: 560, maxHeight: "75vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderTopLeftRadius: 20, borderTopRightRadius: 20, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+                >
+                  <div style={{ padding: "18px 20px 10px", flexShrink: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ fontSize: 16, fontWeight: 800 }}>Filters</div>
+                    <button onClick={() => setAccFilterPanelOpen(false)} style={{ background: "transparent", border: "none", color: C.muted, fontSize: 20, cursor: "pointer" }}>×</button>
+                  </div>
+                  <div style={{ flex: 1, overflowY: "auto", padding: "0 20px 20px", display: "flex", flexDirection: "column", gap: 6 }}>
+                    {accFilters.map((f) => (
+                      <button
+                        key={f.key}
+                        onClick={() => {
+                          setAccFilter(f.key);
+                          setAccFilterPanelOpen(false);
+                        }}
+                        style={{
+                          textAlign: "left",
+                          fontFamily: sans,
+                          fontSize: 13,
+                          fontWeight: accFilter === f.key ? 700 : 500,
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          border: `1px solid ${accFilter === f.key ? C.amber : C.panelEdge}`,
+                          background: accFilter === f.key ? "rgba(245,185,66,0.1)" : "transparent",
+                          color: accFilter === f.key ? C.amber : C.ink,
+                          cursor: "pointer",
+                        }}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {isContactFilterView ? (
+          <>
+            {flatContacts.length === 0 && (
+              <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
+                {accFilter === "outreachedContacts" ? "No contacts outreached yet." : "No contacts due for follow-up."}
+              </div>
+            )}
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {flatContacts.map((c) => {
+                const acc = accounts.find((a) => a.id === c._accountId);
+                const nf = nextFollowUp(c);
+                const fus = normFollowUps(c);
+                const doneCount = fus.filter((x) => x.done).length;
+                const due = isContactDue(c);
+                return (
+                  <div
+                    key={c.id}
+                    onClick={() => acc && setModal({ kind: "account", entry: acc })}
+                    style={{ background: C.panel, border: `1px solid ${due ? C.red : C.panelEdge}`, borderRadius: 12, padding: "12px 14px", cursor: "pointer" }}
+                  >
+                    <div style={{ fontStyle: "italic", fontWeight: 700, fontSize: 12, color: C.amber, marginBottom: 4 }}>@{c._company}</div>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <div style={{ fontWeight: 700, fontSize: 14 }}>{c.name || "Unnamed"}</div>
+                      {c.status && (
+                        <span style={{ fontFamily: mono, fontSize: 10, color: contactStatusColor(c.status), textTransform: "uppercase", flexShrink: 0 }}>
+                          {contactStatusLabel(c.status)}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
+                      {[c.position, c.email, c.phone].filter(Boolean).join(" · ") || "—"}
+                    </div>
+                    <div style={{ display: "flex", gap: 10, marginTop: 6, flexWrap: "wrap", alignItems: "center" }}>
+                      {c.outreachKind && (
+                        <span style={{ fontFamily: mono, fontSize: 10, color: outreachKindColor(c.outreachKind), textTransform: "uppercase" }}>{c.outreachKind}</span>
+                      )}
+                      {fus.length > 0 && (
+                        <span style={{ fontFamily: mono, fontSize: 11, color: due ? C.red : nf ? C.muted : C.green }}>
+                          {nf ? `Next: ${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : `all done (${fus.length})`}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>Tap a contact to open their account and edit details.</div>
+          </>
+        ) : (
+          <>
         {shownAccounts.length === 0 && (
           <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
             {accounts.length === 0
@@ -2917,7 +3403,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {acc.website && openLink(acc.website, { title: "Open website" })}
                         </div>
                       </td>
-                      <td style={{ ...td, minWidth: 120 }}>{cellInput(acc, "industry", { ph: "Industry", onCommit: updateAccountField })}</td>
+                      <td style={{ ...td, minWidth: 120 }}>
+                        {cellInput(acc, "industry", { ph: "Industry", onCommit: updateAccountField })}
+                        {cellInput(acc, "headcount", { ph: "Headcount", onCommit: updateAccountField })}
+                      </td>
                       <td style={{ ...td, minWidth: 110 }} onClick={(e) => e.stopPropagation()}>
                         <select
                           value={acc.status || ""}
@@ -3011,6 +3500,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   </div>
                   <div style={{ display: "flex", gap: 8, marginTop: 2, flexWrap: "wrap" }}>
                     {acc.industry && <span style={{ fontSize: 12, color: C.muted }}>{acc.industry}</span>}
+                    {acc.headcount && <span style={{ fontSize: 12, color: C.muted }}>· {acc.headcount}</span>}
                     {acc.status && <span style={{ fontFamily: mono, fontSize: 10, color: accountStatusColor(acc.status), textTransform: "uppercase" }}>{accountStatusLabel(acc.status)}</span>}
                   </div>
                   {primary && (
@@ -3031,6 +3521,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
           {isDesktop ? "Click any cell to edit · click Contacts to manage the full contact list." : "Tap a row to manage contacts and details."} Related applications link automatically by company name.
         </div>
+          </>
+        )}
       </>
     );
   };
@@ -3264,15 +3756,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         Fully automatic from the Pipeline — set an entry's status to "outreach" to count it there instead of Apps.
       </div>
 
-      {/* conversion: application/outreach -> closed deal (now includes account-contact outreach/replies in the top-line number) */}
+      {/* conversion: application/outreach -> closed deal. Synced account-contact
+          entries already live in `apps`/`totals`, so no manual merging needed here —
+          just a transparency line showing how much of the total came from contacts. */}
       {(() => {
-        const allContacts = (state.accounts || []).flatMap((a) => a.contacts || []);
-        const contactsOutreached = allContacts.filter(isContactOutreached).length;
-        const contactsReplied = allContacts.filter((c) => ["replied", "discovery call", "ongoing"].includes(c.status)).length;
-        const topOfFunnel = totals.apps + totals.outreach + contactsOutreached;
+        const topOfFunnel = totals.apps + totals.outreach;
+        const fromContacts = apps.filter((a) => a.fromAccountContact).length;
         const pct = (num, den) => (den > 0 ? ((num / den) * 100).toFixed(1) : "0.0");
         const stages = [
-          ["Apps+Outreach → Replies", totals.replies, totals.apps + totals.outreach],
+          ["Apps+Outreach → Replies", totals.replies, topOfFunnel],
           ["Replies → Screens", totals.screens, totals.replies],
           ["Screens → Interviews", totals.interviews, totals.screens],
           ["Interviews → Offers", totals.offers, totals.interviews],
@@ -3286,7 +3778,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               </div>
             </div>
             <div style={{ fontSize: 11, color: C.muted, marginTop: 2, marginBottom: 10 }}>
-              {totals.offers} offer{totals.offers === 1 ? "" : "s"} from {topOfFunnel} total sent (apps, outreach, and account contacts combined)
+              {totals.offers} offer{totals.offers === 1 ? "" : "s"} from {topOfFunnel} total sent{fromContacts > 0 ? ` (${fromContacts} from account contacts)` : ""}
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
               {stages.map(([label, num, den]) => (
@@ -3297,15 +3789,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   </span>
                 </div>
               ))}
-              {allContacts.length > 0 && (
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginTop: 4, paddingTop: 6, borderTop: `1px solid ${C.panelEdge}` }}>
-                  <span style={{ color: C.muted }}>Account contacts: outreach → reply</span>
-                  <span style={{ fontFamily: mono, color: contactsOutreached > 0 ? C.ink : C.muted }}>
-                    {contactsOutreached > 0 ? `${pct(contactsReplied, contactsOutreached)}%` : "—"}{" "}
-                    <span style={{ color: C.muted }}>({contactsReplied}/{contactsOutreached})</span>
-                  </span>
-                </div>
-              )}
             </div>
           </div>
         );
@@ -3852,6 +4335,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           runWeekly={runWeekly}
         />
       )}
+      {patternsModalOpen && (
+        <PatternsModal
+          onClose={() => {
+            setPatternsModalOpen(false);
+            setPatternsNarrative("");
+          }}
+          observations={computeSynthesis(state, apps, zone)}
+          narrative={patternsNarrative}
+          narrativeLoading={patternsNarrativeLoading}
+          onAskCoach={generatePatternsNarrative}
+        />
+      )}
       {confirmDelete && (
         <ConfirmDeleteModal
           label={confirmDelete.label}
@@ -3911,6 +4406,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
         company: entry?.company || "",
         website: entry?.website || "",
         industry: entry?.industry || "",
+        headcount: entry?.headcount || "",
         status: entry?.status || "",
         highConfidence: entry?.highConfidence || false,
         badReasons: entry?.badReasons ? [...entry.badReasons] : [],
@@ -4639,6 +5135,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
             </div>
             <Field label="Website" value={f.website} onChange={set("website")} placeholder="https://acme.com" />
             <Field label="Industry" value={f.industry} onChange={set("industry")} placeholder="e.g. Fintech, SaaS" />
+            <Field label="Headcount" value={f.headcount} onChange={set("headcount")} placeholder="e.g. 50-200, 500+" />
 
             <div style={{ marginBottom: 12 }}>
               <Label>Account status</Label>
@@ -5173,6 +5670,69 @@ function WeeklyReviewModal({ onClose, coach, coachLoading, runWeekly }) {
                     </div>
                   ))}
                 </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div style={{ padding: "14px 20px", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0 }}>
+          <Btn ghost onClick={onClose} style={{ width: "100%" }}>Close</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- patterns popup — pre-verified cross-domain observations ---------- */
+function PatternsModal({ onClose, observations, narrative, narrativeLoading, onAskCoach }) {
+  const kindColor = { watch: C.amber, positive: C.green, info: C.blue };
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 460, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+      >
+        <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
+          <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 6 }}>🧭 Patterns</div>
+          <div style={{ fontSize: 11, color: C.muted, marginBottom: 14, lineHeight: 1.5 }}>
+            Things worth noticing across your data — never verdicts, never a reason to lower your floor. Pure coincidence-spotting; you decide what it means.
+          </div>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden", padding: "0 20px 16px", minHeight: 0 }}>
+          {observations.length === 0 && (
+            <div style={{ color: C.muted, fontSize: 13, padding: "20px 0", textAlign: "center" }}>
+              Nothing stands out right now — either everything's steady, or there isn't quite enough data yet to say anything meaningful.
+            </div>
+          )}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {observations.map((o) => (
+              <div key={o.id} style={{ background: C.bg, border: `1px solid ${kindColor[o.kind] || C.panelEdge}`, borderRadius: 10, padding: "10px 12px" }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                  <div style={{ fontSize: 16, flexShrink: 0 }}>{o.icon}</div>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: kindColor[o.kind] || C.ink }}>{o.title}</div>
+                    <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginTop: 3, wordBreak: "break-word" }}>{o.detail}</div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {observations.length > 0 && (
+            <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${C.panelEdge}` }}>
+              {narrative ? (
+                <div style={{ fontSize: 13, lineHeight: 1.6, color: C.ink, fontStyle: "italic" }}>{narrative}</div>
+              ) : (
+                <Btn ghost onClick={() => onAskCoach(observations)} disabled={narrativeLoading} style={{ width: "100%" }}>
+                  {narrativeLoading ? "Thinking…" : "💬 Ask the coach to reflect on these"}
+                </Btn>
               )}
             </div>
           )}
