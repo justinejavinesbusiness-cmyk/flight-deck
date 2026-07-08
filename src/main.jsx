@@ -980,6 +980,24 @@ function Field({ label, value, onChange, type = "text", placeholder }) {
   );
 }
 
+function TextAreaField({ label, hint, value, onChange, placeholder, rows = 4 }) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <Label>{label}</Label>
+        {hint && <span style={{ fontSize: 10, color: C.muted }}>{hint}</span>}
+      </div>
+      <textarea
+        value={value}
+        placeholder={placeholder || ""}
+        onChange={(e) => onChange(e.target.value)}
+        rows={rows}
+        style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5, fontFamily: sans, minHeight: rows * 22 }}
+      />
+    </div>
+  );
+}
+
 function Btn({ children, onClick, color = C.amber, ghost, disabled, style, title }) {
   return (
     <button
@@ -3574,7 +3592,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .filter((c) => {
         if (!contentSearch.trim()) return true;
         const q = contentSearch.trim().toLowerCase();
-        return [c.title, c.type, c.link, c.notes, ...(c.platforms || [])].filter(Boolean).some((f) => f.toLowerCase().includes(q));
+        return [c.title, c.type, c.link, c.hook, c.outline, c.draft, c.notes, ...(c.platforms || [])].filter(Boolean).some((f) => f.toLowerCase().includes(q));
       })
       .slice()
       .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
@@ -3656,7 +3674,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   <th style={th}>Platforms</th>
                   <th style={th}>Link</th>
                   <th style={th}>Date</th>
-                  <th style={th}>Notes</th>
+                  <th style={th}>Brain dump</th>
                   <th style={{ ...th, width: 50 }}></th>
                 </tr>
               </thead>
@@ -3721,7 +3739,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         style={{ fontSize: 13, fontFamily: mono, background: "transparent", border: "1px solid transparent", borderRadius: 6, color: C.muted, padding: "4px 2px", outline: "none", colorScheme: "dark" }}
                       />
                     </td>
-                    <td style={{ ...td, minWidth: 140 }}>{cellInput(c, "notes", { ph: "notes…", onCommit: updateContentField })}</td>
+                    <td style={{ ...td, minWidth: 160, cursor: "pointer" }} onClick={() => setModal({ kind: "content", entry: c })}>
+                      {(() => {
+                        const combined = [c.hook, c.outline, c.draft, c.notes].filter(Boolean).join(" ");
+                        if (!combined) {
+                          return <span style={{ color: C.muted, fontSize: 12 }}>+ add notes</span>;
+                        }
+                        const preview = combined.slice(0, 60) + (combined.length > 60 ? "…" : "");
+                        return (
+                          <div>
+                            <span style={{ fontSize: 12, color: C.ink }}>📝 {preview}</span>
+                            <div style={{ fontFamily: mono, fontSize: 9, color: C.muted, marginTop: 2 }}>
+                              {[c.hook && "hook", c.outline && "outline", c.draft && "draft", c.notes && "notes"].filter(Boolean).join(" · ")}
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </td>
                     <td style={td} onClick={(e) => e.stopPropagation()}>
                       <button
                         onClick={() => mutate((s) => ({ ...s, content: s.content.filter((x) => x.id !== c.id) }), "Content deleted")}
@@ -3757,6 +3791,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   {[c.type, (c.platforms || []).join(", ")].filter(Boolean).join(" · ") || "—"}
                 </div>
                 {c.date && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>{c.date}</div>}
+                {(() => {
+                  const sections = [c.hook && "hook", c.outline && "outline", c.draft && "draft", c.notes && "notes"].filter(Boolean);
+                  return sections.length > 0 ? (
+                    <div style={{ fontFamily: mono, fontSize: 10, color: C.blue, marginTop: 4 }}>📝 {sections.join(" · ")}</div>
+                  ) : null;
+                })()}
               </SwipeRow>
             ))}
           </div>
@@ -4473,6 +4513,9 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
         platforms: entry?.platforms ? [...entry.platforms] : [],
         link: entry?.link || "",
         date: entry?.date || today(),
+        hook: entry?.hook || "",
+        outline: entry?.outline || "",
+        draft: entry?.draft || "",
         notes: entry?.notes || "",
       };
     return { fund: entry?.fund ?? "", expenses: entry?.expenses ?? "" };
@@ -5449,7 +5492,41 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
               </div>
             </div>
 
-            <Field label="Notes" value={f.notes} onChange={set("notes")} placeholder="ideas, script notes, next step…" />
+            <div style={{ marginTop: 16, marginBottom: 8, fontFamily: mono, fontSize: 10, letterSpacing: "0.18em", color: C.muted, textTransform: "uppercase" }}>
+              Brain dump — as much room as you need
+            </div>
+            <TextAreaField
+              label="💡 Hook / Idea"
+              hint="the core concept"
+              value={f.hook}
+              onChange={set("hook")}
+              placeholder="What's the one-line hook? Why would someone stop scrolling for this?"
+              rows={3}
+            />
+            <TextAreaField
+              label="📝 Outline / Key points"
+              hint="the structure"
+              value={f.outline}
+              onChange={set("outline")}
+              placeholder={"- point one\n- point two\n- point three"}
+              rows={5}
+            />
+            <TextAreaField
+              label="✍️ Draft / Script"
+              hint="the actual write-up"
+              value={f.draft}
+              onChange={set("draft")}
+              placeholder="Write the full draft here — as long as it needs to be."
+              rows={10}
+            />
+            <TextAreaField
+              label="🔗 Notes / references"
+              hint="misc, links, next steps"
+              value={f.notes}
+              onChange={set("notes")}
+              placeholder="Sources, references, follow-up ideas, anything else…"
+              rows={3}
+            />
           </>
         )}
 
