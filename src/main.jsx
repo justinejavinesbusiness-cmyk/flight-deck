@@ -1938,7 +1938,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   /* delete confirmation — asks first, deletes only once confirmed. Scoped to
      Applications and Accounts, both of which can hold a lot of accumulated
      detail (contacts, follow-ups, notes) worth double-checking before losing. */
-  const askDeleteApplication = (a) => setConfirmDelete({ kind: "application", id: a.id, label: a.company || "this application" });
+  const askDeleteApplication = (a) =>
+    setConfirmDelete({
+      kind: "application",
+      id: a.id,
+      label: a.company || "this application",
+      note: a.fromAccountContact ? "This came from an account contact — deleting it will also reset that contact back to \"not contacted yet\" (status, date, and follow-ups cleared)." : null,
+    });
   const askDeleteAccount = (acc) => setConfirmDelete({ kind: "account", id: acc.id, label: acc.company || "this account" });
   const executeConfirmedDelete = () => {
     if (!confirmDelete) return;
@@ -1950,7 +1956,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           deletedApp && deletedApp.fromAccountContact
             ? s.accounts.map((acc) => ({
                 ...acc,
-                contacts: (acc.contacts || []).map((c) => (c.linkedApplicationId === id ? { ...c, linkedApplicationId: null } : c)),
+                contacts: (acc.contacts || []).map((c) =>
+                  c.linkedApplicationId === id
+                    ? { ...c, status: "", contacted: "", outreachKind: "", followUps: [], linkedApplicationId: null }
+                    : c
+                ),
               }))
             : s.accounts;
         if (deletedApp && deletedApp.postShot) edgeDelete("job-posts", deletedApp.postShot).catch(() => {});
@@ -4491,6 +4501,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {confirmDelete && (
         <ConfirmDeleteModal
           label={confirmDelete.label}
+          note={confirmDelete.note}
           onCancel={() => setConfirmDelete(null)}
           onConfirm={executeConfirmedDelete}
         />
@@ -5651,7 +5662,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
 
 /* ---------- sync modal (centered) ---------- */
 /* ---------- delete confirmation (centered) ---------- */
-function ConfirmDeleteModal({ label, onCancel, onConfirm }) {
+function ConfirmDeleteModal({ label, note, onCancel, onConfirm }) {
   return (
     <div
       onClick={onCancel}
@@ -5664,9 +5675,14 @@ function ConfirmDeleteModal({ label, onCancel, onConfirm }) {
         style={{ width: "100%", maxWidth: 360, background: C.panel, border: `1px solid ${C.red}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
       >
         <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>Delete this entry?</div>
-        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16, wordBreak: "break-word" }}>
+        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: note ? 8 : 16, wordBreak: "break-word" }}>
           You're about to delete <span style={{ color: C.ink, fontWeight: 700 }}>{label}</span>. You can undo this afterward with the ↩ Undo button if you change your mind.
         </div>
+        {note && (
+          <div style={{ fontSize: 12, color: C.amber, lineHeight: 1.5, marginBottom: 16, background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 10, padding: "8px 10px" }}>
+            {note}
+          </div>
+        )}
         <div style={{ display: "flex", gap: 10 }}>
           <Btn ghost onClick={onCancel} style={{ flex: 1 }}>Cancel</Btn>
           <Btn onClick={onConfirm} color={C.red} style={{ flex: 1 }}>Delete</Btn>
