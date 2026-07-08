@@ -946,6 +946,32 @@ function Label({ children }) {
   );
 }
 
+/* small, reusable "copy this to clipboard" icon button with its own brief
+   confirmation — no dependency on the app's toast system, so it works
+   equally well inside the Modal or the main table views. */
+function CopyButton({ text, title = "Copy" }) {
+  const [copied, setCopied] = useState(false);
+  if (!text) return null;
+  return (
+    <button
+      onClick={(e) => {
+        e.stopPropagation();
+        (navigator.clipboard?.writeText(text) || Promise.reject()).then(
+          () => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          },
+          () => {}
+        );
+      }}
+      title={copied ? "Copied!" : title}
+      style={{ background: "transparent", border: "none", cursor: "pointer", padding: 0, fontSize: 13, lineHeight: 1, color: copied ? C.green : C.muted, flexShrink: 0 }}
+    >
+      {copied ? "✓" : "📋"}
+    </button>
+  );
+}
+
 const inputStyle = {
   width: "100%",
   minWidth: 0,
@@ -2929,7 +2955,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           </>
                         )}
                       </td>
-                      <td style={{ ...td, minWidth: 110 }}>{cellInput(a, "contact", { ph: "Name" })}</td>
+                      <td style={{ ...td, minWidth: 130 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          {cellInput(a, "contact", { ph: "Name" })}
+                          {!a.fromAccountContact && <CopyButton text={a.email} title="Copy email" />}
+                        </div>
+                      </td>
                       <td style={{ ...td, minWidth: 150 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           {cellInput(a, "email", { ph: "email@…" })}
@@ -3381,7 +3412,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   >
                     <div style={{ fontStyle: "italic", fontWeight: 700, fontSize: 12, color: C.amber, marginBottom: 4 }}>@{c._company}</div>
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                      <div style={{ fontWeight: 700, fontSize: 14 }}>{c.name || "Unnamed"}</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <div style={{ fontWeight: 700, fontSize: 14 }}>{c.name || "Unnamed"}</div>
+                        <CopyButton text={c.email} title="Copy email" />
+                      </div>
                       {c.status && (
                         <span style={{ fontFamily: mono, fontSize: 10, color: contactStatusColor(c.status), textTransform: "uppercase", flexShrink: 0 }}>
                           {contactStatusLabel(c.status)}
@@ -3502,6 +3536,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                               {primary.name || "Unnamed"}{primary.position ? ` · ${primary.position}` : ""}
                               {primary.status && <span style={{ color: contactStatusColor(primary.status), marginLeft: 4 }}>· {primary.status}</span>}
                             </span>
+                            <CopyButton text={primary.email} title="Copy email" />
                             {primary.linkedin && (
                               <a
                                 href={primary.linkedin.startsWith("http") ? primary.linkedin : `https://${primary.linkedin}`}
@@ -4773,9 +4808,18 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
               </div>
             )}
             <Field label="Salary / offer" value={f.salary} onChange={set("salary")} placeholder="e.g. ₱120K–150K/mo or $1,800/mo" />
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, alignItems: "flex-end" }}>
               <Field label="Contact person" value={f.contact} onChange={set("contact")} placeholder="e.g. Jane Cruz" />
-              <Field label="Email" value={f.email} onChange={set("email")} placeholder="jane@acme.com" />
+              <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 12 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <Field label="Email" value={f.email} onChange={set("email")} placeholder="jane@acme.com" />
+                </div>
+                {!entry?.fromAccountContact && (
+                  <div style={{ paddingBottom: 10 }}>
+                    <CopyButton text={f.email} title="Copy email" />
+                  </div>
+                )}
+              </div>
             </div>
             <Field label="Date contacted / applied" type="date" value={f.contacted} onChange={set("contacted")} />
 
@@ -5301,13 +5345,14 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
               const fus = c.followUps || [];
               return (
                 <div key={c.id || i} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10, marginBottom: 8 }}>
-                  <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 6, alignItems: "center" }}>
                     <input
                       value={c.name}
                       placeholder="Contact name"
                       onChange={(e) => setContact({ name: e.target.value })}
                       style={{ ...inputStyle, flex: 1 }}
                     />
+                    <CopyButton text={c.email} title="Copy email" />
                     <button
                       onClick={() => setF((p) => ({ ...p, contacts: p.contacts.filter((_, j) => j !== i) }))}
                       style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0 }}
