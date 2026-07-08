@@ -661,6 +661,16 @@ function migrate(saved) {
   if (!Array.isArray(s.settings.followUpDefaults) || !s.settings.followUpDefaults.length)
     s.settings.followUpDefaults = [...DEFAULT_FOLLOWUPS];
   s.accounts = s.accounts.map((a) => ({ ...a, contacts: Array.isArray(a.contacts) ? a.contacts : [] }));
+  /* one-time cleanup: a past bug dropped linkedApplicationId every time the
+     account form reopened, causing outreach on a contact to spawn a fresh
+     duplicate application instead of updating the existing linked one. Any
+     fromAccountContact application no longer referenced by any contact's
+     linkedApplicationId is an orphan (either the true duplicate left behind,
+     or a contact that's since been removed) — safe to drop. */
+  if (s.applications.some((a) => a.fromAccountContact)) {
+    const liveLinkedIds = new Set(s.accounts.flatMap((a) => (a.contacts || []).map((c) => c.linkedApplicationId).filter(Boolean)));
+    s.applications = s.applications.filter((a) => !a.fromAccountContact || liveLinkedIds.has(a.id));
+  }
   /* legacy single followUpDays → followUps array; records with NO status field
      at all (saved before this feature existed) default to "applied" so old
      data isn't silently reclassified — but a deliberate status: "" (saved
@@ -1890,11 +1900,27 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     if (!confirmDelete) return;
     const { kind, id, label } = confirmDelete;
     if (kind === "application") {
-      mutate((s) => ({ ...s, applications: s.applications.filter((x) => x.id !== id) }), `Deleted ${label}`);
+      mutate((s) => {
+        const deletedApp = s.applications.find((a) => a.id === id);
+        const accounts =
+          deletedApp && deletedApp.fromAccountContact
+            ? s.accounts.map((acc) => ({
+                ...acc,
+                contacts: (acc.contacts || []).map((c) => (c.linkedApplicationId === id ? { ...c, linkedApplicationId: null } : c)),
+              }))
+            : s.accounts;
+        if (deletedApp && deletedApp.postShot) edgeDelete("job-posts", deletedApp.postShot).catch(() => {});
+        return { ...s, applications: s.applications.filter((x) => x.id !== id), accounts };
+      }, `Deleted ${label}`);
     } else if (kind === "account") {
       mutate((s) => {
         const acc = s.accounts.find((x) => x.id === id);
         const linkedIds = new Set((acc?.contacts || []).map((c) => c.linkedApplicationId).filter(Boolean));
+        if (linkedIds.size) {
+          s.applications.forEach((a) => {
+            if (linkedIds.has(a.id) && a.postShot) edgeDelete("job-posts", a.postShot).catch(() => {});
+          });
+        }
         return {
           ...s,
           accounts: s.accounts.filter((x) => x.id !== id),
@@ -1938,6 +1964,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         const oldContacts = entry?.contacts || [];
         const oldAppsById = new Map(s.applications.map((a) => [a.id, a]));
         const { contacts: newContacts, applications: syncedApps } = syncContactsToApplications(data.company, oldContacts, data.contacts || [], s.applications);
+
+        /* any application present before sync but gone after (a contact was removed
+           from the account) may have had a screenshot attached — clean it up so it
+           doesn't sit orphaned in Storage forever */
+        const syncedIds = new Set(syncedApps.map((a) => a.id));
+        oldAppsById.forEach((a, aid) => {
+          if (a.fromAccountContact && a.postShot && !syncedIds.has(aid)) edgeDelete("job-posts", a.postShot).catch(() => {});
+        });
 
         let addWins = [];
         const finalApps = syncedApps.map((a) => {
@@ -3998,7 +4032,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 }
                 setModal({ kind: "session", entry: s, localUrl });
               }}
-              onDelete={() => mutate((st) => ({ ...st, supportSessions: st.supportSessions.filter((y) => y.id !== s.id) }), "Session deleted")}
+              onDelete={() => {
+                mutate((st) => ({ ...st, supportSessions: st.supportSessions.filter((y) => y.id !== s.id) }), "Session deleted");
+                if (s.audioPath) deleteAudio(s.audioPath).catch(() => {});
+                if (s.audioLocal) idbDelete(s.id).catch(() => {});
+              }}
             >
               <div
                 style={
@@ -4423,8 +4461,9 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
               outreachKind: c.outreachKind || "",
               contacted: c.contacted || "",
               followUps: Array.isArray(c.followUps) ? c.followUps.map((f) => ({ ...f })) : [],
+              linkedApplicationId: c.linkedApplicationId || null,
             }))
-          : [{ id: uid(), name: "", position: "", email: "", phone: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [] }],
+          : [{ id: uid(), name: "", position: "", email: "", phone: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], linkedApplicationId: null }],
       };
     if (kind === "content")
       return {
@@ -4623,7 +4662,11 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
                     <img src={shotPublicUrl(f.postShot)} alt="job post" style={{ width: "100%", maxHeight: 140, objectFit: "cover", borderRadius: 10, border: `1px solid ${C.panelEdge}` }} />
                   </a>
                   <button
-                    onClick={() => set("postShot")("")}
+                    onClick={() => {
+                      const oldPath = f.postShot;
+                      set("postShot")("");
+                      if (oldPath) edgeDelete("job-posts", oldPath).catch(() => {});
+                    }}
                     style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, height: 40, cursor: "pointer", flexShrink: 0 }}
                   >
                     ×
@@ -5321,7 +5364,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
               onClick={() =>
                 setF((p) => ({
                   ...p,
-                  contacts: [...(p.contacts || []), { id: uid(), name: "", position: "", email: "", phone: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [] }],
+                  contacts: [...(p.contacts || []), { id: uid(), name: "", position: "", email: "", phone: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], linkedApplicationId: null }],
                 }))
               }
               style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 12 }}
