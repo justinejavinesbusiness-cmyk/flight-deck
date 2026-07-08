@@ -3491,7 +3491,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               <tbody>
                 {shownAccounts.map((acc) => {
                   const contacts = acc.contacts || [];
-                  const primary = contacts[0];
                   const related = relatedApplications(acc.company, apps);
                   const anyDue = contacts.some(isContactDue);
                   const outreachedCount = contacts.filter(isContactOutreached).length;
@@ -3535,21 +3534,21 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           </div>
                         )}
                       </td>
-                      <td style={{ ...td, minWidth: 170, cursor: "pointer" }} onClick={() => setModal({ kind: "account", entry: acc })}>
+                      <td style={{ ...td, minWidth: 190, cursor: "pointer" }} onClick={() => setModal({ kind: "account", entry: acc })}>
                         <div style={{ fontWeight: 700, fontSize: 13, color: contacts.length ? C.ink : C.muted }}>
                           {contacts.length} contact{contacts.length === 1 ? "" : "s"}
                           {anyDue && <span style={{ color: C.red, marginLeft: 6 }}>⚑ due</span>}
                         </div>
-                        {primary && (
-                          <div style={{ fontSize: 11, color: C.muted, marginTop: 2, display: "flex", alignItems: "center", gap: 4 }}>
-                            <span>
-                              {primary.name || "Unnamed"}{primary.position ? ` · ${primary.position}` : ""}
-                              {primary.status && <span style={{ color: contactStatusColor(primary.status), marginLeft: 4 }}>· {primary.status}</span>}
+                        {contacts.map((c) => (
+                          <div key={c.id} style={{ fontSize: 11, color: C.muted, marginTop: 3, display: "flex", alignItems: "center", gap: 4 }}>
+                            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {c.name || "Unnamed"}{c.position ? ` · ${c.position}` : ""}
+                              {c.status && <span style={{ color: contactStatusColor(c.status), marginLeft: 4 }}>· {c.status}</span>}
                             </span>
-                            <CopyButton text={primary.email} title="Copy email" />
-                            {primary.linkedin && (
+                            <CopyButton text={c.email} title="Copy email" />
+                            {c.linkedin && (
                               <a
-                                href={primary.linkedin.startsWith("http") ? primary.linkedin : `https://${primary.linkedin}`}
+                                href={c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`}
                                 target="_blank"
                                 rel="noreferrer"
                                 title="Open LinkedIn profile"
@@ -3560,9 +3559,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                               </a>
                             )}
                           </div>
-                        )}
+                        ))}
                         {outreachedCount > 0 && (
-                          <div style={{ fontFamily: mono, fontSize: 10, color: C.blue, marginTop: 2 }}>{outreachedCount} outreached</div>
+                          <div style={{ fontFamily: mono, fontSize: 10, color: C.blue, marginTop: 4 }}>{outreachedCount} outreached</div>
                         )}
                       </td>
                       <td style={{ ...td, minWidth: 150 }}>
@@ -3603,7 +3602,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {shownAccounts.map((acc) => {
               const contacts = acc.contacts || [];
-              const primary = contacts[0];
               const related = relatedApplications(acc.company, apps);
               const anyDue = contacts.some(isContactDue);
               const outreachedCount = contacts.filter(isContactOutreached).length;
@@ -3628,11 +3626,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                     {acc.headcount && <span style={{ fontSize: 12, color: C.muted }}>· {acc.headcount}</span>}
                     {acc.status && <span style={{ fontFamily: mono, fontSize: 10, color: accountStatusColor(acc.status), textTransform: "uppercase" }}>{accountStatusLabel(acc.status)}</span>}
                   </div>
-                  {primary && (
-                    <div style={{ fontSize: 12, color: C.ink, marginTop: 4 }}>
-                      {primary.name || "Unnamed"}{primary.position ? ` · ${primary.position}` : ""}
+                  {contacts.map((c) => (
+                    <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.ink, marginTop: 4 }}>
+                      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {c.name || "Unnamed"}{c.position ? ` · ${c.position}` : ""}
+                        {c.status && <span style={{ color: contactStatusColor(c.status), marginLeft: 4 }}>· {c.status}</span>}
+                      </span>
+                      <CopyButton text={c.email} title="Copy email" />
                     </div>
-                  )}
+                  ))}
                   <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
                     {outreachedCount > 0 && <span style={{ fontSize: 11, color: C.blue }}>{outreachedCount} outreached</span>}
                     {related.length > 0 && <span style={{ fontSize: 11, color: C.blue }}>{related.length} related app{related.length === 1 ? "" : "s"}</span>}
