@@ -5018,7 +5018,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        style={{ width: "100%", maxWidth: 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+        style={{ width: "100%", maxWidth: ["application", "account"].includes(kind) ? 620 : 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
       >
         <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
           <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 14 }}>{titles[kind]}</div>
@@ -5171,21 +5171,21 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>No touch points logged yet.</div>
             )}
             {(f.touchpoints || []).map((tp, i) => (
-              <div key={tp.id || i} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center" }}>
+              <div key={tp.id || i} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center", flexWrap: "wrap" }}>
                 <input
                   type="date"
                   value={tp.date}
                   onChange={(e) =>
                     setF((p) => ({ ...p, touchpoints: p.touchpoints.map((x, j) => (j === i ? { ...x, date: e.target.value } : x)) }))
                   }
-                  style={{ ...inputStyle, width: "auto", maxWidth: 150, colorScheme: "dark", padding: "8px 8px", fontSize: 13, flexShrink: 0 }}
+                  style={{ ...inputStyle, width: "auto", maxWidth: 150, minWidth: 130, colorScheme: "dark", padding: "8px 8px", fontSize: 13, flexShrink: 0 }}
                 />
                 <select
                   value={tp.channel}
                   onChange={(e) =>
                     setF((p) => ({ ...p, touchpoints: p.touchpoints.map((x, j) => (j === i ? { ...x, channel: e.target.value } : x)) }))
                   }
-                  style={{ ...selectStyle, flex: 1, padding: "8px 10px", fontSize: 13 }}
+                  style={{ ...selectStyle, flex: "1 1 120px", minWidth: 0, padding: "8px 10px", fontSize: 13 }}
                 >
                   <option value="">Channel…</option>
                   {TOUCHPOINT_CHANNELS.map((c) => (
@@ -5198,7 +5198,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   onChange={(e) =>
                     setF((p) => ({ ...p, touchpoints: p.touchpoints.map((x, j) => (j === i ? { ...x, note: e.target.value } : x)) }))
                   }
-                  style={{ ...inputStyle, flex: 1, padding: "8px 10px", fontSize: 13 }}
+                  style={{ ...inputStyle, flex: "1 1 140px", minWidth: 0, padding: "8px 10px", fontSize: 13 }}
                 />
                 <button
                   onClick={() => setF((p) => ({ ...p, touchpoints: p.touchpoints.filter((_, j) => j !== i) }))}
@@ -5932,7 +5932,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                             <select
                               value={tp.channel}
                               onChange={(e) => setContact({ touchpoints: tps.map((x, xi) => (xi === ti ? { ...x, channel: e.target.value } : x)) })}
-                              style={{ fontSize: 10, background: "transparent", border: "none", color: C.ink, outline: "none" }}
+                              style={{ fontSize: 10, background: "transparent", border: "none", color: C.ink, outline: "none", minWidth: 70, cursor: "pointer" }}
                             >
                               <option value="">Channel…</option>
                               {TOUCHPOINT_CHANNELS.map((ch) => (
