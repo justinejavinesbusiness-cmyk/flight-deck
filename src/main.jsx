@@ -47,7 +47,38 @@ const TITLES = {
   HISTORY: "Accomplishments",
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
-const today = () => new Date().toISOString().slice(0, 10);
+/* ---- configurable "day" timezone ----
+   The app's whole notion of "today" (goal targets, due dates, digest,
+   archiving, everything) is driven by this single offset rather than the
+   device's local clock or raw UTC — so it stays consistent regardless of
+   where the device physically is, and can be changed in Settings to whatever
+   country's midnight should decide when the day rolls over. Defaults to the
+   Philippines (UTC+8). Fixed offsets only — no DST handling, since DST rules
+   vary by country and year; this keeps the model simple and predictable. */
+let DAY_TZ_OFFSET_HOURS = 8;
+const setDayTimezoneOffset = (hours) => {
+  DAY_TZ_OFFSET_HOURS = typeof hours === "number" ? hours : 8;
+};
+const TIMEZONE_OPTIONS = [
+  { label: "Philippines (UTC+8)", offset: 8 },
+  { label: "Singapore / Hong Kong / China (UTC+8)", offset: 8 },
+  { label: "Japan / Korea (UTC+9)", offset: 9 },
+  { label: "Australia — Sydney/Melbourne (UTC+10)", offset: 10 },
+  { label: "Australia — Perth (UTC+8)", offset: 8 },
+  { label: "India (UTC+5:30)", offset: 5.5 },
+  { label: "United Arab Emirates (UTC+4)", offset: 4 },
+  { label: "United Kingdom (UTC+0)", offset: 0 },
+  { label: "Germany / France / Central Europe (UTC+1)", offset: 1 },
+  { label: "United States — Eastern (UTC-5)", offset: -5 },
+  { label: "United States — Central (UTC-6)", offset: -6 },
+  { label: "United States — Mountain (UTC-7)", offset: -7 },
+  { label: "United States — Pacific (UTC-8)", offset: -8 },
+  { label: "Canada — Eastern (UTC-5)", offset: -5 },
+];
+const today = () => {
+  const d = new Date(Date.now() + DAY_TZ_OFFSET_HOURS * 3600000);
+  return d.toISOString().slice(0, 10);
+};
 const thisMonth = () => today().slice(0, 7);
 
 /* ---- week + follow-up helpers ---- */
@@ -342,7 +373,12 @@ function computeGoal(goal, apps) {
   const todayMet = actualToday >= todaysTarget;
   const stillRamping = goal.rampEnabled && elapsedCalendarDays < preset.rampDays;
 
-  /* weekly breakdown, Mon-Sat buckets across the whole campaign span, ramp-aware */
+  /* weekly breakdown, Mon-Sat buckets across the whole campaign span, ramp-aware.
+     Same rollover principle as the daily target: a week that beats its target
+     reduces the next week's number; a week that falls short adds the
+     remainder on top of the next week's base target. Carry flows forward
+     week-to-week in one pass, independent of (and in addition to) the daily
+     carry above — they're complementary views of the same underlying data. */
   const weeksMap = new Map();
   let dayCounter = 0;
   for (let d = new Date(goal.startDate + "T00:00:00"); d <= new Date(deadline + "T00:00:00"); d.setDate(d.getDate() + 1)) {
@@ -350,17 +386,23 @@ function computeGoal(goal, apps) {
     if (d.getDay() === 0) continue;
     const wStart = iso(mondayOf(d));
     const label = weekLabel(mondayOf(d));
-    if (!weeksMap.has(label)) weeksMap.set(label, { label, weekStart: wStart, workingDays: 0, target: 0 });
+    if (!weeksMap.has(label)) weeksMap.set(label, { label, weekStart: wStart, workingDays: 0, baseTarget: 0 });
     const wk = weeksMap.get(label);
     wk.workingDays += 1;
-    wk.target += dailyTargetForDay(goal, dayCounter, fullQuota);
+    wk.baseTarget += dailyTargetForDay(goal, dayCounter, fullQuota);
   }
+  let weekCarry = 0;
   const weeks = Array.from(weeksMap.values())
     .sort((a, b) => a.weekStart.localeCompare(b.weekStart))
-    .map((w) => ({
-      ...w,
-      actual: apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length,
-    }));
+    .map((w) => {
+      const actual = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length;
+      const carryIn = weekCarry;
+      const target = Math.max(0, w.baseTarget + carryIn);
+      weekCarry = w.weekStart <= t ? target - actual : 0; /* only carry from weeks that have actually happened; future weeks don't speculatively adjust */
+      return { ...w, target, actual, carryIn };
+    });
+  const thisWeekStart = iso(mondayOf(new Date(t + "T00:00:00")));
+  const thisWeek = weeks.find((w) => w.weekStart === thisWeekStart) || null;
 
   return {
     fullQuota,
@@ -381,6 +423,9 @@ function computeGoal(goal, apps) {
     onPace: actualByNow >= expectedByNow,
     pctComplete: Math.min(100, Math.round((actualTotal / goal.target) * 100)),
     weeks,
+    thisWeeksTarget: thisWeek?.target ?? null,
+    carryIntoThisWeek: thisWeek?.carryIn ?? 0,
+    thisWeeksActual: thisWeek?.actual ?? 0,
   };
 }
 
@@ -639,13 +684,13 @@ function applyTombstones(state) {
    salary, everything) from being lost for good: a flat row is captured
    HERE, before any stripping ever happens, and only ever cleared when the
    person explicitly deletes the backup themselves. */
-const CSV_COLUMNS = ["archivedDate", "type", "company", "role", "contact", "email", "status", "contacted", "outreachKind", "salary", "source", "touchpoints", "notes"];
+const CSV_COLUMNS = ["archivedDate", "type", "company", "role", "contact", "email", "contactPhone", "contactLinkedin", "status", "contacted", "outreachKind", "salary", "source", "touchpoints", "notes"];
 const summarizeTouchpoints = (tps) => (tps || []).map((t) => `${t.channel || "?"} (${t.date}${t.note ? `: ${t.note}` : ""})`).join("; ");
 function csvRowFromApplication(a) {
-  return { archivedDate: today(), type: "application", company: a.company || "", role: a.role || "", contact: a.contact || "", email: a.email || "", status: a.status || "", contacted: a.contacted || "", outreachKind: a.outreachKind || "", salary: a.salary || "", source: a.source || "", touchpoints: summarizeTouchpoints(a.touchpoints), notes: a.notes || "" };
+  return { archivedDate: today(), type: "application", company: a.company || "", role: a.role || "", contact: a.contact || "", email: a.email || "", contactPhone: a.contactPhone || "", contactLinkedin: a.contactLinkedin || "", status: a.status || "", contacted: a.contacted || "", outreachKind: a.outreachKind || "", salary: a.salary || "", source: a.source || "", touchpoints: summarizeTouchpoints(a.touchpoints), notes: a.notes || "" };
 }
 function csvRowFromContact(accountCompany, c) {
-  return { archivedDate: today(), type: "contact", company: accountCompany || "", role: c.position || "", contact: c.name || "", email: c.email || "", status: c.status || "", contacted: c.contacted || "", outreachKind: c.outreachKind || "", salary: "", source: "", touchpoints: summarizeTouchpoints(c.touchpoints), notes: c.notes || "" };
+  return { archivedDate: today(), type: "contact", company: accountCompany || "", role: c.position || "", contact: c.name || "", email: c.email || "", contactPhone: c.phone || "", contactLinkedin: c.linkedin || "", status: c.status || "", contacted: c.contacted || "", outreachKind: c.outreachKind || "", salary: "", source: "", touchpoints: summarizeTouchpoints(c.touchpoints), notes: c.notes || "" };
 }
 function rowsToCsv(rows) {
   const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
@@ -727,7 +772,7 @@ const DEFAULT_STATE = {
   goal: null,
   cycleCount: 0,
   runway: { fund: 1200000, expenses: 50000 },
-  settings: { checkinDay: 1 },
+  settings: { checkinDay: 1, timezoneOffset: 8 },
   lastCheckinMonth: null,
   lastDigestShownDate: null,
   archivedCsvRows: [],
@@ -750,6 +795,7 @@ function migrate(saved) {
   if (!Array.isArray(s.supportSessions)) s.supportSessions = [];
   if (!s.settings || typeof s.settings !== "object") s.settings = { checkinDay: 1 };
   if (!s.settings.checkinDay) s.settings.checkinDay = 1;
+  if (typeof s.settings.timezoneOffset !== "number") s.settings.timezoneOffset = 8;
   if (!Array.isArray(s.settings.followUpDefaults) || !s.settings.followUpDefaults.length)
     s.settings.followUpDefaults = [...DEFAULT_FOLLOWUPS];
   s.accounts = s.accounts.map((a) => ({ ...a, contacts: Array.isArray(a.contacts) ? a.contacts : [] }));
@@ -1613,6 +1659,10 @@ export default function FlightDeck() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.applications, state.goal]);
 
+  /* keep "today" in sync with whatever day-timezone the person has chosen —
+     directly in render so there's no one-tick lag waiting for an effect */
+  setDayTimezoneOffset(state.settings?.timezoneOffset);
+
   /* monthly runway check-in */
   const checkinDay = +state.settings?.checkinDay || 1;
   const checkinDue = new Date().getDate() >= checkinDay && state.lastCheckinMonth !== thisMonth();
@@ -2344,6 +2394,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               .map((d) => Math.max(0, +d || 0))
               .filter((d) => d > 0)
               .slice(0, 10) || DEFAULT_FOLLOWUPS,
+            timezoneOffset: typeof data.timezoneOffset === "number" ? data.timezoneOffset : 8,
           },
         }),
         "Settings updated"
@@ -2868,7 +2919,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .filter((a) => {
         if (!pipeSearch.trim()) return true;
         const q = pipeSearch.trim().toLowerCase();
-        return [a.company, a.contact, a.email, a.notes, a.jobBoardName, a.website, a.role]
+        return [a.company, a.contact, a.email, a.contactPhone, a.contactLinkedin, a.notes, a.jobBoardName, a.website, a.role]
           .filter(Boolean)
           .some((f) => f.toLowerCase().includes(q));
       })
@@ -3246,6 +3297,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           {cellInput(a, "contact", { ph: "Name" })}
                           {!a.fromAccountContact && <CopyButton text={a.email} title="Copy email" />}
+                          {!a.fromAccountContact && a.contactLinkedin && (
+                            <a
+                              href={a.contactLinkedin.startsWith("http") ? a.contactLinkedin : `https://${a.contactLinkedin}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              title="Open LinkedIn profile"
+                              onClick={(e) => e.stopPropagation()}
+                              style={{ color: C.blue, textDecoration: "none", flexShrink: 0 }}
+                            >
+                              🔗
+                            </a>
+                          )}
                         </div>
                         {(a.touchpoints || []).length > 0 && (
                           <button
@@ -4365,6 +4428,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         {w.actual} / {w.target}
                       </div>
                     </div>
+                    {w.carryIn !== 0 && (
+                      <div style={{ fontSize: 10, color: w.carryIn > 0 ? C.red : C.green, marginTop: 2 }}>
+                        {w.carryIn > 0 ? `⬆ +${w.carryIn} carried over from last week's shortfall` : `⬇ ${-w.carryIn} banked from last week's overachievement`}
+                      </div>
+                    )}
                     <div style={{ height: 5, background: C.bg, borderRadius: 3, marginTop: 6, overflow: "hidden" }}>
                       <div style={{ height: "100%", width: `${w.target > 0 ? Math.min(100, (w.actual / w.target) * 100) : 0}%`, background: wOnPace ? C.green : C.amber, borderRadius: 3 }} />
                     </div>
@@ -4536,7 +4604,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       </div>
 
       <div
-        onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay } })}
+        onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay, timezoneOffset: state.settings?.timezoneOffset } })}
         style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 14px", marginBottom: 14, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
       >
         <div style={{ fontSize: 13, color: C.muted }}>Settings: check-in day & follow-up defaults</div>
@@ -4632,7 +4700,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
-            <Btn ghost onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay } })} title="Settings" style={{ padding: "10px 12px" }}>
+            <Btn ghost onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay, timezoneOffset: state.settings?.timezoneOffset } })} title="Settings" style={{ padding: "10px 12px" }}>
               ⚙
             </Btn>
             <Btn ghost onClick={() => setSyncModal(true)} title="Sync across devices" style={{ padding: "10px 12px" }}>
@@ -4892,6 +4960,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         salary: entry?.salary || pre.salary || "",
         contact: entry?.contact || "",
         email: entry?.email || "",
+        contactLinkedin: entry?.contactLinkedin || "",
+        contactPhone: entry?.contactPhone || "",
         contacted: entry?.contacted || "",
         followUps: entry
           ? normFollowUps(entry).map((f) => ({ ...f }))
@@ -4911,7 +4981,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     if (kind === "accomplishment")
       return { text: entry?.text || "", date: entry?.date || today(), category: entry?.category || "Daily focus" };
     if (kind === "checkinDay")
-      return { day: entry?.day ?? 1, followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String) };
+      return { day: entry?.day ?? 1, followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String), timezoneOffset: entry?.timezoneOffset ?? 8 };
     if (kind === "goal")
       return {
         target: entry?.target ?? 500,
@@ -5201,6 +5271,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   </div>
                 )}
               </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <Field label="Phone number" value={f.contactPhone} onChange={set("contactPhone")} placeholder="e.g. +63 917 000 0000" />
+              <Field label="LinkedIn profile" value={f.contactLinkedin} onChange={set("contactLinkedin")} placeholder="https://linkedin.com/in/…" />
             </div>
             <Field label="Date contacted / applied" type="date" value={f.contacted} onChange={set("contacted")} />
 
@@ -5546,6 +5620,20 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
 
         {kind === "checkinDay" && (
           <>
+            <Label>What determines your "day"?</Label>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+              This decides when today flips to tomorrow — for goal targets, due follow-ups, and everything else the app treats as "today." Defaults to the Philippines. Fixed offset only, no daylight saving adjustment.
+            </div>
+            <select
+              value={f.timezoneOffset}
+              onChange={(e) => set("timezoneOffset")(parseFloat(e.target.value))}
+              style={{ ...selectStyle, marginBottom: 16 }}
+            >
+              {TIMEZONE_OPTIONS.map((tz) => (
+                <option key={tz.label} value={tz.offset}>{tz.label}</option>
+              ))}
+            </select>
+
             <Field label="Day of the month for the runway check-in (1–28)" type="number" value={f.day} onChange={set("day")} />
             <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 16 }}>
               On or after this day each month, the Dashboard will remind you to recalculate fund ÷ expenses. Saving new runway numbers marks the month as done.
