@@ -97,6 +97,11 @@ const APP_STATUSES = ["", "outreach", "applied", "followed up", "replied", "scre
 const APP_SOURCES = ["LinkedIn", "Instagram", "Facebook", "Referral", "Job board", "Company site", "X / Twitter", "Other"];
 const JOB_BOARD_OPTIONS = ["Onlinejobs.ph", "Upwork", "Indeed", "Jobstreet", "We Work Remotely", "Other"];
 const OUTREACH_KINDS = ["warm", "cold"];
+/* ---- touch points: a log of individual interactions, distinct from the
+   overall status/outreachKind — e.g. "messaged on Facebook July 5", "cold
+   emailed July 3", each tagged to whichever application or contact it
+   belongs to by simply living nested inside that entry. */
+const TOUCHPOINT_CHANNELS = ["Facebook", "Instagram", "LinkedIn", "Cold email", "Phone call", "Text/SMS", "In person", "Other"];
 const OUTREACH_CHANNELS = ["Email", "Call", "Text", "Other"];
 /* "bad fit" reasons — multi-select, for companies that don't align on comp/values/etc */
 const BAD_FIT_REASONS = ["Salary too low", "Values mismatch", "Culture concerns", "Red flags in process", "Scope creep", "Other"];
@@ -634,12 +639,13 @@ function applyTombstones(state) {
    salary, everything) from being lost for good: a flat row is captured
    HERE, before any stripping ever happens, and only ever cleared when the
    person explicitly deletes the backup themselves. */
-const CSV_COLUMNS = ["archivedDate", "type", "company", "role", "contact", "email", "status", "contacted", "outreachKind", "salary", "source", "notes"];
+const CSV_COLUMNS = ["archivedDate", "type", "company", "role", "contact", "email", "status", "contacted", "outreachKind", "salary", "source", "touchpoints", "notes"];
+const summarizeTouchpoints = (tps) => (tps || []).map((t) => `${t.channel || "?"} (${t.date}${t.note ? `: ${t.note}` : ""})`).join("; ");
 function csvRowFromApplication(a) {
-  return { archivedDate: today(), type: "application", company: a.company || "", role: a.role || "", contact: a.contact || "", email: a.email || "", status: a.status || "", contacted: a.contacted || "", outreachKind: a.outreachKind || "", salary: a.salary || "", source: a.source || "", notes: a.notes || "" };
+  return { archivedDate: today(), type: "application", company: a.company || "", role: a.role || "", contact: a.contact || "", email: a.email || "", status: a.status || "", contacted: a.contacted || "", outreachKind: a.outreachKind || "", salary: a.salary || "", source: a.source || "", touchpoints: summarizeTouchpoints(a.touchpoints), notes: a.notes || "" };
 }
 function csvRowFromContact(accountCompany, c) {
-  return { archivedDate: today(), type: "contact", company: accountCompany || "", role: c.position || "", contact: c.name || "", email: c.email || "", status: c.status || "", contacted: c.contacted || "", outreachKind: c.outreachKind || "", salary: "", source: "", notes: c.notes || "" };
+  return { archivedDate: today(), type: "contact", company: accountCompany || "", role: c.position || "", contact: c.name || "", email: c.email || "", status: c.status || "", contacted: c.contacted || "", outreachKind: c.outreachKind || "", salary: "", source: "", touchpoints: summarizeTouchpoints(c.touchpoints), notes: c.notes || "" };
 }
 function rowsToCsv(rows) {
   const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
@@ -3241,6 +3247,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {cellInput(a, "contact", { ph: "Name" })}
                           {!a.fromAccountContact && <CopyButton text={a.email} title="Copy email" />}
                         </div>
+                        {(a.touchpoints || []).length > 0 && (
+                          <div style={{ fontFamily: mono, fontSize: 9, color: C.blue, marginTop: 2 }}>💬 {a.touchpoints.length} touch pt{a.touchpoints.length === 1 ? "" : "s"}</div>
+                        )}
                       </td>
                       <td style={{ ...td, minWidth: 150 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -3727,6 +3736,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           🔗 LinkedIn
                         </a>
                       )}
+                      {(c.touchpoints || []).length > 0 && (
+                        <span style={{ fontFamily: mono, fontSize: 10, color: C.blue }}>💬 {c.touchpoints.length}</span>
+                      )}
                     </div>
                   </div>
                 );
@@ -3817,6 +3829,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                               {c.status && <span style={{ color: contactStatusColor(c.status), marginLeft: 4 }}>· {c.status}</span>}
                             </span>
                             <CopyButton text={c.email} title="Copy email" />
+                            {(c.touchpoints || []).length > 0 && <span style={{ fontFamily: mono, fontSize: 9, color: C.blue, flexShrink: 0 }}>💬 {c.touchpoints.length}</span>}
                             {c.linkedin && (
                               <a
                                 href={c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`}
@@ -3904,6 +3917,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         {c.status && <span style={{ color: contactStatusColor(c.status), marginLeft: 4 }}>· {c.status}</span>}
                       </span>
                       <CopyButton text={c.email} title="Copy email" />
+                      {(c.touchpoints || []).length > 0 && <span style={{ fontFamily: mono, fontSize: 9, color: C.blue, flexShrink: 0 }}>💬 {c.touchpoints.length}</span>}
                     </div>
                   ))}
                   <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
@@ -4849,6 +4863,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         highConfidence: entry?.highConfidence || false,
         notes: entry?.notes || pre.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
+        touchpoints: entry?.touchpoints ? entry.touchpoints.map((t) => ({ ...t })) : [],
       };
     }
     if (kind === "decision") return { note: entry?.note || "" };
@@ -4889,9 +4904,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               outreachKind: c.outreachKind || "",
               contacted: c.contacted || "",
               followUps: Array.isArray(c.followUps) ? c.followUps.map((f) => ({ ...f })) : [],
+              touchpoints: Array.isArray(c.touchpoints) ? c.touchpoints.map((t) => ({ ...t })) : [],
               linkedApplicationId: c.linkedApplicationId || null,
             }))
-          : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], linkedApplicationId: null }],
+          : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], linkedApplicationId: null }],
       };
     if (kind === "content")
       return {
@@ -5147,6 +5163,59 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               </div>
             </div>
             <Field label="Date contacted / applied" type="date" value={f.contacted} onChange={set("contacted")} />
+
+            <div style={{ marginBottom: 4 }}>
+              <Label>Touch points (every message sent — Facebook, cold email, etc.)</Label>
+            </div>
+            {(f.touchpoints || []).length === 0 && (
+              <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>No touch points logged yet.</div>
+            )}
+            {(f.touchpoints || []).map((tp, i) => (
+              <div key={tp.id || i} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center" }}>
+                <input
+                  type="date"
+                  value={tp.date}
+                  onChange={(e) =>
+                    setF((p) => ({ ...p, touchpoints: p.touchpoints.map((x, j) => (j === i ? { ...x, date: e.target.value } : x)) }))
+                  }
+                  style={{ ...inputStyle, width: "auto", maxWidth: 150, colorScheme: "dark", padding: "8px 8px", fontSize: 13, flexShrink: 0 }}
+                />
+                <select
+                  value={tp.channel}
+                  onChange={(e) =>
+                    setF((p) => ({ ...p, touchpoints: p.touchpoints.map((x, j) => (j === i ? { ...x, channel: e.target.value } : x)) }))
+                  }
+                  style={{ ...selectStyle, flex: 1, padding: "8px 10px", fontSize: 13 }}
+                >
+                  <option value="">Channel…</option>
+                  {TOUCHPOINT_CHANNELS.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+                <input
+                  value={tp.note}
+                  placeholder="note (optional)"
+                  onChange={(e) =>
+                    setF((p) => ({ ...p, touchpoints: p.touchpoints.map((x, j) => (j === i ? { ...x, note: e.target.value } : x)) }))
+                  }
+                  style={{ ...inputStyle, flex: 1, padding: "8px 10px", fontSize: 13 }}
+                />
+                <button
+                  onClick={() => setF((p) => ({ ...p, touchpoints: p.touchpoints.filter((_, j) => j !== i) }))}
+                  style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 8, width: 32, height: 36, cursor: "pointer", flexShrink: 0 }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            <button
+              onClick={() =>
+                setF((p) => ({ ...p, touchpoints: [...(p.touchpoints || []), { id: uid(), date: today(), channel: "", note: "" }] }))
+              }
+              style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 16 }}
+            >
+              + Add touch point
+            </button>
 
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <Label>Follow-up schedule (days after contact)</Label>
@@ -5853,6 +5922,42 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     </div>
                   )}
 
+                  <div style={{ marginTop: 6, marginBottom: 2 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 10, color: C.muted }}>Touch points:</span>
+                      {(c.touchpoints || []).map((tp, ti) => {
+                        const tps = c.touchpoints || [];
+                        return (
+                          <div key={tp.id || ti} style={{ display: "flex", alignItems: "center", gap: 3, background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "2px 4px 2px 6px" }}>
+                            <select
+                              value={tp.channel}
+                              onChange={(e) => setContact({ touchpoints: tps.map((x, xi) => (xi === ti ? { ...x, channel: e.target.value } : x)) })}
+                              style={{ fontSize: 10, background: "transparent", border: "none", color: C.ink, outline: "none" }}
+                            >
+                              <option value="">Channel…</option>
+                              {TOUCHPOINT_CHANNELS.map((ch) => (
+                                <option key={ch} value={ch} style={{ background: C.panel }}>{ch}</option>
+                              ))}
+                            </select>
+                            <span style={{ fontFamily: mono, fontSize: 9, color: C.muted }}>{tp.date}</span>
+                            <button
+                              onClick={() => setContact({ touchpoints: tps.filter((_, xi) => xi !== ti) })}
+                              style={{ background: "transparent", border: "none", color: C.muted, fontSize: 11, cursor: "pointer", padding: 0, lineHeight: 1 }}
+                            >
+                              ×
+                            </button>
+                          </div>
+                        );
+                      })}
+                      <button
+                        onClick={() => setContact({ touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "", note: "" }] })}
+                        style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, fontSize: 10, borderRadius: 10, padding: "3px 8px", cursor: "pointer" }}
+                      >
+                        + touch point
+                      </button>
+                    </div>
+                  </div>
+
                   <input
                     value={c.notes}
                     placeholder="Notes (optional)"
@@ -5866,7 +5971,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               onClick={() =>
                 setF((p) => ({
                   ...p,
-                  contacts: [...(p.contacts || []), { id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], linkedApplicationId: null }],
+                  contacts: [...(p.contacts || []), { id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], linkedApplicationId: null }],
                 }))
               }
               style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 12 }}
