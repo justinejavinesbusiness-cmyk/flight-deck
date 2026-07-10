@@ -1141,6 +1141,24 @@ function Panel({ title, children, style }) {
    A fixed palette would repeat once slices exceed its length (e.g. the
    "Where found" donut, which breaks out individual job board names). */
 const donutColor = (i) => `hsl(${((i * 137.508) % 360).toFixed(1)}, 68%, 62%)`;
+/* status colors are semantic, not just index-distinct — evenly spaced at
+   exactly 36° apart (guaranteeing every pair is at least that far apart)
+   and deliberately placed so "applied" sits firmly in green and "bad fit"
+   sits firmly in red, on opposite sides of the wheel rather than wherever
+   array order happens to put them. */
+const STATUS_DONUT_HUE = {
+  "bad fit": 0,
+  rejected: 36,
+  screening: 72,
+  interview: 108,
+  applied: 144,
+  offer: 180,
+  outreach: 216,
+  "followed up": 252,
+  "final round": 288,
+  replied: 324,
+};
+const statusDonutColor = (s) => (s ? `hsl(${STATUS_DONUT_HUE[s]}, 65%, 58%)` : C.muted);
 function Donut({ data, centerLabel }) {
   const total = data.reduce((a, d) => a + d.value, 0);
   const R = 52, SW = 22, CIRC = 2 * Math.PI * R;
@@ -1159,7 +1177,7 @@ function Donut({ data, centerLabel }) {
                 cy="70"
                 r={R}
                 fill="none"
-                stroke={donutColor(i)}
+                stroke={d.color || donutColor(i)}
                 strokeWidth={SW}
                 strokeDasharray={`${Math.max(frac * CIRC - 1.5, 0)} ${CIRC}`}
                 strokeDashoffset={-offset * CIRC}
@@ -1185,7 +1203,7 @@ function Donut({ data, centerLabel }) {
             const i = data.indexOf(d);
             return (
               <div key={d.label} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
-                <span style={{ width: 10, height: 10, borderRadius: 5, background: donutColor(i), flexShrink: 0 }} />
+                <span style={{ width: 10, height: 10, borderRadius: 5, background: d.color || donutColor(i), flexShrink: 0 }} />
                 <span style={{ color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.label}</span>
                 <span style={{ fontFamily: mono, color: C.muted, marginLeft: "auto" }}>
                   {d.value} · {Math.round((d.value / total) * 100)}%
@@ -2551,7 +2569,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           centerLabel={donutMode === "status" ? "BY STATUS" : donutMode === "source" ? "BY SOURCE" : "OUTREACH"}
           data={
             donutMode === "status"
-              ? APP_STATUSES.map((s) => ({ label: statusLabel(s), value: apps.filter((a) => (a.status ?? "") === s).length }))
+              ? APP_STATUSES.map((s) => ({ label: statusLabel(s), value: apps.filter((a) => (a.status ?? "") === s).length, color: statusDonutColor(s) }))
               : donutMode === "source"
               ? (() => {
                   const buckets = new Map();
