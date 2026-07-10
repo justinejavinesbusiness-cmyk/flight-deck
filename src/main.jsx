@@ -577,6 +577,57 @@ function computeSynthesis(state, apps, zone) {
   return observations;
 }
 
+/* ---- CRM housekeeping agent ----
+   Archiving hides an entry from your active view but changes NOTHING about
+   its status/contacted date/tags — so goal progress, funnel totals, and
+   conversion % (all of which read live from this same data) are completely
+   unaffected. Only after 30 MORE untouched days does an archived entry get
+   tombstoned: stripped down to just {status, contacted, outreachKind} — the
+   only fields any counting logic ever reads — with everything else (company,
+   contact, notes, salary, screenshots, etc.) discarded for good. From your
+   perspective it's gone; the numbers never move regardless. Applies uniformly
+   to every archived entry, with no special-casing by status. */
+const HOUSEKEEPING_STALE_DAYS = 30;
+const HOUSEKEEPING_TOMBSTONE_DAYS = 30;
+function computeHousekeepingProposals(state, apps) {
+  const cutoff = addDays(today(), -HOUSEKEEPING_STALE_DAYS);
+  const proposals = [];
+
+  apps.forEach((a) => {
+    if (a.archivedAt || a.tombstoned || a.fromAccountContact) return; /* synced entries are managed via their contact, not directly */
+    if (!isOpenApp(a)) return; /* closed already — nothing to clean up */
+    if (!a.contacted || a.contacted > cutoff) return;
+    const days = Math.floor((new Date(today()) - new Date(a.contacted)) / 86400000);
+    proposals.push({ type: "application", id: a.id, label: a.company || "Unnamed application", detail: `No activity in ${days} days (last: ${a.contacted}).` });
+  });
+
+  (state.accounts || []).forEach((acc) => {
+    (acc.contacts || []).forEach((c) => {
+      if (c.archivedAt || c.tombstoned) return;
+      if (!isContactOpen(c) || !isContactOutreached(c)) return;
+      if (!c.contacted || c.contacted > cutoff) return;
+      const days = Math.floor((new Date(today()) - new Date(c.contacted)) / 86400000);
+      proposals.push({ type: "contact", accountId: acc.id, contactId: c.id, label: `${c.name || "Unnamed"} @ ${acc.company || "Unnamed account"}`, detail: `No activity in ${days} days (last: ${c.contacted}).` });
+    });
+  });
+
+  return proposals;
+}
+/* pure: applies the tombstone step to any application/contact whose archive
+   window has expired. Called from migrate() so it runs automatically. */
+function applyTombstones(state) {
+  const cutoff = addDays(today(), -HOUSEKEEPING_TOMBSTONE_DAYS);
+  const applications = state.applications.map((a) => {
+    if (!a.archivedAt || a.tombstoned || a.archivedAt > cutoff) return a;
+    return { id: a.id, status: a.status, contacted: a.contacted, outreachKind: a.outreachKind || "", fromAccountContact: !!a.fromAccountContact, archivedAt: a.archivedAt, tombstoned: true };
+  });
+  const accounts = state.accounts.map((acc) => ({
+    ...acc,
+    contacts: (acc.contacts || []).filter((c) => !(c.archivedAt && c.archivedAt <= cutoff)), /* contacts aren't counted directly, so once their window expires they're simply removed — their linked application (if any) already has its own independent archive/tombstone lifecycle */
+  }));
+  return { ...state, applications, accounts };
+}
+
 
 /* multi-step follow-ups: a.followUps = [{days, done}] counted from `contacted` */
 const DEFAULT_FOLLOWUPS = [3, 7, 14];
@@ -641,6 +692,7 @@ const DEFAULT_STATE = {
   runway: { fund: 1200000, expenses: 50000 },
   settings: { checkinDay: 1 },
   lastCheckinMonth: null,
+  lastDigestShownDate: null,
 };
 const DEFAULT_COACH = { dailyDate: null, daily: null, dailyDone: [], weeklyDate: null, weekly: null };
 
@@ -688,7 +740,7 @@ function migrate(saved) {
     const { applications, ...rest } = w;
     return rest;
   });
-  return s;
+  return applyTombstones(s);
 }
 
 /* ---------- merge (two-way sync without data loss) ---------- */
@@ -1120,6 +1172,8 @@ export default function FlightDeck() {
   const [confirmDelete, setConfirmDelete] = useState(null); /* { kind: "application"|"account", id, label } */
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false);
   const [patternsModalOpen, setPatternsModalOpen] = useState(false);
+  const [housekeepingOpen, setHousekeepingOpen] = useState(false);
+  const [digestOpen, setDigestOpen] = useState(false);
   const [patternsNarrative, setPatternsNarrative] = useState("");
   const [patternsNarrativeLoading, setPatternsNarrativeLoading] = useState(false);
   const [toast, setToast] = useState("");
@@ -1355,12 +1409,13 @@ export default function FlightDeck() {
 
   /* ============ DERIVED ============ */
   const apps = state.applications;
-  const dueList = useMemo(() => apps.filter(isDue), [apps]);
+  const dueList = useMemo(() => apps.filter((a) => isDue(a) && !a.archivedAt), [apps]);
   const dueContactsCount = useMemo(
-    () => (state.accounts || []).reduce((s, a) => s + (a.contacts || []).filter(isContactDue).length, 0),
+    () => (state.accounts || []).reduce((s, a) => s + (a.contacts || []).filter((c) => isContactDue(c) && !c.archivedAt).length, 0),
     [state.accounts]
   );
   const totalDueCount = dueList.length + dueContactsCount;
+  const housekeepingProposals = useMemo(() => computeHousekeepingProposals(state, apps), [state.applications, state.accounts]);
 
   const weekRows = useMemo(() => {
     const map = new Map();
@@ -1675,6 +1730,37 @@ Respond with ONLY valid JSON, no markdown fences, no preamble, exactly this shap
     setPatternsNarrativeLoading(false);
   };
 
+  /* job post parser — extracts structured fields from raw pasted text into a
+     draft the person still reviews and saves themselves; never auto-creates
+     an application on its own. */
+  const parseJobPostText = async (text) => {
+    const prompt = `Extract structured job posting information from the following raw, possibly messy pasted text (likely copied from LinkedIn, Indeed, a job board, or similar). Return ONLY valid JSON, no markdown fences, no preamble, exactly this shape:
+{"company": "...", "role": "...", "salary": "...", "source": "...", "jobBoardName": "...", "postLink": "...", "notes": "..."}
+
+Rules:
+- "source" must be exactly one of: LinkedIn, Instagram, Facebook, Referral, Job board, Company site, X / Twitter, Other — or "" if genuinely unclear.
+- "jobBoardName" is only set if source is "Job board" and a specific board is named or clearly inferable (e.g. Onlinejobs.ph, Upwork, Indeed) — otherwise "".
+- "postLink" is only set if an actual URL literally appears in the text — otherwise "".
+- "salary" exactly as written in the post if a figure or range is mentioned, otherwise "".
+- "notes" is a 1-2 sentence factual summary of key requirements/responsibilities — never opinion, never "".
+- If any field can't be determined from the text, use an empty string. Never guess or invent a value that isn't actually supported by the text.
+
+TEXT:
+${text}`;
+    const res = await fetch("/api/coach", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    const textOut = (data.content || [])
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    return JSON.parse(textOut.replace(/```json|```/g, "").trim());
+  };
+
   const runDaily = async () => {
     setCoachLoading("daily");
     setCoachError("");
@@ -1800,6 +1886,22 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     if ((state.supportSessions || []).some(isExpiredAudio)) setExpiryOpen(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
+
+  const digestChecked = useRef(false);
+  useEffect(() => {
+    if (!loaded || digestChecked.current) return;
+    digestChecked.current = true;
+    if (state.lastDigestShownDate === today()) return;
+    const g = state.goal ? computeGoal(state.goal, apps) : null;
+    const patterns = computeSynthesis(state, apps, zone);
+    if (totalDueCount === 0 && !g && patterns.length === 0) return; /* nothing worth a digest today */
+    setDigestOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+  const dismissDigest = () => {
+    setDigestOpen(false);
+    mutate((s) => ({ ...s, lastDigestShownDate: today() }));
+  };
 
   const clearAudioFields = (id) =>
     mutate(
@@ -1934,6 +2036,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   };
   const setContentGoalPerWeek = (n) =>
     mutate((s) => ({ ...s, contentGoal: { ...s.contentGoal, perWeek: Math.max(0, Math.round(+n || 0)) } }));
+
+  /* housekeeping: archive hides an entry from the active view without
+     touching status/contacted/tags, so nothing it feeds (goal, funnel,
+     conversion) ever moves. A background migration step tombstones it after
+     30 more untouched days — see applyTombstones. */
+  const archiveApplication = (id) =>
+    mutate((s) => ({ ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, archivedAt: today() } : a)) }), "Archived");
+  const archiveContact = (accountId, contactId) =>
+    mutate(
+      (s) => ({
+        ...s,
+        accounts: s.accounts.map((acc) =>
+          acc.id === accountId ? { ...acc, contacts: (acc.contacts || []).map((c) => (c.id === contactId ? { ...c, archivedAt: today() } : c)) } : acc
+        ),
+      }),
+      "Archived"
+    );
 
   /* delete confirmation — asks first, deletes only once confirmed. Scoped to
      Applications and Accounts, both of which can hold a lot of accumulated
@@ -2602,15 +2721,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   const renderPipeline = () => {
     const filters = [
-      { key: "active", label: `Active (${apps.filter(isOpenApp).length})` },
-      { key: "highConfidence", label: `⭐ High confidence (${apps.filter((a) => a.highConfidence).length})` },
-      { key: "blank", label: `◻ Saved for later (${apps.filter(isBlankStatus).length})` },
+      { key: "active", label: `Active (${apps.filter((a) => isOpenApp(a) && !a.archivedAt).length})` },
+      { key: "highConfidence", label: `⭐ High confidence (${apps.filter((a) => a.highConfidence && !a.archivedAt).length})` },
+      { key: "blank", label: `◻ Saved for later (${apps.filter((a) => isBlankStatus(a) && !a.archivedAt).length})` },
       { key: "due", label: `⚑ Due (${dueList.length})` },
-      { key: "badFit", label: `🚫 Bad fit (${apps.filter(isBadFit).length})` },
-      { key: "closed", label: `Closed (${apps.filter((a) => !isOpenApp(a)).length})` },
-      { key: "all", label: `All (${apps.length})` },
+      { key: "badFit", label: `🚫 Bad fit (${apps.filter((a) => isBadFit(a) && !a.archivedAt).length})` },
+      { key: "closed", label: `Closed (${apps.filter((a) => !isOpenApp(a) && !a.archivedAt).length})` },
+      { key: "all", label: `All (${apps.filter((a) => !a.archivedAt).length})` },
+      { key: "archived", label: `🗄 Archived (${apps.filter((a) => !!a.archivedAt).length})` },
     ];
     const shown = apps
+      .filter((a) => (pipeFilter === "archived" ? !!a.archivedAt : !a.archivedAt))
       .filter((a) =>
         pipeFilter === "due"
           ? isDue(a)
@@ -2639,7 +2760,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .sort((a, b) => (b.contacted || "").localeCompare(a.contacted || ""));
 
     const totalContacts = (state.accounts || []).reduce((s, a) => s + (a.contacts || []).length, 0);
-    const realApplicationsCount = apps.filter((a) => !a.fromAccountContact).length;
+    const realApplicationsCount = apps.filter((a) => !a.fromAccountContact && !a.archivedAt).length;
 
     return (
       <>
@@ -2673,8 +2794,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               </button>
             ))}
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <Btn onClick={() => setModal({ kind: "application", entry: null })}>+ Track application</Btn>
+            <Btn ghost onClick={() => setModal({ kind: "parseJobPost", entry: null })}>📋 Paste job post</Btn>
             <Btn
               ghost
               onClick={() => {
@@ -2683,6 +2805,45 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             >
               + Track account
             </Btn>
+            <button
+              onClick={() => setHousekeepingOpen(true)}
+              title="CRM Housekeeping"
+              style={{
+                position: "relative",
+                background: "transparent",
+                border: `1px solid ${C.panelEdge}`,
+                borderRadius: 10,
+                width: 42,
+                height: 42,
+                cursor: "pointer",
+                fontSize: 16,
+                color: C.muted,
+                flexShrink: 0,
+              }}
+            >
+              🧹
+              {housekeepingProposals.length > 0 && (
+                <span
+                  style={{
+                    position: "absolute",
+                    top: -4,
+                    right: -4,
+                    minWidth: 16,
+                    height: 16,
+                    borderRadius: 8,
+                    background: C.red,
+                    color: "#2b0b0b",
+                    fontFamily: mono,
+                    fontSize: 9,
+                    fontWeight: 800,
+                    lineHeight: "16px",
+                    padding: "0 4px",
+                  }}
+                >
+                  {housekeepingProposals.length}
+                </span>
+              )}
+            </button>
           </div>
         </div>
 
@@ -3271,8 +3432,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const accFilters = [
       { key: "active", label: `Active (${accounts.filter(isAccountOpen).length})` },
       { key: "highConfidence", label: `⭐ High confidence (${accounts.filter((a) => a.highConfidence).length})` },
-      { key: "outreachedContacts", label: `Outreached contacts (${accounts.filter((a) => (a.contacts || []).some(isContactOutreached)).length})` },
-      { key: "dueContacts", label: `⚑ Due contacts (${accounts.filter((a) => (a.contacts || []).some(isContactDue)).length})` },
+      { key: "outreachedContacts", label: `Outreached contacts (${accounts.filter((a) => (a.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)).length})` },
+      { key: "dueContacts", label: `⚑ Due contacts (${accounts.filter((a) => (a.contacts || []).some((c) => isContactDue(c) && !c.archivedAt)).length})` },
       { key: "closed", label: `Closed (${accounts.filter((a) => a.status === "closed").length})` },
       { key: "badFit", label: `🚫 Bad fit (${accounts.filter((a) => a.status === "bad fit").length})` },
       { key: "all", label: `All (${accounts.length})` },
@@ -3284,9 +3445,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           : accFilter === "highConfidence"
           ? !!acc.highConfidence
           : accFilter === "outreachedContacts"
-          ? (acc.contacts || []).some(isContactOutreached)
+          ? (acc.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)
           : accFilter === "dueContacts"
-          ? (acc.contacts || []).some(isContactDue)
+          ? (acc.contacts || []).some((c) => isContactDue(c) && !c.archivedAt)
           : accFilter === "closed"
           ? acc.status === "closed"
           : accFilter === "badFit"
@@ -3309,7 +3470,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
       ? accounts
-          .flatMap((acc) => (acc.contacts || []).map((c) => ({ ...c, _company: acc.company || "Unnamed", _accountId: acc.id })))
+          .flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt).map((c) => ({ ...c, _company: acc.company || "Unnamed", _accountId: acc.id })))
           .filter((c) => (accFilter === "outreachedContacts" ? isContactOutreached(c) : isContactDue(c)))
           .filter((c) => {
             if (!accSearch.trim()) return true;
@@ -3490,7 +3651,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               </thead>
               <tbody>
                 {shownAccounts.map((acc) => {
-                  const contacts = acc.contacts || [];
+                  const contacts = (acc.contacts || []).filter((c) => !c.archivedAt);
                   const related = relatedApplications(acc.company, apps);
                   const anyDue = contacts.some(isContactDue);
                   const outreachedCount = contacts.filter(isContactOutreached).length;
@@ -3601,7 +3762,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         {rowsMobile && (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {shownAccounts.map((acc) => {
-              const contacts = acc.contacts || [];
+              const contacts = (acc.contacts || []).filter((c) => !c.archivedAt);
               const related = relatedApplications(acc.company, apps);
               const anyDue = contacts.some(isContactDue);
               const outreachedCount = contacts.filter(isContactOutreached).length;
@@ -4439,7 +4600,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         </div>
       )}
 
-      {modal && (
+      {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
           modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, syncKey: syncKeyRef.current }}
@@ -4447,6 +4608,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           onSave={saveModal}
           totals={totals}
           apps={apps}
+        />
+      )}
+      {modal && modal.kind === "parseJobPost" && (
+        <ParseJobPostModal
+          onClose={() => setModal(null)}
+          onParse={parseJobPostText}
+          onParsed={(prefill) => setModal({ kind: "application", entry: null, prefill })}
         />
       )}
       {syncModal && <SyncModal currentKey={syncKeyRef.current} onClose={() => setSyncModal(false)} onSwitch={switchSyncKey} flash={flash} />}
@@ -4500,6 +4668,22 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           onAskCoach={generatePatternsNarrative}
         />
       )}
+      {housekeepingOpen && (
+        <HousekeepingModal
+          onClose={() => setHousekeepingOpen(false)}
+          proposals={housekeepingProposals}
+          onArchive={(p) => (p.type === "application" ? archiveApplication(p.id) : archiveContact(p.accountId, p.contactId))}
+          onArchiveAll={(list) => list.forEach((p) => (p.type === "application" ? archiveApplication(p.id) : archiveContact(p.accountId, p.contactId)))}
+        />
+      )}
+      {digestOpen && (
+        <MorningDigestModal
+          onClose={dismissDigest}
+          dueCount={totalDueCount}
+          goalInfo={state.goal ? computeGoal(state.goal, apps) : null}
+          topPattern={computeSynthesis(state, apps, zone)[0] || null}
+        />
+      )}
       {confirmDelete && (
         <ConfirmDeleteModal
           label={confirmDelete.label}
@@ -4515,17 +4699,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 function Modal({ modal, onClose, onSave, totals, apps }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
-    if (kind === "application")
+    if (kind === "application") {
+      const pre = modal.prefill || {};
       return {
-        company: entry?.company || "",
-        role: entry?.role || "",
+        company: entry?.company || pre.company || "",
+        role: entry?.role || pre.role || "",
         website: entry?.website || "",
-        source: entry?.source || "",
-        jobBoardName: entry?.jobBoardName || "",
-        postLink: entry?.postLink || "",
+        source: entry?.source || pre.source || "",
+        jobBoardName: entry?.jobBoardName || pre.jobBoardName || "",
+        postLink: entry?.postLink || pre.postLink || "",
         postShot: entry?.postShot || "",
         screenshotLink: entry?.screenshotLink || "",
-        salary: entry?.salary || "",
+        salary: entry?.salary || pre.salary || "",
         contact: entry?.contact || "",
         email: entry?.email || "",
         contacted: entry?.contacted || "",
@@ -4537,9 +4722,10 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
         outreachChannel: entry?.outreachChannel || "",
         badReasons: entry?.badReasons ? [...entry.badReasons] : [],
         highConfidence: entry?.highConfidence || false,
-        notes: entry?.notes || "",
+        notes: entry?.notes || pre.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
       };
+    }
     if (kind === "decision") return { note: entry?.note || "" };
     if (kind === "session") return {};
     if (kind === "accomplishment")
@@ -5354,6 +5540,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
 
             <Label>Contacts</Label>
             {(f.contacts || []).map((c, i) => {
+              if (c.archivedAt) return null; /* archived — hidden from view, still present in data until it fully ages out */
               const setContact = (patch) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, ...patch } : x)) }));
               const fus = c.followUps || [];
               return (
@@ -5366,6 +5553,13 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
                       style={{ ...inputStyle, flex: 1 }}
                     />
                     <CopyButton text={c.email} title="Copy email" />
+                    <button
+                      onClick={() => setContact({ archivedAt: today() })}
+                      title="Archive — hides it from view, doesn't affect any counted numbers"
+                      style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0, fontSize: 14 }}
+                    >
+                      🗄
+                    </button>
                     <button
                       onClick={() => setF((p) => ({ ...p, contacts: p.contacts.filter((_, j) => j !== i) }))}
                       style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0 }}
@@ -5973,6 +6167,193 @@ function PatternsModal({ onClose, observations, narrative, narrativeLoading, onA
 
         <div style={{ padding: "14px 20px", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0 }}>
           <Btn ghost onClick={onClose} style={{ width: "100%" }}>Close</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- CRM housekeeping popup ---------- */
+/* ---------- job post parser popup ---------- */
+/* ---------- morning digest popup ---------- */
+function MorningDigestModal({ onClose, dueCount, goalInfo, topPattern }) {
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 420, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+      >
+        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 4 }}>☀️ Here's where things stand</div>
+        <div style={{ fontSize: 11, color: C.muted, marginBottom: 16 }}>Today, at a glance.</div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {dueCount > 0 && (
+            <div style={{ background: C.bg, border: `1px solid ${C.red}`, borderRadius: 10, padding: "10px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 13, color: C.ink }}>⚑ Follow-ups due</span>
+              <span style={{ fontFamily: mono, fontSize: 16, fontWeight: 800, color: C.red }}>{dueCount}</span>
+            </div>
+          )}
+          {goalInfo && (
+            <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 13, color: C.ink }}>🎯 Today's target</span>
+              <span style={{ fontFamily: mono, fontSize: 16, fontWeight: 800, color: goalInfo.actualToday >= goalInfo.todaysTarget ? C.green : C.amber }}>
+                {goalInfo.actualToday}/{goalInfo.todaysTarget}
+              </span>
+            </div>
+          )}
+          {topPattern && (
+            <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.ink }}>{topPattern.icon} {topPattern.title}</div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 3, lineHeight: 1.5 }}>{topPattern.detail}</div>
+            </div>
+          )}
+          {dueCount === 0 && !goalInfo && !topPattern && (
+            <div style={{ fontSize: 13, color: C.muted, textAlign: "center", padding: "10px 0" }}>Nothing urgent — a clean slate today.</div>
+          )}
+        </div>
+
+        <Btn onClick={onClose} style={{ width: "100%", marginTop: 16 }}>Got it</Btn>
+      </div>
+    </div>
+  );
+}
+
+function ParseJobPostModal({ onClose, onParsed, onParse }) {
+  const [text, setText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 480, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+      >
+        <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
+          <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 6 }}>📋 Paste a job post</div>
+          <div style={{ fontSize: 11, color: C.muted, marginBottom: 14, lineHeight: 1.5 }}>
+            Paste the raw text of a listing — company, role, salary, and source get extracted into a draft you still review and save yourself. Nothing is created automatically.
+          </div>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: "0 20px 16px", minHeight: 0 }}>
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="Paste the full job post here…"
+            rows={12}
+            autoFocus
+            style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5, fontFamily: sans, minHeight: 220 }}
+          />
+          {error && <div style={{ fontSize: 12, color: C.red, marginTop: 8 }}>{error}</div>}
+        </div>
+        <div style={{ padding: "14px 20px", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0, display: "flex", gap: 10 }}>
+          <Btn ghost onClick={onClose} style={{ flex: 1 }}>Cancel</Btn>
+          <Btn
+            onClick={async () => {
+              if (!text.trim() || loading) return;
+              setLoading(true);
+              setError("");
+              try {
+                const parsed = await onParse(text);
+                onParsed(parsed);
+              } catch (e) {
+                setError("Couldn't parse that — check connection and retry, or open a blank draft and fill it in yourself.");
+              }
+              setLoading(false);
+            }}
+            disabled={loading || !text.trim()}
+            style={{ flex: 1 }}
+          >
+            {loading ? "Parsing…" : "Parse & continue"}
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HousekeepingModal({ onClose, proposals, onArchive, onArchiveAll }) {
+  const [skipped, setSkipped] = useState(() => new Set());
+  const visible = proposals.filter((p) => !skipped.has(p.type + (p.id || p.contactId)));
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 460, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+      >
+        <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
+          <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 6 }}>🧹 CRM Housekeeping</div>
+          <div style={{ fontSize: 11, color: C.muted, marginBottom: 14, lineHeight: 1.5 }}>
+            Nothing here changes your goal progress, funnel totals, or conversion % — archiving just tucks a stale entry out of your active view. It stays fully counted, and only gets stripped down to a bare record after another 30 untouched days.
+          </div>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden", padding: "0 20px 16px", minHeight: 0 }}>
+          {visible.length === 0 && (
+            <div style={{ color: C.muted, fontSize: 13, padding: "20px 0", textAlign: "center" }}>
+              Nothing stale right now — everything's either recent or already archived.
+            </div>
+          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {visible.map((p) => {
+              const key = p.type + (p.id || p.contactId);
+              return (
+                <div key={key} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px" }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.ink }}>{p.label}</div>
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 2, lineHeight: 1.5 }}>{p.detail}</div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <Btn
+                      onClick={() => {
+                        onArchive(p);
+                        setSkipped((s) => new Set(s).add(key));
+                      }}
+                      style={{ padding: "6px 12px", fontSize: 11 }}
+                    >
+                      🗄 Archive
+                    </Btn>
+                    <Btn ghost onClick={() => setSkipped((s) => new Set(s).add(key))} style={{ padding: "6px 12px", fontSize: 11 }}>
+                      Skip
+                    </Btn>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div style={{ padding: "14px 20px", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0, display: "flex", gap: 10 }}>
+          {visible.length > 0 && (
+            <Btn
+              ghost
+              onClick={() => {
+                onArchiveAll(visible);
+                setSkipped((s) => {
+                  const next = new Set(s);
+                  visible.forEach((p) => next.add(p.type + (p.id || p.contactId)));
+                  return next;
+                });
+              }}
+              style={{ flex: 1 }}
+            >
+              Archive all ({visible.length})
+            </Btn>
+          )}
+          <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
         </div>
       </div>
     </div>
