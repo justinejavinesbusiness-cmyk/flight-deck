@@ -3248,7 +3248,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {!a.fromAccountContact && <CopyButton text={a.email} title="Copy email" />}
                         </div>
                         {(a.touchpoints || []).length > 0 && (
-                          <div style={{ fontFamily: mono, fontSize: 9, color: C.blue, marginTop: 2 }}>💬 {a.touchpoints.length} touch pt{a.touchpoints.length === 1 ? "" : "s"}</div>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setModal({ kind: "application", entry: a });
+                            }}
+                            title="Edit touch points"
+                            style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 9, marginTop: 2, padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                          >
+                            💬 {a.touchpoints.length} touch pt{a.touchpoints.length === 1 ? "" : "s"}
+                          </button>
                         )}
                       </td>
                       <td style={{ ...td, minWidth: 150 }}>
@@ -3737,7 +3746,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         </a>
                       )}
                       {(c.touchpoints || []).length > 0 && (
-                        <span style={{ fontFamily: mono, fontSize: 10, color: C.blue }}>💬 {c.touchpoints.length}</span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (acc) setModal({ kind: "account", entry: acc });
+                          }}
+                          title="Edit touch points"
+                          style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 10, padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                        >
+                          💬 {c.touchpoints.length}
+                        </button>
                       )}
                     </div>
                   </div>
@@ -3829,7 +3847,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                               {c.status && <span style={{ color: contactStatusColor(c.status), marginLeft: 4 }}>· {c.status}</span>}
                             </span>
                             <CopyButton text={c.email} title="Copy email" />
-                            {(c.touchpoints || []).length > 0 && <span style={{ fontFamily: mono, fontSize: 9, color: C.blue, flexShrink: 0 }}>💬 {c.touchpoints.length}</span>}
+                            {(c.touchpoints || []).length > 0 && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setModal({ kind: "account", entry: acc });
+                                }}
+                                title="Edit touch points"
+                                style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 9, flexShrink: 0, padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                              >
+                                💬 {c.touchpoints.length}
+                              </button>
+                            )}
                             {c.linkedin && (
                               <a
                                 href={c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`}
@@ -3917,7 +3946,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         {c.status && <span style={{ color: contactStatusColor(c.status), marginLeft: 4 }}>· {c.status}</span>}
                       </span>
                       <CopyButton text={c.email} title="Copy email" />
-                      {(c.touchpoints || []).length > 0 && <span style={{ fontFamily: mono, fontSize: 9, color: C.blue, flexShrink: 0 }}>💬 {c.touchpoints.length}</span>}
+                      {(c.touchpoints || []).length > 0 && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setModal({ kind: "account", entry: acc });
+                          }}
+                          title="Edit touch points"
+                          style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 9, flexShrink: 0, padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                        >
+                          💬 {c.touchpoints.length}
+                        </button>
+                      )}
                     </div>
                   ))}
                   <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
