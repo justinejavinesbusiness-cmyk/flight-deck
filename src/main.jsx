@@ -628,6 +628,37 @@ function applyTombstones(state) {
   return { ...state, applications, accounts };
 }
 
+/* ---- CSV backup, captured at the moment something is archived ----
+   Tombstoning strips a record down to bare counting fields 30 days after
+   archiving — this is what keeps the full detail (company, contact, notes,
+   salary, everything) from being lost for good: a flat row is captured
+   HERE, before any stripping ever happens, and only ever cleared when the
+   person explicitly deletes the backup themselves. */
+const CSV_COLUMNS = ["archivedDate", "type", "company", "role", "contact", "email", "status", "contacted", "outreachKind", "salary", "source", "notes"];
+function csvRowFromApplication(a) {
+  return { archivedDate: today(), type: "application", company: a.company || "", role: a.role || "", contact: a.contact || "", email: a.email || "", status: a.status || "", contacted: a.contacted || "", outreachKind: a.outreachKind || "", salary: a.salary || "", source: a.source || "", notes: a.notes || "" };
+}
+function csvRowFromContact(accountCompany, c) {
+  return { archivedDate: today(), type: "contact", company: accountCompany || "", role: c.position || "", contact: c.name || "", email: c.email || "", status: c.status || "", contacted: c.contacted || "", outreachKind: c.outreachKind || "", salary: "", source: "", notes: c.notes || "" };
+}
+function rowsToCsv(rows) {
+  const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const lines = [CSV_COLUMNS.join(","), ...rows.map((r) => CSV_COLUMNS.map((k) => esc(r[k])).join(","))];
+  return lines.join("\n");
+}
+function triggerCsvDownload(rows, filename) {
+  const csv = rowsToCsv(rows);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 
 /* multi-step follow-ups: a.followUps = [{days, done}] counted from `contacted` */
 const DEFAULT_FOLLOWUPS = [3, 7, 14];
@@ -693,6 +724,8 @@ const DEFAULT_STATE = {
   settings: { checkinDay: 1 },
   lastCheckinMonth: null,
   lastDigestShownDate: null,
+  archivedCsvRows: [],
+  lastCsvPromptDate: null,
 };
 const DEFAULT_COACH = { dailyDate: null, daily: null, dailyDone: [], weeklyDate: null, weekly: null };
 
@@ -705,6 +738,7 @@ function migrate(saved) {
   if (!Array.isArray(s.applications)) s.applications = [];
   if (!Array.isArray(s.accounts)) s.accounts = [];
   if (!Array.isArray(s.content)) s.content = [];
+  if (!Array.isArray(s.archivedCsvRows)) s.archivedCsvRows = [];
   if (!s.contentGoal || typeof s.contentGoal !== "object") s.contentGoal = { perWeek: 3 };
   if (!Array.isArray(s.accomplishments)) s.accomplishments = [];
   if (!Array.isArray(s.supportSessions)) s.supportSessions = [];
@@ -1101,7 +1135,12 @@ function Panel({ title, children, style }) {
 }
 
 /* ---------- donut analytics (pure SVG) ---------- */
-const DONUT_COLORS = ["#F5B942", "#7DB0F7", "#4ADE80", "#F87171", "#C084FC", "#34D399", "#FB923C", "#7A8699"];
+/* generates a color per index using the golden angle (~137.5°) — this spreads
+   hues maximally around the color wheel so no two slices ever land on the
+   same (or a visually adjacent) color, no matter how many slices there are.
+   A fixed palette would repeat once slices exceed its length (e.g. the
+   "Where found" donut, which breaks out individual job board names). */
+const donutColor = (i) => `hsl(${((i * 137.508) % 360).toFixed(1)}, 68%, 62%)`;
 function Donut({ data, centerLabel }) {
   const total = data.reduce((a, d) => a + d.value, 0);
   const R = 52, SW = 22, CIRC = 2 * Math.PI * R;
@@ -1120,7 +1159,7 @@ function Donut({ data, centerLabel }) {
                 cy="70"
                 r={R}
                 fill="none"
-                stroke={DONUT_COLORS[i % DONUT_COLORS.length]}
+                stroke={donutColor(i)}
                 strokeWidth={SW}
                 strokeDasharray={`${Math.max(frac * CIRC - 1.5, 0)} ${CIRC}`}
                 strokeDashoffset={-offset * CIRC}
@@ -1146,7 +1185,7 @@ function Donut({ data, centerLabel }) {
             const i = data.indexOf(d);
             return (
               <div key={d.label} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
-                <span style={{ width: 10, height: 10, borderRadius: 5, background: DONUT_COLORS[i % DONUT_COLORS.length], flexShrink: 0 }} />
+                <span style={{ width: 10, height: 10, borderRadius: 5, background: donutColor(i), flexShrink: 0 }} />
                 <span style={{ color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.label}</span>
                 <span style={{ fontFamily: mono, color: C.muted, marginLeft: "auto" }}>
                   {d.value} · {Math.round((d.value / total) * 100)}%
@@ -1542,7 +1581,10 @@ export default function FlightDeck() {
         }
         return { ...s, goal: nextGoal, accomplishments: nextAccomplishments, cycleCount: nextCycleCount };
       });
-      if (shouldSnapshotCycle) flash("🏁 Goal complete — Cycle snapshot saved to Wins");
+      if (shouldSnapshotCycle) {
+        flash("🏁 Goal complete — Cycle snapshot saved to Wins");
+        if (state.archivedCsvRows.length) setCsvPromptOpen(true);
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.applications, state.goal]);
@@ -1733,24 +1775,29 @@ Respond with ONLY valid JSON, no markdown fences, no preamble, exactly this shap
   /* job post parser — extracts structured fields from raw pasted text into a
      draft the person still reviews and saves themselves; never auto-creates
      an application on its own. */
-  const parseJobPostText = async (text) => {
-    const prompt = `Extract structured job posting information from the following raw, possibly messy pasted text (likely copied from LinkedIn, Indeed, a job board, or similar). Return ONLY valid JSON, no markdown fences, no preamble, exactly this shape:
+  const parseJobPostText = async ({ url, text }) => {
+    const extractionRules = `Return ONLY valid JSON, no markdown fences, no preamble, exactly this shape:
 {"company": "...", "role": "...", "salary": "...", "source": "...", "jobBoardName": "...", "postLink": "...", "notes": "..."}
 
 Rules:
 - "source" must be exactly one of: LinkedIn, Instagram, Facebook, Referral, Job board, Company site, X / Twitter, Other — or "" if genuinely unclear.
 - "jobBoardName" is only set if source is "Job board" and a specific board is named or clearly inferable (e.g. Onlinejobs.ph, Upwork, Indeed) — otherwise "".
-- "postLink" is only set if an actual URL literally appears in the text — otherwise "".
+- "postLink" is the URL of the posting itself if one is known — otherwise "".
 - "salary" exactly as written in the post if a figure or range is mentioned, otherwise "".
 - "notes" is a 1-2 sentence factual summary of key requirements/responsibilities — never opinion, never "".
-- If any field can't be determined from the text, use an empty string. Never guess or invent a value that isn't actually supported by the text.
+- If any field can't be determined, use an empty string. Never guess or invent a value that isn't actually supported by what you found.`;
 
-TEXT:
-${text}`;
+    const prompt = url
+      ? `Fetch and read the job posting at this URL, then extract structured information from its actual content: ${url}\n\nIf the page can't be fetched directly, use web search to find the posting's content (or close paraphrases of it, e.g. cached/aggregator copies) and extract from that instead. Set "postLink" to "${url}" regardless.\n\n${extractionRules}`
+      : `Extract structured job posting information from the following raw, possibly messy pasted text (likely copied from LinkedIn, Indeed, a job board, or similar).\n\n${extractionRules}\n\nTEXT:\n${text}`;
+
+    const body = { prompt };
+    if (url) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+
     const res = await fetch("/api/coach", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
@@ -1903,6 +1950,25 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     mutate((s) => ({ ...s, lastDigestShownDate: today() }));
   };
 
+  /* every 28 days (or whenever a goal cycle completes — see the milestone
+     effect below), remind the person their archive backup exists and is
+     worth downloading. Purely a reminder — Download/Delete always live in
+     Settings regardless. */
+  const [csvPromptOpen, setCsvPromptOpen] = useState(false);
+  const csvPromptChecked = useRef(false);
+  useEffect(() => {
+    if (!loaded || csvPromptChecked.current) return;
+    csvPromptChecked.current = true;
+    if (!state.archivedCsvRows.length) return;
+    const dueForPrompt = !state.lastCsvPromptDate || state.lastCsvPromptDate <= addDays(today(), -28);
+    if (dueForPrompt) setCsvPromptOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+  const snoozeCsvPrompt = () => {
+    setCsvPromptOpen(false);
+    mutate((s) => ({ ...s, lastCsvPromptDate: today() }));
+  };
+
   const clearAudioFields = (id) =>
     mutate(
       (s) => ({
@@ -2040,19 +2106,32 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   /* housekeeping: archive hides an entry from the active view without
      touching status/contacted/tags, so nothing it feeds (goal, funnel,
      conversion) ever moves. A background migration step tombstones it after
-     30 more untouched days — see applyTombstones. */
+     30 more untouched days — see applyTombstones. Before that ever happens,
+     a full-detail snapshot is captured into the CSV backup below, so nothing
+     is really lost even once the record itself gets stripped down. */
   const archiveApplication = (id) =>
-    mutate((s) => ({ ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, archivedAt: today() } : a)) }), "Archived");
-  const archiveContact = (accountId, contactId) =>
-    mutate(
-      (s) => ({
+    mutate((s) => {
+      const a = s.applications.find((x) => x.id === id);
+      const row = a ? csvRowFromApplication(a) : null;
+      return {
         ...s,
-        accounts: s.accounts.map((acc) =>
-          acc.id === accountId ? { ...acc, contacts: (acc.contacts || []).map((c) => (c.id === contactId ? { ...c, archivedAt: today() } : c)) } : acc
+        applications: s.applications.map((x) => (x.id === id ? { ...x, archivedAt: today() } : x)),
+        archivedCsvRows: row ? [...s.archivedCsvRows, row] : s.archivedCsvRows,
+      };
+    }, "Archived");
+  const archiveContact = (accountId, contactId) =>
+    mutate((s) => {
+      const acc = s.accounts.find((a) => a.id === accountId);
+      const c = acc?.contacts.find((x) => x.id === contactId);
+      const row = c ? csvRowFromContact(acc.company, c) : null;
+      return {
+        ...s,
+        accounts: s.accounts.map((a) =>
+          a.id === accountId ? { ...a, contacts: (a.contacts || []).map((x) => (x.id === contactId ? { ...x, archivedAt: today() } : x)) } : a
         ),
-      }),
-      "Archived"
-    );
+        archivedCsvRows: row ? [...s.archivedCsvRows, row] : s.archivedCsvRows,
+      };
+    }, "Archived");
 
   /* delete confirmation — asks first, deletes only once confirmed. Scoped to
      Applications and Accounts, both of which can hold a lot of accumulated
@@ -2162,8 +2241,21 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? s.accounts.map((acc) => (acc.id === entry.id ? { ...acc, ...data, contacts: newContacts } : acc))
           : [{ id: uid(), ...data, contacts: newContacts }, ...s.accounts];
 
+        /* capture a CSV backup row for any contact newly archived via the
+           form's manual archive button (before it ever reaches tombstoning) */
+        const oldContactsById = new Map(oldContacts.map((c) => [c.id, c]));
+        const newCsvRows = newContacts
+          .filter((c) => c.archivedAt && !oldContactsById.get(c.id)?.archivedAt)
+          .map((c) => csvRowFromContact(data.company, c));
+
         if (addWins.length) winMsg = addWins.map((w) => w.text).join(" · ");
-        return { ...s, accounts, applications: finalApps, accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments };
+        return {
+          ...s,
+          accounts,
+          applications: finalApps,
+          accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments,
+          archivedCsvRows: newCsvRows.length ? [...s.archivedCsvRows, ...newCsvRows] : s.archivedCsvRows,
+        };
       }, entry ? "Account updated" : "Account tracked");
       if (!entry) setCrmView("accounts"); /* land on the Accounts table after creating one */
       if (winMsg) setTimeout(() => flash(winMsg), 400);
@@ -2796,7 +2888,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <Btn onClick={() => setModal({ kind: "application", entry: null })}>+ Track application</Btn>
-            <Btn ghost onClick={() => setModal({ kind: "parseJobPost", entry: null })}>📋 Paste job post</Btn>
+            <Btn ghost onClick={() => setModal({ kind: "parseJobPost", entry: null })}>🔗 Add from job post link</Btn>
             <Btn
               ghost
               onClick={() => {
@@ -4603,11 +4695,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, syncKey: syncKeyRef.current }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
           apps={apps}
+          onDownloadCsv={() => {
+            triggerCsvDownload(state.archivedCsvRows, `flight-deck-archive-${today()}.csv`);
+            mutate((s) => ({ ...s, lastCsvPromptDate: today() }));
+          }}
+          onDeleteCsvRows={() => mutate((s) => ({ ...s, archivedCsvRows: [] }), "Archive backup cleared")}
         />
       )}
       {modal && modal.kind === "parseJobPost" && (
@@ -4684,6 +4781,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           topPattern={computeSynthesis(state, apps, zone)[0] || null}
         />
       )}
+      {csvPromptOpen && (
+        <CsvBackupPromptModal
+          onClose={snoozeCsvPrompt}
+          count={state.archivedCsvRows.length}
+          onDownload={() => {
+            triggerCsvDownload(state.archivedCsvRows, `flight-deck-archive-${today()}.csv`);
+            mutate((s) => ({ ...s, lastCsvPromptDate: today() }));
+          }}
+        />
+      )}
       {confirmDelete && (
         <ConfirmDeleteModal
           label={confirmDelete.label}
@@ -4696,7 +4803,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave, totals, apps }) {
+function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
     if (kind === "application") {
@@ -4785,6 +4892,7 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
   });
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
   const [shotBusy, setShotBusy] = useState(false);
+  const [confirmClearCsv, setConfirmClearCsv] = useState(false);
   const [shotErr, setShotErr] = useState("");
   const [customBoard, setCustomBoard] = useState(
     () => kind === "application" && !!entry?.jobBoardName && !JOB_BOARD_OPTIONS.includes(entry.jobBoardName)
@@ -5349,6 +5457,37 @@ function Modal({ modal, onClose, onSave, totals, apps }) {
             >
               + Add follow-up
             </button>
+
+            <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <Label>🧹 Housekeeping archive backup</Label>
+              <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+                Every entry the Housekeeping agent archives is captured here first, in full, before it's ever stripped down. Nothing here affects your goal or funnel numbers either way.
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
+                <span style={{ fontSize: 13, color: C.ink }}>{modal.archivedCsvCount || 0} archived {modal.archivedCsvCount === 1 ? "entry" : "entries"} backed up</span>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <Btn ghost onClick={onDownloadCsv} disabled={!modal.archivedCsvCount} style={{ flex: 1 }}>
+                  ⬇ Download CSV
+                </Btn>
+                {confirmClearCsv ? (
+                  <Btn
+                    color={C.red}
+                    onClick={() => {
+                      onDeleteCsvRows();
+                      setConfirmClearCsv(false);
+                    }}
+                    style={{ flex: 1 }}
+                  >
+                    Confirm delete?
+                  </Btn>
+                ) : (
+                  <Btn ghost onClick={() => setConfirmClearCsv(true)} disabled={!modal.archivedCsvCount} style={{ flex: 1 }}>
+                    Delete backup
+                  </Btn>
+                )}
+              </div>
+            </div>
           </>
         )}
 
@@ -6176,6 +6315,40 @@ function PatternsModal({ onClose, observations, narrative, narrativeLoading, onA
 /* ---------- CRM housekeeping popup ---------- */
 /* ---------- job post parser popup ---------- */
 /* ---------- morning digest popup ---------- */
+/* ---------- CSV backup reminder popup ---------- */
+function CsvBackupPromptModal({ onClose, count, onDownload }) {
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 380, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+      >
+        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 8 }}>🧹 Archive backup ready</div>
+        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16 }}>
+          {count} archived {count === 1 ? "entry" : "entries"} {count === 1 ? "is" : "are"} backed up in full. Worth downloading a copy for your own records — you can always do this later from Settings too.
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <Btn ghost onClick={onClose} style={{ flex: 1 }}>Not now</Btn>
+          <Btn
+            onClick={() => {
+              onDownload();
+              onClose();
+            }}
+            style={{ flex: 1 }}
+          >
+            ⬇ Download
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MorningDigestModal({ onClose, dueCount, goalInfo, topPattern }) {
   return (
     <div
@@ -6224,9 +6397,11 @@ function MorningDigestModal({ onClose, dueCount, goalInfo, topPattern }) {
 }
 
 function ParseJobPostModal({ onClose, onParsed, onParse }) {
+  const [url, setUrl] = useState("");
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const canParse = url.trim() || text.trim();
 
   return (
     <div
@@ -6242,17 +6417,29 @@ function ParseJobPostModal({ onClose, onParsed, onParse }) {
         <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
           <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 6 }}>📋 Paste a job post</div>
           <div style={{ fontSize: 11, color: C.muted, marginBottom: 14, lineHeight: 1.5 }}>
-            Paste the raw text of a listing — company, role, salary, and source get extracted into a draft you still review and save yourself. Nothing is created automatically.
+            Drop the job post link and it'll fetch and extract company, role, salary, and source into a draft you still review and save yourself. Nothing is created automatically.
           </div>
         </div>
         <div style={{ flex: 1, overflowY: "auto", padding: "0 20px 16px", minHeight: 0 }}>
+          <Label>Job post link</Label>
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://…"
+            autoFocus
+            style={{ ...inputStyle, marginBottom: 14 }}
+          />
+          <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "4px 0 12px" }}>
+            <div style={{ flex: 1, height: 1, background: C.panelEdge }} />
+            <span style={{ fontSize: 10, color: C.muted, letterSpacing: "0.1em" }}>OR PASTE TEXT INSTEAD</span>
+            <div style={{ flex: 1, height: 1, background: C.panelEdge }} />
+          </div>
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder="Paste the full job post here…"
-            rows={12}
-            autoFocus
-            style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5, fontFamily: sans, minHeight: 220 }}
+            placeholder="If the link can't be fetched (paywalled, login-gated, etc.), paste the raw text here"
+            rows={8}
+            style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5, fontFamily: sans, minHeight: 150 }}
           />
           {error && <div style={{ fontSize: 12, color: C.red, marginTop: 8 }}>{error}</div>}
         </div>
@@ -6260,18 +6447,18 @@ function ParseJobPostModal({ onClose, onParsed, onParse }) {
           <Btn ghost onClick={onClose} style={{ flex: 1 }}>Cancel</Btn>
           <Btn
             onClick={async () => {
-              if (!text.trim() || loading) return;
+              if (!canParse || loading) return;
               setLoading(true);
               setError("");
               try {
-                const parsed = await onParse(text);
+                const parsed = await onParse({ url: url.trim(), text: text.trim() });
                 onParsed(parsed);
               } catch (e) {
-                setError("Couldn't parse that — check connection and retry, or open a blank draft and fill it in yourself.");
+                setError(url.trim() ? "Couldn't fetch that link — try pasting the post's text instead." : "Couldn't parse that — check connection and retry, or open a blank draft and fill it in yourself.");
               }
               setLoading(false);
             }}
-            disabled={loading || !text.trim()}
+            disabled={loading || !canParse}
             style={{ flex: 1 }}
           >
             {loading ? "Parsing…" : "Parse & continue"}
