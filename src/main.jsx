@@ -3310,18 +3310,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                             </a>
                           )}
                         </div>
-                        {(a.touchpoints || []).length > 0 && (
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setModal({ kind: "application", entry: a });
-                            }}
-                            title="Edit touch points"
-                            style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 9, marginTop: 2, padding: 0, cursor: "pointer", textDecoration: "underline" }}
-                          >
-                            💬 {a.touchpoints.length} touch pt{a.touchpoints.length === 1 ? "" : "s"}
-                          </button>
-                        )}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setModal({ kind: "application", entry: a });
+                          }}
+                          title="Edit touch points"
+                          style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 9, marginTop: 2, padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                        >
+                          {(a.touchpoints || []).length > 0 ? `💬 ${a.touchpoints.length} touch pt${a.touchpoints.length === 1 ? "" : "s"}` : "+ add a touch point"}
+                        </button>
                       </td>
                       <td style={{ ...td, minWidth: 150 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -3808,18 +3806,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           🔗 LinkedIn
                         </a>
                       )}
-                      {(c.touchpoints || []).length > 0 && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (acc) setModal({ kind: "account", entry: acc });
-                          }}
-                          title="Edit touch points"
-                          style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 10, padding: 0, cursor: "pointer", textDecoration: "underline" }}
-                        >
-                          💬 {c.touchpoints.length}
-                        </button>
-                      )}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (acc) setModal({ kind: "account", entry: acc });
+                        }}
+                        title="Edit touch points"
+                        style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 10, padding: 0, cursor: "pointer", textDecoration: "underline" }}
+                      >
+                        {(c.touchpoints || []).length > 0 ? `💬 ${c.touchpoints.length}` : "+ add a touch point"}
+                      </button>
                     </div>
                   </div>
                 );
@@ -3910,18 +3906,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                               {c.status && <span style={{ color: contactStatusColor(c.status), marginLeft: 4 }}>· {c.status}</span>}
                             </span>
                             <CopyButton text={c.email} title="Copy email" />
-                            {(c.touchpoints || []).length > 0 && (
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setModal({ kind: "account", entry: acc });
-                                }}
-                                title="Edit touch points"
-                                style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 9, flexShrink: 0, padding: 0, cursor: "pointer", textDecoration: "underline" }}
-                              >
-                                💬 {c.touchpoints.length}
-                              </button>
-                            )}
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setModal({ kind: "account", entry: acc });
+                              }}
+                              title="Edit touch points"
+                              style={{ background: "transparent", border: "none", color: C.blue, fontFamily: mono, fontSize: 9, flexShrink: 0, padding: 0, cursor: "pointer", textDecoration: "underline", whiteSpace: "nowrap" }}
+                            >
+                              {(c.touchpoints || []).length > 0 ? `💬 ${c.touchpoints.length}` : "+ touch point"}
+                            </button>
                             {c.linkedin && (
                               <a
                                 href={c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`}
