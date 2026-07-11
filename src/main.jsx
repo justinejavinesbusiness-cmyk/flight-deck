@@ -5122,7 +5122,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        style={{ width: "100%", maxWidth: ["application", "account"].includes(kind) ? 620 : 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+        style={{ width: "100%", maxWidth: ["application", "account"].includes(kind) ? 620 : kind === "content" ? 760 : 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
       >
         <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
           <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 14 }}>{titles[kind]}</div>
@@ -6187,7 +6187,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               value={f.hook}
               onChange={set("hook")}
               placeholder="What's the one-line hook? Why would someone stop scrolling for this?"
-              rows={3}
+              rows={4}
             />
             <TextAreaField
               label="📝 Outline / Key points"
@@ -6195,7 +6195,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               value={f.outline}
               onChange={set("outline")}
               placeholder={"- point one\n- point two\n- point three"}
-              rows={5}
+              rows={6}
             />
             <TextAreaField
               label="✍️ Draft / Script"
@@ -6203,7 +6203,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               value={f.draft}
               onChange={set("draft")}
               placeholder="Write the full draft here — as long as it needs to be."
-              rows={10}
+              rows={16}
             />
             <TextAreaField
               label="🔗 Notes / references"
@@ -6211,7 +6211,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               value={f.notes}
               onChange={set("notes")}
               placeholder="Sources, references, follow-up ideas, anything else…"
-              rows={3}
+              rows={4}
             />
           </>
         )}
