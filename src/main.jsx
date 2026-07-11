@@ -3215,8 +3215,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1700 }}>
               <thead>
                 <tr>
-                  <th style={{ ...th, width: 34 }}>⭐</th>
-                  <th style={th}>Company / Website</th>
+                  <th style={{ ...th, width: 34, position: "sticky", left: 0, zIndex: 3, background: C.panel }}>⭐</th>
+                  <th style={{ ...th, position: "sticky", left: 34, zIndex: 3, background: C.panel, boxShadow: `2px 0 0 ${C.panelEdge}` }}>Company / Website</th>
                   <th style={th}>Role</th>
                   <th style={th}>Source / Board</th>
                   <th style={th}>Contact</th>
@@ -3239,7 +3239,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   const doneCount = fus.filter((x) => x.done).length;
                   return (
                     <tr key={a.id} style={{ background: due ? "rgba(248,113,113,0.06)" : a.highConfidence ? "rgba(245,185,66,0.05)" : "transparent" }}>
-                      <td style={{ ...td, textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
+                      <td style={{ ...td, textAlign: "center", position: "sticky", left: 0, zIndex: 2, background: C.panel }} onClick={(e) => e.stopPropagation()}>
                         <button
                           onClick={() => updateAppField(a.id, "highConfidence", !a.highConfidence)}
                           title={a.highConfidence ? "High confidence — click to unmark" : "Mark as high confidence"}
@@ -3248,7 +3248,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {a.highConfidence ? "⭐" : "☆"}
                         </button>
                       </td>
-                      <td style={{ ...td, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 170 }}>
+                      <td style={{ ...td, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 170, position: "sticky", left: 34, zIndex: 2, background: C.panel, boxShadow: `2px 0 0 ${C.panelEdge}` }}>
                         {cellInput(a, "company", { ph: "Company" })}
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           {cellInput(a, "website", { ph: "website.com" })}
@@ -3838,8 +3838,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1150 }}>
               <thead>
                 <tr>
-                  <th style={{ ...th, width: 34 }}>⭐</th>
-                  <th style={th}>Company / Website</th>
+                  <th style={{ ...th, width: 34, position: "sticky", left: 0, zIndex: 3, background: C.panel }}>⭐</th>
+                  <th style={{ ...th, position: "sticky", left: 34, zIndex: 3, background: C.panel, boxShadow: `2px 0 0 ${C.panelEdge}` }}>Company / Website</th>
                   <th style={th}>Industry</th>
                   <th style={th}>Status</th>
                   <th style={th}>Contacts</th>
@@ -3856,7 +3856,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   const outreachedCount = contacts.filter(isContactOutreached).length;
                   return (
                     <tr key={acc.id} style={{ background: anyDue ? "rgba(248,113,113,0.06)" : acc.highConfidence ? "rgba(245,185,66,0.05)" : "transparent" }}>
-                      <td style={{ ...td, textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
+                      <td style={{ ...td, textAlign: "center", position: "sticky", left: 0, zIndex: 2, background: C.panel }} onClick={(e) => e.stopPropagation()}>
                         <button
                           onClick={() => updateAccountField(acc.id, "highConfidence", !acc.highConfidence)}
                           title={acc.highConfidence ? "High confidence — click to unmark" : "Mark as high confidence"}
@@ -3865,7 +3865,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {acc.highConfidence ? "⭐" : "☆"}
                         </button>
                       </td>
-                      <td style={{ ...td, minWidth: 180, borderLeft: anyDue ? `3px solid ${C.red}` : "3px solid transparent" }}>
+                      <td style={{ ...td, minWidth: 180, borderLeft: anyDue ? `3px solid ${C.red}` : "3px solid transparent", position: "sticky", left: 34, zIndex: 2, background: C.panel, boxShadow: `2px 0 0 ${C.panelEdge}` }}>
                         {cellInput(acc, "company", { ph: "Company", onCommit: updateAccountField })}
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           {cellInput(acc, "website", { ph: "website.com", onCommit: updateAccountField })}
