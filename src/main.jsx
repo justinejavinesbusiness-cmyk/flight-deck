@@ -644,6 +644,24 @@ function computeSynthesis(state, apps, zone) {
     }
   }
 
+  /* 6. Focus-item outcomes — do completed daily-focus suggestions coincide
+     with the linked application actually moving forward? Gated at 5+ checked
+     outcomes so a couple of coincidences don't masquerade as a trend. Purely
+     descriptive: never claims the suggestion caused the movement, since the
+     person may well have advanced these regardless of being told to. */
+  const checkedOutcomes = (state.accomplishments || []).filter((a) => a.outcomeChecked && a.outcomeAdvanced !== null);
+  if (checkedOutcomes.length >= 5) {
+    const advanced = checkedOutcomes.filter((a) => a.outcomeAdvanced).length;
+    const pct = Math.round((advanced / checkedOutcomes.length) * 100);
+    observations.push({
+      id: "focus-outcome-rate",
+      icon: "📋",
+      kind: "info",
+      title: "Following the daily focus, checked back later",
+      detail: `${advanced} of ${checkedOutcomes.length} completed focus items (${pct}%) saw the linked company move forward within about 10 days after. Worth noticing — not proof the suggestion itself caused it, since you may well have advanced these anyway.`,
+    });
+  }
+
   return observations;
 }
 
@@ -755,11 +773,27 @@ const isDue = (a) => {
 
 /* ---- daily focus model ---- */
 const normFocus = (arr) =>
-  (arr || []).map((f) => (typeof f === "string" ? { text: f, key: false } : { text: f?.text || "", key: !!f?.key }));
+  (arr || []).map((f) => (typeof f === "string" ? { text: f, key: false, company: "" } : { text: f?.text || "", key: !!f?.key, company: f?.company || "" }));
+
+/* resolves a focus item's named company to a real, currently-tracked
+   application — used to snapshot "before" state so a later check can see
+   whether it actually moved forward. Never guesses across ambiguous matches;
+   an empty/unmatched company simply isn't tracked for outcome purposes. */
+function resolveApplicationForCompany(company, apps) {
+  if (!company || !company.trim()) return null;
+  const q = company.trim().toLowerCase();
+  const matches = (apps || []).filter((a) => !a.fromAccountContact && (a.company || "").trim().toLowerCase() === q);
+  if (matches.length !== 1) return null; /* no match, or ambiguous (multiple companies with the same name) */
+  const app = matches[0];
+  return { id: app.id, statusIdx: STAGE_IDX[app.status] ?? -2 };
+}
 
 /* Day rollover: archive done items, carry over unfinished ones.
-   Returns { coach, archived, shouldGenerate }. Pure function. */
-function rolloverCoach(c, todayStr) {
+   Returns { coach, archived, shouldGenerate }. Pure function. Completed items
+   tied to a specific company get a status snapshot + a future check-back
+   date, so a later pass can see whether the suggestion coincided with real
+   forward movement — see checkFocusOutcomes. */
+function rolloverCoach(c, todayStr, apps) {
   const t = todayStr || today();
   if (!c || !c.daily || !c.dailyDate) return { coach: { ...(c || {}), daily: null, dailyDate: null, dailyDone: [] }, archived: [], shouldGenerate: true };
   if (c.dailyDate === t) return { coach: c, archived: [], shouldGenerate: false };
@@ -767,7 +801,19 @@ function rolloverCoach(c, todayStr) {
   const doneIdx = new Set(c.dailyDone || []);
   const archived = items
     .filter((_, i) => doneIdx.has(i))
-    .map((it) => ({ id: uid(), date: c.dailyDate, text: it.text, category: it.key ? "Key focus" : "Daily focus" }));
+    .map((it) => {
+      const entry = { id: uid(), date: c.dailyDate, text: it.text, category: it.key ? "Key focus" : "Daily focus" };
+      const resolved = resolveApplicationForCompany(it.company, apps || []);
+      if (resolved) {
+        entry.linkedAppId = resolved.id;
+        entry.linkedCompany = it.company;
+        entry.statusIdxAtCompletion = resolved.statusIdx;
+        entry.outcomeCheckDate = addDays(c.dailyDate, 10);
+        entry.outcomeChecked = false;
+        entry.outcomeAdvanced = null;
+      }
+      return entry;
+    });
   const remaining = items.filter((_, i) => !doneIdx.has(i));
   if (remaining.length === 0) {
     return { coach: { ...c, daily: null, dailyDate: null, dailyDone: [] }, archived, shouldGenerate: true };
@@ -777,6 +823,25 @@ function rolloverCoach(c, todayStr) {
     archived,
     shouldGenerate: false,
   };
+}
+/* runs alongside migrate() — finds completed focus items whose check-back
+   date has arrived, and records whether the linked application actually
+   advanced since. Purely descriptive data collection; the conclusions (if
+   any) only ever surface through Patterns, with the same hedged, no-causation
+   framing as every other observation there. */
+function checkFocusOutcomes(state) {
+  const t = today();
+  let changed = false;
+  const appsById = new Map((state.applications || []).map((a) => [a.id, a]));
+  const accomplishments = (state.accomplishments || []).map((a) => {
+    if (!a.linkedAppId || a.outcomeChecked || !a.outcomeCheckDate || a.outcomeCheckDate > t) return a;
+    changed = true;
+    const app = appsById.get(a.linkedAppId);
+    if (!app) return { ...a, outcomeChecked: true, outcomeAdvanced: null }; /* deleted since — inconclusive, not counted either way */
+    const currentIdx = STAGE_IDX[app.status] ?? -2;
+    return { ...a, outcomeChecked: true, outcomeAdvanced: currentIdx > a.statusIdxAtCompletion };
+  });
+  return changed ? { ...state, accomplishments } : state;
 }
 
 const DEFAULT_STATE = {
@@ -846,7 +911,7 @@ function migrate(saved) {
     const { applications, ...rest } = w;
     return rest;
   });
-  return applyTombstones(s);
+  return checkFocusOutcomes(applyTombstones(s));
 }
 
 /* ---------- merge (two-way sync without data loss) ---------- */
@@ -1428,7 +1493,7 @@ export default function FlightDeck() {
         setSyncStatus("offline");
       }
 
-      const { coach: rolled, archived, shouldGenerate } = rolloverCoach(mergedCoach);
+      const { coach: rolled, archived, shouldGenerate } = rolloverCoach(mergedCoach, null, mergedState.applications);
       if (archived.length) {
         mergedState = { ...mergedState, accomplishments: [...archived, ...(mergedState.accomplishments || [])] };
       }
@@ -1944,8 +2009,8 @@ Rules:
     setCoachError("");
     try {
       const daily = await callClaude(
-        "Give today's focus: a MAXIMUM of 3 things to do TODAY (specific and finishable today; due follow-ups by company name usually come first, then volume/quality work sized to where the funnel leaks, then any unfinished emotion-log action). ORDER the items from HIGHEST to LOWEST impact on landing the job — item 1 must be the single highest-leverage job-search action right now (application, outreach, follow-up, or interview prep), never content. Set key=true on item 1 only. This order matters: as items get completed, the app will highlight whichever remaining item is next in this priority order, so order them exactly by true impact, not by convenience or sequence. If they are meaningfully behind their weekly content goal, content CAN be one of the up-to-3 items — framed purely as consistency/staying visible, never as something that helps land the job — but it should rarely if ever be item 1. Also give one sentence on why based on the numbers, one thing to watch (or empty string), and one grounding reminder in evidence-file style.",
-        `{"focus": [{"text": "...", "key": false}, {"text": "...", "key": true}], "why": "...", "watch": "...", "reminder": "..."}`
+        "Give today's focus: a MAXIMUM of 3 things to do TODAY (specific and finishable today; due follow-ups by company name usually come first, then volume/quality work sized to where the funnel leaks, then any unfinished emotion-log action). ORDER the items from HIGHEST to LOWEST impact on landing the job — item 1 must be the single highest-leverage job-search action right now (application, outreach, follow-up, or interview prep), never content. Set key=true on item 1 only. This order matters: as items get completed, the app will highlight whichever remaining item is next in this priority order, so order them exactly by true impact, not by convenience or sequence. If a focus item is about a SPECIFIC company already in the pipeline (a follow-up, a reply to send, etc.), include that exact company name in \"company\" so the app can track whether it actually moved forward later — leave \"company\" empty for general/volume items that aren't about one specific company. If they are meaningfully behind their weekly content goal, content CAN be one of the up-to-3 items — framed purely as consistency/staying visible, never as something that helps land the job — but it should rarely if ever be item 1. Also give one sentence on why based on the numbers, one thing to watch (or empty string), and one grounding reminder in evidence-file style.",
+        `{"focus": [{"text": "...", "key": false, "company": ""}, {"text": "...", "key": true, "company": "Acme Corp"}], "why": "...", "watch": "...", "reminder": "..."}`
       );
       const items = normFocus(daily.focus).slice(0, 3);
       if (items.length && !items.some((i) => i.key)) items[0].key = true;
@@ -2517,7 +2582,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       if (remote) {
         if (remote.data) nextState = mergeStates(state, migrate(remote.data));
         if (remote.coach) {
-          const { coach: rolled, archived } = rolloverCoach(mergeCoach(coach, { ...DEFAULT_COACH, ...remote.coach }));
+          const { coach: rolled, archived } = rolloverCoach(mergeCoach(coach, { ...DEFAULT_COACH, ...remote.coach }), null, nextState.applications);
           nextCoach = rolled;
           if (archived.length) nextState = { ...nextState, accomplishments: [...archived, ...(nextState.accomplishments || [])] };
         }
