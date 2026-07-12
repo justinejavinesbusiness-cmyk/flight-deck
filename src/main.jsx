@@ -438,6 +438,26 @@ const MILESTONE_MESSAGES = [
   "The process is working. Trust the numbers, not the mood.",
   "This didn't happen by accident — it happened because you kept feeding the funnel.",
 ];
+/* rest days (Sundays) intentionally have no quota — the message here should
+   feel like permission to actually rest, not another thing to perform. Picked
+   deterministically from the date so it stays the same all day, but varies
+   week to week. */
+const REST_DAY_QUOTES = [
+  "Rest is not idleness, and to lie sometimes on the grass under trees on a summer day is by no means a waste of time. — John Lubbock",
+  "Almost everything will work again if you unplug it for a few minutes, including you. — Anne Lamott",
+  "Take rest; a field that has rested gives a bountiful crop. — Ovid",
+  "There is virtue in work and there is virtue in rest. Use both and overlook neither. — Alan Cohen",
+  "Sometimes the most productive thing you can do is rest.",
+  "Rest and self-care are so important. Replenishing your spirit lets you show up fully when it counts. — Eleanor Brown",
+  "The time to relax is when you don't have time for it. — Sydney J. Harris",
+  "Slow down — everything you're chasing will come around and catch you. — John De Paola",
+  "You don't have to be productive every single day. It's OK to rest.",
+  "A well-rested mind finds the door that a tired one walks past.",
+];
+const restDayQuote = (dateStr) => {
+  const idx = dateStr.split("").reduce((s, c) => s + c.charCodeAt(0), 0) % REST_DAY_QUOTES.length;
+  return REST_DAY_QUOTES[idx];
+};
 /* pure: builds a full, AI-analyzable snapshot of one completed goal cycle */
 function buildCycleSnapshot(s, g, cycleNumber) {
   const apps = s.applications || [];
@@ -1110,6 +1130,34 @@ function CopyButton({ text, title = "Copy" }) {
   );
 }
 
+const PAGE_SIZE = 100;
+/* shared pagination control — hidden entirely when everything fits on one
+   page, so it never adds clutter to short lists. */
+function Pagination({ page, setPage, total, pageSize = PAGE_SIZE }) {
+  if (total <= pageSize) return null;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const start = total === 0 ? 0 : page * pageSize + 1;
+  const end = Math.min(total, (page + 1) * pageSize);
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10, marginBottom: 4, flexWrap: "wrap", gap: 8 }}>
+      <span style={{ fontSize: 12, color: C.muted }}>
+        Showing {start}–{end} of {total}
+      </span>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <Btn ghost disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))} style={{ padding: "6px 14px", fontSize: 12 }}>
+          ‹ Prev
+        </Btn>
+        <span style={{ fontSize: 12, color: C.muted }}>
+          Page {page + 1} of {totalPages}
+        </span>
+        <Btn ghost disabled={page >= totalPages - 1} onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))} style={{ padding: "6px 14px", fontSize: 12 }}>
+          Next ›
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
 const inputStyle = {
   width: "100%",
   minWidth: 0,
@@ -1298,6 +1346,15 @@ export default function FlightDeck() {
   const [pipeStatusFilter, setPipeStatusFilter] = useState("");
   const [pipeFilterPanelOpen, setPipeFilterPanelOpen] = useState(false);
   const [accFilterPanelOpen, setAccFilterPanelOpen] = useState(false);
+  /* pagination — 100 per page across the CRM's larger lists, reset to page 1
+     whenever the underlying filter/search changes so you never land on an
+     empty page after narrowing down a list */
+  const [pipePage, setPipePage] = useState(0);
+  useEffect(() => setPipePage(0), [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
+  const [accPage, setAccPage] = useState(0);
+  useEffect(() => setAccPage(0), [accFilter, accSearch]);
+  const [contentPage, setContentPage] = useState(0);
+  useEffect(() => setContentPage(0), [contentFilter, contentSearch]);
   const [donutMode, setDonutMode] = useState("status");
   const [historyGroup, setHistoryGroup] = useState("date");
   const [coachLoading, setCoachLoading] = useState(null);
@@ -2490,10 +2547,21 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   const renderDashboard = () => {
     const g = computeGoal(state.goal, apps);
+    const isRestDay = new Date(today() + "T00:00:00").getDay() === 0;
     return (
     <>
-      {/* today's goal — featured front and center, not buried in the Goal tab */}
-      {state.goal && g ? (
+      {/* today's goal — featured front and center, not buried in the Goal tab.
+          Sundays are a rest day with no quota at all, so this takes priority
+          over both the active-goal and no-goal states — it's not something
+          to push through, it's permission to actually stop. */}
+      {isRestDay ? (
+        <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: "22px 20px", marginBottom: 14, textAlign: "center" }}>
+          <div style={{ fontSize: 30, marginBottom: 8 }}>🌤️</div>
+          <div style={{ fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 8 }}>Take a break today</div>
+          <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, fontStyle: "italic", maxWidth: 380, margin: "0 auto" }}>{restDayQuote(today())}</div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 12 }}>No quota today — Sundays are for rest, not the funnel.</div>
+        </div>
+      ) : state.goal && g ? (
         <div
           onClick={() => setMode(1)}
           style={{ background: C.panel, border: `1px solid ${g.todayMet ? C.green : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14, cursor: "pointer" }}
@@ -2925,6 +2993,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       })
       .slice()
       .sort((a, b) => (b.contacted || "").localeCompare(a.contacted || ""));
+    const shownPage = shown.slice(pipePage * PAGE_SIZE, (pipePage + 1) * PAGE_SIZE);
 
     const totalContacts = (state.accounts || []).reduce((s, a) => s + (a.contacts || []).length, 0);
     const realApplicationsCount = apps.filter((a) => !a.fromAccountContact && !a.archivedAt).length;
@@ -3232,7 +3301,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </tr>
               </thead>
               <tbody>
-                {shown.map((a) => {
+                {shownPage.map((a) => {
                   const nf = nextFollowUp(a);
                   const due = isDue(a);
                   const fus = normFollowUps(a);
@@ -3466,6 +3535,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </table>
           </div>
         )}
+        {shown.length > 0 && isDesktop && <Pagination page={pipePage} setPage={setPipePage} total={shown.length} />}
 
         {shown.length > 0 && !isDesktop && (
           <div
@@ -3489,7 +3559,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </tr>
               </thead>
               <tbody>
-                {shown.map((a) => {
+                {shownPage.map((a) => {
                   const nf = nextFollowUp(a);
                   const due = isDue(a);
                   const fus = normFollowUps(a);
@@ -3605,6 +3675,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </table>
           </div>
         )}
+        {shown.length > 0 && !isDesktop && <Pagination page={pipePage} setPage={setPipePage} total={shown.length} />}
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
           {isDesktop
             ? "Full spreadsheet — click any cell to edit, Enter or click away to save. 📎 attach handles screenshots; the follow-up column opens the schedule editor."
@@ -3651,6 +3722,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       })
       .slice()
       .sort((a, b) => (a.company || "").localeCompare(b.company || ""));
+    const shownAccountsPage = shownAccounts.slice(accPage * PAGE_SIZE, (accPage + 1) * PAGE_SIZE);
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
@@ -3668,6 +3740,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           })
           .sort((a, b) => a._company.localeCompare(b._company))
       : [];
+    const flatContactsPage = flatContacts.slice(accPage * PAGE_SIZE, (accPage + 1) * PAGE_SIZE);
 
     return (
       <>
@@ -3758,7 +3831,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               </div>
             )}
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {flatContacts.map((c) => {
+              {flatContactsPage.map((c) => {
                 const acc = accounts.find((a) => a.id === c._accountId);
                 const nf = nextFollowUp(c);
                 const fus = normFollowUps(c);
@@ -3821,6 +3894,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 );
               })}
             </div>
+            <Pagination page={accPage} setPage={setAccPage} total={flatContacts.length} />
             <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>Tap a contact to open their account and edit details.</div>
           </>
         ) : (
@@ -3849,7 +3923,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </tr>
               </thead>
               <tbody>
-                {shownAccounts.map((acc) => {
+                {shownAccountsPage.map((acc) => {
                   const contacts = (acc.contacts || []).filter((c) => !c.archivedAt);
                   const related = relatedApplications(acc.company, apps);
                   const anyDue = contacts.some(isContactDue);
@@ -3967,10 +4041,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </table>
           </div>
         )}
+        {rowsDesktop && <Pagination page={accPage} setPage={setAccPage} total={shownAccounts.length} />}
 
         {rowsMobile && (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {shownAccounts.map((acc) => {
+            {shownAccountsPage.map((acc) => {
               const contacts = (acc.contacts || []).filter((c) => !c.archivedAt);
               const related = relatedApplications(acc.company, apps);
               const anyDue = contacts.some(isContactDue);
@@ -4026,6 +4101,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             })}
           </div>
         )}
+        {rowsMobile && <Pagination page={accPage} setPage={setAccPage} total={shownAccounts.length} />}
 
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
           {isDesktop ? "Click any cell to edit · click Contacts to manage the full contact list." : "Tap a row to manage contacts and details."} Related applications link automatically by company name.
@@ -4053,6 +4129,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       })
       .slice()
       .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+    const shownPage = shown.slice(contentPage * PAGE_SIZE, (contentPage + 1) * PAGE_SIZE);
 
     return (
       <>
@@ -4136,7 +4213,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </tr>
               </thead>
               <tbody>
-                {shown.map((c) => (
+                {shownPage.map((c) => (
                   <tr key={c.id}>
                     <td style={{ ...td, minWidth: 170 }}>{cellInput(c, "title", { ph: "Title", onCommit: updateContentField })}</td>
                     <td style={{ ...td, minWidth: 110 }} onClick={(e) => e.stopPropagation()}>
@@ -4228,10 +4305,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </table>
           </div>
         )}
+        {shown.length > 0 && isDesktop && <Pagination page={contentPage} setPage={setContentPage} total={shown.length} />}
 
         {shown.length > 0 && !isDesktop && (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {shown.map((c) => (
+            {shownPage.map((c) => (
               <SwipeRow
                 key={c.id}
                 showX={false}
@@ -4258,6 +4336,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             ))}
           </div>
         )}
+        {shown.length > 0 && !isDesktop && <Pagination page={contentPage} setPage={setContentPage} total={shown.length} />}
 
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
           {isDesktop ? "Click any cell to edit · click platform tags to toggle them." : "Tap a card to edit."}
