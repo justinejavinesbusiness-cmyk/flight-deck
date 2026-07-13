@@ -426,7 +426,7 @@ function computeGoal(goal, apps) {
     actualByNow,
     daysRemaining,
     pastDeadline,
-    onPace: actualByNow >= expectedByNow,
+    onPace: carryIntoToday <= 0, /* rollover-consistent: the same carry math that already banks/carries daily and weekly surplus is what decides "behind or not" — a naive expectedByNow-vs-actual comparison would ignore any surplus you've already banked */
     pctComplete: Math.min(100, Math.round((actualTotal / goal.target) * 100)),
     weeks,
     thisWeeksTarget: thisWeek?.target ?? null,
@@ -1840,7 +1840,7 @@ export default function FlightDeck() {
           : g.carryIntoToday < 0
           ? ` Overachieved yesterday by ${Math.abs(g.carryIntoToday)} — today's target is reduced accordingly.`
           : "";
-      return `Active goal: ${state.goal.target} applications+outreach combined (each counts as 1) over ${state.goal.days} days, deadline ${g.deadline}, aggressiveness ${g.aggressiveness.label}, full daily quota ${g.fullQuota}.${rampNote}${carryNote} Today's actual target (after rollover): ${g.todaysTarget}, done so far today: ${g.actualToday}. Progress: ${g.actualTotal}/${state.goal.target} (${g.pctComplete}%) — ${g.pastDeadline ? "deadline passed" : g.onPace ? "on pace" : `behind, expected ${g.expectedByNow} by now`}.`;
+      return `Active goal: ${state.goal.target} applications+outreach combined (each counts as 1) over ${state.goal.days} days, deadline ${g.deadline}, aggressiveness ${g.aggressiveness.label}, full daily quota ${g.fullQuota}.${rampNote}${carryNote} Today's actual target (after rollover): ${g.todaysTarget}, done so far today: ${g.actualToday}. Progress: ${g.actualTotal}/${state.goal.target} (${g.pctComplete}%) — ${g.pastDeadline ? "deadline passed" : g.onPace ? "on pace (rollover-adjusted, so any banked surplus already counts)" : `behind by ${g.carryIntoToday}, after rollover`}.`;
     })();
     const sessions = (state.supportSessions || [])
       .slice(0, 6)
@@ -4542,7 +4542,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   {g.actualTotal} / {state.goal.target} ({g.pctComplete}%)
                 </span>
                 <span style={{ fontFamily: mono, color: g.onPace ? C.green : C.red }}>
-                  {g.pastDeadline ? "DEADLINE PASSED" : g.onPace ? "● ON PACE" : `○ BEHIND (expected ${g.expectedByNow})`}
+                  {g.pastDeadline ? "DEADLINE PASSED" : g.onPace ? "● ON PACE" : `○ BEHIND (${g.carryIntoToday} short, after rollover)`}
                 </span>
               </div>
 
