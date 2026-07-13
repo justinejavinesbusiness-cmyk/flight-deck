@@ -89,6 +89,11 @@ const mondayOf = (d) => {
   x.setHours(0, 0, 0, 0);
   return x;
 };
+/* "this week" anchored to the configured day-timezone (today()), not the
+   device's raw local clock — mondayOf(new Date()) would silently disagree
+   with the rest of the app whenever the configured offset differs from
+   wherever the device actually is. */
+const mondayOfToday = () => mondayOf(new Date(today() + "T00:00:00"));
 const iso = (d) => {
   const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
   return z.toISOString().slice(0, 10);
@@ -398,7 +403,8 @@ function computeGoal(goal, apps) {
       const actual = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length;
       const carryIn = weekCarry;
       const target = Math.max(0, w.baseTarget + carryIn);
-      weekCarry = w.weekStart <= t ? target - actual : 0; /* only carry from weeks that have actually happened; future weeks don't speculatively adjust */
+      const weekEnd = addDays(w.weekStart, 5); /* Saturday — the week isn't "over" until this has passed */
+      weekCarry = weekEnd < t ? target - actual : 0; /* only carry from weeks that have FULLY CONCLUDED; the current week is still changing, so it must not push a premature shortfall onto next week */
       return { ...w, target, actual, carryIn };
     });
   const thisWeekStart = iso(mondayOf(new Date(t + "T00:00:00")));
@@ -1779,7 +1785,7 @@ export default function FlightDeck() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.applications, state.goal]);
+  }, [state.applications, state.goal, state.archivedCsvRows]);
 
   /* keep "today" in sync with whatever day-timezone the person has chosen —
      directly in render so there's no one-tick lag waiting for an effect */
@@ -1787,7 +1793,7 @@ export default function FlightDeck() {
 
   /* monthly runway check-in */
   const checkinDay = +state.settings?.checkinDay || 1;
-  const checkinDue = new Date().getDate() >= checkinDay && state.lastCheckinMonth !== thisMonth();
+  const checkinDue = +today().slice(8, 10) >= checkinDay && state.lastCheckinMonth !== thisMonth();
 
   /* focus state */
   const focusItems = normFocus(coach.daily?.focus);
@@ -1842,8 +1848,8 @@ export default function FlightDeck() {
     const contentLine = (() => {
       const items = state.content || [];
       if (!items.length) return "No content tracked yet.";
-      const thisWeekStart = iso(mondayOf(new Date()));
-      const doneThisWeek = items.filter((c) => c.date && weekStartOfDate(c.date) === thisWeekStart).length;
+      const thisWeekStart = iso(mondayOfToday());
+      const doneThisWeek = items.filter((c) => c.date && weekStartOfDate(c.date) === thisWeekStart && c.status === "published").length;
       const perWeek = state.contentGoal?.perWeek || 0;
       const published = items.filter((c) => c.status === "published").length;
       const recent = items
@@ -1852,7 +1858,7 @@ export default function FlightDeck() {
         .join("; ");
       return `Content: ${doneThisWeek}/${perWeek} this week, ${published} published total. Recent: ${recent}. Content is nurturing/staying visible to your network — NOT a job-search conversion tactic. Never frame it as "this will get you interviews"; the goal is consistency and genuine presence, full stop.`;
     })();
-    const now = new Date();
+    const now = new Date(today() + "T00:00:00");
     return [
       `Today: ${now.toDateString()}.`,
       `Runway: ${months.toFixed(1)} months (zone: ${zone.name}). Fund P${state.runway.fund}, expenses P${state.runway.expenses}/mo.`,
@@ -4180,9 +4186,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   const renderContent = () => {
     const items = state.content || [];
     const perWeek = state.contentGoal?.perWeek || 0;
-    const thisWeekStart = iso(mondayOf(new Date()));
-    const thisWeekLabel = weekLabel(mondayOf(new Date()));
-    const doneThisWeek = items.filter((c) => c.date && weekStartOfDate(c.date) === thisWeekStart).length;
+    const thisWeekStart = iso(mondayOfToday());
+    const thisWeekLabel = weekLabel(mondayOfToday());
+    const doneThisWeek = items.filter((c) => c.date && weekStartOfDate(c.date) === thisWeekStart && c.status === "published").length;
     const weekMet = perWeek > 0 && doneThisWeek >= perWeek;
 
     const shown = items
@@ -6492,7 +6498,7 @@ function TodaysFocusModal({ onClose, coach, setCoach, coachLoading, runDaily, fo
         <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 14 }}>
             <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink }}>
-              📋 Today's Focus — {new Date().toDateString()}
+              📋 Today's Focus — {new Date(today() + "T00:00:00").toDateString()}
               {coach.daily?.carried ? "  ·  CARRIED OVER" : ""}
             </div>
             {coach.daily && (
