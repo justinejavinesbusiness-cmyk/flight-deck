@@ -231,7 +231,16 @@ const isOutreach = (a) => a.status === "outreach";
 const isBlankStatus = (a) => !a.status;
 const isBadFit = (a) => a.status === "bad fit";
 const isOpenApp = (a) => !["offer", "rejected", "bad fit"].includes(a.status);
-const reached = (a, stage) => a.status !== "rejected" && a.status !== "bad fit" && (STAGE_IDX[a.status] ?? 0) >= STAGE_IDX[stage];
+/* has this application EVER reached a given stage? Checks the historical
+   milestonesLogged record first — which only ever grows, regardless of later
+   status changes — so a real reply/screen/interview that happened stays
+   counted even if the application is later marked rejected or bad fit.
+   Falls back to the current status for stages outside the milestone list
+   (or older data saved before milestonesLogged existed). */
+const reached = (a, stage) => {
+  if ((a.milestonesLogged || []).includes(stage)) return true;
+  return a.status !== "rejected" && a.status !== "bad fit" && (STAGE_IDX[a.status] ?? 0) >= STAGE_IDX[stage];
+};
 const statusColor = (s) =>
   s === "offer" ? C.green : s === "rejected" ? C.muted : s === "bad fit" ? C.red : s === "" ? C.muted : s === "outreach" ? C.blue : ["interview", "final round"].includes(s) ? C.amber : ["replied", "screening"].includes(s) ? C.blue : C.ink;
 const outreachKindColor = (k) => (k === "warm" ? C.amber : k === "cold" ? C.blue : C.muted);
@@ -476,7 +485,7 @@ function buildCycleSnapshot(s, g, cycleNumber) {
   const replies = apps.filter((a) => reached(a, "replied")).length;
   const screens = apps.filter((a) => reached(a, "screening")).length;
   const interviews = apps.filter((a) => reached(a, "interview")).length;
-  const offers = apps.filter((a) => a.status === "offer").length;
+  const offers = apps.filter((a) => a.status === "offer" || (a.milestonesLogged || []).includes("offer")).length;
   const badFits = apps.filter((a) => isBadFit(a)).length;
   const highConfidence = apps.filter((a) => a.highConfidence).length;
   const topOfFunnel = totalApps + totalOutreach;
@@ -1691,7 +1700,7 @@ export default function FlightDeck() {
       if (reached(a, "replied")) row.d.replies += 1;
       if (reached(a, "screening")) row.d.screens += 1;
       if (reached(a, "interview")) row.d.interviews += 1;
-      if (a.status === "offer") row.d.offers += 1;
+      if (a.status === "offer" || (a.milestonesLogged || []).includes("offer")) row.d.offers += 1;
       if (isDue(a)) row.due += 1;
     });
     return Array.from(map.values()).sort((x, y) => {
