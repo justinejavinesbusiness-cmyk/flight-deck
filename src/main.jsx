@@ -294,6 +294,18 @@ function computeContentPublishWin(prevContent, newStatus) {
     },
   };
 }
+/* fires alongside computeContentPublishWin — separate, count-based milestone:
+   first at 3 total published pieces, then every +5 after (3, 8, 13, 18...) */
+function computePublishedMilestoneWin(oldCount, newCount) {
+  const milestone = publishedMilestoneCrossed(oldCount, newCount);
+  if (!milestone) return null;
+  return {
+    id: uid(),
+    date: today(),
+    category: "Content Streak",
+    text: `🔥 ${milestone} pieces of content published — the consistency is compounding.`,
+  };
+}
 
 /* ---- goal / campaign planner ---- */
 /* an application/outreach counts toward the goal the moment it's real activity —
@@ -859,11 +871,60 @@ function checkFocusOutcomes(state) {
   return changed ? { ...state, accomplishments } : state;
 }
 
+/* ---- content schedule: which day does which stage happen on ---- */
+const CONTENT_SCHEDULE_STAGES = ["idea", "draft", "design", "scheduled"];
+const CONTENT_STAGE_LABEL = { idea: "Ideate", draft: "Draft", design: "Design", scheduled: "Schedule / queue" };
+const CONTENT_STAGE_VERB = { idea: "Come up with an idea", draft: "Write a draft", design: "Design/produce it", scheduled: "Schedule or queue it to publish" };
+const WEEKDAY_ABBR = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+/* which stage(s) are scheduled for a given date, per the weekly schedule */
+function stagesForDate(schedule, dateStr) {
+  const dow = new Date(dateStr + "T00:00:00").getDay();
+  return CONTENT_SCHEDULE_STAGES.filter((stage) => (schedule?.[stage] || []).includes(dow));
+}
+/* pure: runs alongside migrate(). Ensures today has a log entry if a stage is
+   scheduled, and marks yesterday's entry "missed" if it was scheduled but
+   never checked done — the actual continue/skip prompt is a runtime UI
+   concern (see the useEffect in FlightDeck), this just prepares the data. */
+function rollContentScheduleLog(state, todayStr) {
+  const t = todayStr || today();
+  const yesterday = addDays(t, -1);
+  let log = state.contentScheduleLog || {};
+  let changed = false;
+
+  const yEntry = log[yesterday];
+  if (yEntry && !yEntry.done && !yEntry.missed) {
+    log = { ...log, [yesterday]: { ...yEntry, missed: true } };
+    changed = true;
+  }
+
+  if (!log[t]) {
+    const stages = stagesForDate(state.contentSchedule, t);
+    if (stages.length) {
+      log = { ...log, [t]: { stage: stages[0], done: false, missed: false } };
+      changed = true;
+    }
+  }
+
+  return changed ? { ...state, contentScheduleLog: log } : state;
+}
+/* published-content milestones: first at 3, then every +5 after (3, 8, 13, 18...) */
+function publishedMilestoneCrossed(oldCount, newCount) {
+  if (newCount <= oldCount) return null;
+  if (oldCount < 3 && newCount >= 3) return 3;
+  if (oldCount >= 3) {
+    const nextRung = oldCount + (5 - ((oldCount - 3) % 5));
+    if (newCount >= nextRung) return nextRung;
+  }
+  return null;
+}
+
 const DEFAULT_STATE = {
   applications: [],
   accounts: [],
   content: [],
   contentGoal: { perWeek: 3 },
+  contentSchedule: { idea: [1], draft: [2, 3], design: [4], scheduled: [5] }, /* weekday index: 0=Sun..6=Sat. Default: Mon ideate, Tue/Wed draft, Thu design, Fri schedule/queue */
+  contentScheduleLog: {}, /* keyed by date "YYYY-MM-DD" -> { stage, done, missed } */
   funnel: [],
   emotions: [],
   decisions: [],
@@ -877,6 +938,7 @@ const DEFAULT_STATE = {
   lastDigestShownDate: null,
   archivedCsvRows: [],
   lastCsvPromptDate: null,
+  lastContentScheduleCheckDate: null,
 };
 const DEFAULT_COACH = { dailyDate: null, daily: null, dailyDone: [], weeklyDate: null, weekly: null };
 
@@ -891,6 +953,11 @@ function migrate(saved) {
   if (!Array.isArray(s.content)) s.content = [];
   if (!Array.isArray(s.archivedCsvRows)) s.archivedCsvRows = [];
   if (!s.contentGoal || typeof s.contentGoal !== "object") s.contentGoal = { perWeek: 3 };
+  if (!s.contentSchedule || typeof s.contentSchedule !== "object") s.contentSchedule = { idea: [1], draft: [2, 3], design: [4], scheduled: [5] };
+  ["idea", "draft", "design", "scheduled"].forEach((k) => {
+    if (!Array.isArray(s.contentSchedule[k])) s.contentSchedule[k] = [];
+  });
+  if (!s.contentScheduleLog || typeof s.contentScheduleLog !== "object") s.contentScheduleLog = {};
   if (!Array.isArray(s.accomplishments)) s.accomplishments = [];
   if (!Array.isArray(s.supportSessions)) s.supportSessions = [];
   if (!s.settings || typeof s.settings !== "object") s.settings = { checkinDay: 1 };
@@ -926,7 +993,7 @@ function migrate(saved) {
     const { applications, ...rest } = w;
     return rest;
   });
-  return checkFocusOutcomes(applyTombstones(s));
+  return rollContentScheduleLog(checkFocusOutcomes(applyTombstones(s)));
 }
 
 /* ---------- merge (two-way sync without data loss) ---------- */
@@ -2161,6 +2228,33 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     mutate((s) => ({ ...s, lastDigestShownDate: today() }));
   };
 
+  /* content schedule: if yesterday's scheduled task was left unchecked, ask
+     once whether to carry it into today or let it go — never silently
+     re-prompt once resolved */
+  const [missedContentPrompt, setMissedContentPrompt] = useState(null);
+  const missedContentChecked = useRef(false);
+  useEffect(() => {
+    if (!loaded || missedContentChecked.current) return;
+    missedContentChecked.current = true;
+    const yesterday = addDays(today(), -1);
+    const entry = state.contentScheduleLog?.[yesterday];
+    if (entry && entry.missed && !entry.resolved) setMissedContentPrompt({ date: yesterday, stage: entry.stage });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+  const resolveMissedContent = (choice) => {
+    if (!missedContentPrompt) return;
+    const { date, stage } = missedContentPrompt;
+    mutate((s) => {
+      const log = { ...s.contentScheduleLog, [date]: { ...s.contentScheduleLog[date], resolved: true } };
+      if (choice === "continue") {
+        const t = today();
+        log[t] = { stage, done: false, missed: false };
+      }
+      return { ...s, contentScheduleLog: log };
+    });
+    setMissedContentPrompt(null);
+  };
+
   /* every 28 days (or whenever a goal cycle completes — see the milestone
      effect below), remind the person their archive backup exists and is
      worth downloading. Purely a reminder — Download/Delete always live in
@@ -2295,6 +2389,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     let winMsg = "";
     mutate((s) => {
       let addWin = null;
+      let extraWin = null;
+      const oldPublishedCount = s.content.filter((c) => c.status === "published").length;
       const content = s.content.map((c) => {
         if (c.id !== id) return c;
         if (field === "status") {
@@ -2306,13 +2402,25 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         }
         return { ...c, [field]: value };
       });
-      if (addWin) winMsg = addWin.text;
-      return { ...s, content, accomplishments: addWin ? [addWin, ...s.accomplishments] : s.accomplishments };
+      if (field === "status") {
+        const newPublishedCount = content.filter((c) => c.status === "published").length;
+        extraWin = computePublishedMilestoneWin(oldPublishedCount, newPublishedCount);
+      }
+      const newWins = [addWin, extraWin].filter(Boolean);
+      if (newWins.length) winMsg = newWins.map((w) => w.text).join(" · ");
+      return { ...s, content, accomplishments: newWins.length ? [...newWins, ...s.accomplishments] : s.accomplishments };
     });
     if (winMsg) setTimeout(() => flash(winMsg), 400);
   };
   const setContentGoalPerWeek = (n) =>
     mutate((s) => ({ ...s, contentGoal: { ...s.contentGoal, perWeek: Math.max(0, Math.round(+n || 0)) } }));
+
+  const toggleContentScheduleDone = (dateStr) =>
+    mutate((s) => {
+      const entry = s.contentScheduleLog?.[dateStr];
+      if (!entry) return s;
+      return { ...s, contentScheduleLog: { ...s.contentScheduleLog, [dateStr]: { ...entry, done: !entry.done } } };
+    });
 
   /* housekeeping: archive hides an entry from the active view without
      touching status/contacted/tags, so nothing it feeds (goal, funnel,
@@ -2475,6 +2583,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       mutate((s) => {
         let addWin = null;
         let content;
+        const oldPublishedCount = s.content.filter((c) => c.status === "published").length;
         if (entry) {
           content = s.content.map((c) => {
             if (c.id !== entry.id) return c;
@@ -2487,8 +2596,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           if (m) addWin = m.win;
           content = [{ id: uid(), ...data, celebratedPublish: m ? true : false }, ...s.content];
         }
-        if (addWin) winMsg = addWin.text;
-        return { ...s, content, accomplishments: addWin ? [addWin, ...s.accomplishments] : s.accomplishments };
+        const newPublishedCount = content.filter((c) => c.status === "published").length;
+        const extraWin = computePublishedMilestoneWin(oldPublishedCount, newPublishedCount);
+        const newWins = [addWin, extraWin].filter(Boolean);
+        if (newWins.length) winMsg = newWins.map((w) => w.text).join(" · ");
+        return { ...s, content, accomplishments: newWins.length ? [...newWins, ...s.accomplishments] : s.accomplishments };
       }, entry ? "Content updated" : "Content added");
       if (winMsg) setTimeout(() => flash(winMsg), 400);
     } else if (kind === "decision") {
@@ -2532,6 +2644,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               .filter((d) => d > 0)
               .slice(0, 10) || DEFAULT_FOLLOWUPS,
             timezoneOffset: typeof data.timezoneOffset === "number" ? data.timezoneOffset : 8,
+          },
+          contentSchedule: {
+            idea: Array.isArray(data.contentSchedule?.idea) ? data.contentSchedule.idea : [],
+            draft: Array.isArray(data.contentSchedule?.draft) ? data.contentSchedule.draft : [],
+            design: Array.isArray(data.contentSchedule?.design) ? data.contentSchedule.design : [],
+            scheduled: Array.isArray(data.contentSchedule?.scheduled) ? data.contentSchedule.scheduled : [],
           },
         }),
         "Settings updated"
@@ -4205,14 +4323,47 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .filter((c) => {
         if (!contentSearch.trim()) return true;
         const q = contentSearch.trim().toLowerCase();
-        return [c.title, c.type, c.link, c.hook, c.outline, c.draft, c.notes, ...(c.platforms || [])].filter(Boolean).some((f) => f.toLowerCase().includes(q));
+        return [c.title, c.type, c.link, c.assetsLink, c.hook, c.outline, c.draft, c.notes, ...(c.platforms || [])].filter(Boolean).some((f) => f.toLowerCase().includes(q));
       })
       .slice()
       .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
     const shownPage = shown.slice(contentPage * PAGE_SIZE, (contentPage + 1) * PAGE_SIZE);
 
+    const todaysEntry = state.contentScheduleLog?.[today()] || null;
+
     return (
       <>
+        {/* today's content focus — the single task for today, per the schedule set in Settings */}
+        {todaysEntry && (
+          <div style={{ background: C.panel, border: `1px solid ${todaysEntry.done ? C.green : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+            <Label>📌 Today's content focus</Label>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 8, gap: 10 }}>
+              <div>
+                <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink }}>{CONTENT_STAGE_LABEL[todaysEntry.stage]}</div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>{CONTENT_STAGE_VERB[todaysEntry.stage]}</div>
+              </div>
+              <button
+                onClick={() => toggleContentScheduleDone(today())}
+                style={{
+                  flexShrink: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  background: todaysEntry.done ? "rgba(74,222,128,0.15)" : "transparent",
+                  border: `1px solid ${todaysEntry.done ? C.green : C.panelEdge}`,
+                  color: todaysEntry.done ? C.green : C.muted,
+                  borderRadius: 10,
+                  padding: "8px 14px",
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                {todaysEntry.done ? "✓ Done" : "☐ Mark done"}
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* weekly content goal */}
         <div style={{ background: C.panel, border: `1px solid ${weekMet ? C.green : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -4257,17 +4408,31 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         </div>
 
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {["all", ...CONTENT_STATUSES].map((s) => (
-              <button
-                key={s}
-                onClick={() => setContentFilter(s)}
-                style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${contentFilter === s ? C.amber : C.panelEdge}`, background: contentFilter === s ? "rgba(245,185,66,0.12)" : "transparent", color: contentFilter === s ? C.amber : C.muted, cursor: "pointer", textTransform: "capitalize" }}
-              >
-                {s === "all" ? `All (${items.length})` : `${s} (${items.filter((c) => (c.status || "idea") === s).length})`}
-              </button>
-            ))}
-          </div>
+          {isDesktop ? (
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {["all", ...CONTENT_STATUSES].map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setContentFilter(s)}
+                  style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${contentFilter === s ? C.amber : C.panelEdge}`, background: contentFilter === s ? "rgba(245,185,66,0.12)" : "transparent", color: contentFilter === s ? C.amber : C.muted, cursor: "pointer", textTransform: "capitalize" }}
+                >
+                  {s === "all" ? `All (${items.length})` : `${s} (${items.filter((c) => (c.status || "idea") === s).length})`}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <select
+              value={contentFilter}
+              onChange={(e) => setContentFilter(e.target.value)}
+              style={{ ...selMini, fontSize: 13, padding: "8px 10px", background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, color: C.ink, textTransform: "capitalize" }}
+            >
+              {["all", ...CONTENT_STATUSES].map((s) => (
+                <option key={s} value={s}>
+                  {s === "all" ? `All (${items.length})` : `${contentStatusLabel(s)} (${items.filter((c) => (c.status || "idea") === s).length})`}
+                </option>
+              ))}
+            </select>
+          )}
           <Btn onClick={() => setModal({ kind: "content", entry: null })}>+ Add content</Btn>
         </div>
 
@@ -4342,6 +4507,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                         {cellInput(c, "link", { ph: "https://…", onCommit: updateContentField })}
                         {c.link && openLink(c.link, { title: "Open published content" })}
+                        {c.assetsLink && openLink(c.assetsLink, { title: "Open video/photo assets", icon: "🎬" })}
                       </div>
                     </td>
                     <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
@@ -4406,6 +4572,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   {[c.type, (c.platforms || []).join(", ")].filter(Boolean).join(" · ") || "—"}
                 </div>
                 {c.date && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>{c.date}</div>}
+                {(c.link || c.assetsLink) && (
+                  <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+                    {c.link && openLink(c.link, { title: "Open published content" })}
+                    {c.assetsLink && openLink(c.assetsLink, { title: "Open video/photo assets", icon: "🎬" })}
+                  </div>
+                )}
                 {(() => {
                   const sections = [c.hook && "hook", c.outline && "outline", c.draft && "draft", c.notes && "notes"].filter(Boolean);
                   return sections.length > 0 ? (
@@ -4757,7 +4929,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       </div>
 
       <div
-        onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay, timezoneOffset: state.settings?.timezoneOffset } })}
+        onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay, timezoneOffset: state.settings?.timezoneOffset, contentSchedule: state.contentSchedule } })}
         style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 14px", marginBottom: 14, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
       >
         <div style={{ fontSize: 13, color: C.muted }}>Settings: check-in day & follow-up defaults</div>
@@ -4853,7 +5025,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
-            <Btn ghost onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay, timezoneOffset: state.settings?.timezoneOffset } })} title="Settings" style={{ padding: "10px 12px" }}>
+            <Btn ghost onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay, timezoneOffset: state.settings?.timezoneOffset, contentSchedule: state.contentSchedule } })} title="Settings" style={{ padding: "10px 12px" }}>
               ⚙
             </Btn>
             <Btn ghost onClick={() => setSyncModal(true)} title="Sync across devices" style={{ padding: "10px 12px" }}>
@@ -5084,6 +5256,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           }}
         />
       )}
+      {missedContentPrompt && (
+        <MissedContentModal
+          onClose={() => resolveMissedContent("skip")}
+          stage={missedContentPrompt.stage}
+          onContinue={() => resolveMissedContent("continue")}
+          onSkip={() => resolveMissedContent("skip")}
+        />
+      )}
       {confirmDelete && (
         <ConfirmDeleteModal
           label={confirmDelete.label}
@@ -5134,7 +5314,14 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     if (kind === "accomplishment")
       return { text: entry?.text || "", date: entry?.date || today(), category: entry?.category || "Daily focus" };
     if (kind === "checkinDay")
-      return { day: entry?.day ?? 1, followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String), timezoneOffset: entry?.timezoneOffset ?? 8 };
+      return {
+        day: entry?.day ?? 1,
+        followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String),
+        timezoneOffset: entry?.timezoneOffset ?? 8,
+        contentSchedule: entry?.contentSchedule
+          ? { idea: [...entry.contentSchedule.idea], draft: [...entry.contentSchedule.draft], design: [...entry.contentSchedule.design], scheduled: [...entry.contentSchedule.scheduled] }
+          : { idea: [1], draft: [2, 3], design: [4], scheduled: [5] },
+      };
     if (kind === "goal")
       return {
         target: entry?.target ?? 500,
@@ -5179,6 +5366,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         type: entry?.type || "",
         platforms: entry?.platforms ? [...entry.platforms] : [],
         link: entry?.link || "",
+        assetsLink: entry?.assetsLink || "",
         date: entry?.date || today(),
         hook: entry?.hook || "",
         outline: entry?.outline || "",
@@ -5827,6 +6015,47 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             </button>
 
             <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <Label>📝 Content schedule — which day for which stage?</Label>
+              <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+                Pick the days you want to ideate, draft, design, and schedule content. Content mode will show today's task based on this.
+              </div>
+              {CONTENT_SCHEDULE_STAGES.map((stage) => (
+                <div key={stage} style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>{CONTENT_STAGE_LABEL[stage]}</div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {WEEKDAY_ABBR.map((abbr, dow) => {
+                      const active = (f.contentSchedule?.[stage] || []).includes(dow);
+                      return (
+                        <button
+                          key={dow}
+                          onClick={() =>
+                            setF((p) => {
+                              const cur = p.contentSchedule?.[stage] || [];
+                              const next = cur.includes(dow) ? cur.filter((d) => d !== dow) : [...cur, dow];
+                              return { ...p, contentSchedule: { ...p.contentSchedule, [stage]: next } };
+                            })
+                          }
+                          style={{
+                            flex: 1,
+                            padding: "6px 0",
+                            borderRadius: 8,
+                            border: `1px solid ${active ? C.amber : C.panelEdge}`,
+                            background: active ? "rgba(245,185,66,0.15)" : "transparent",
+                            color: active ? C.amber : C.muted,
+                            fontSize: 11,
+                            cursor: "pointer",
+                          }}
+                        >
+                          {abbr}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
               <Label>🧹 Housekeeping archive backup</Label>
               <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
                 Every entry the Housekeeping agent archives is captured here first, in full, before it's ever stripped down. Nothing here affects your goal or funnel numbers either way.
@@ -6307,6 +6536,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               </div>
             </div>
             <Field label="Link to the content (if published)" value={f.link} onChange={set("link")} placeholder="https://…" />
+            <Field label="Link to assets (video / photo)" value={f.assetsLink} onChange={set("assetsLink")} placeholder="Google Drive, Dropbox, raw file link…" />
             <Field label="Date" type="date" value={f.date} onChange={set("date")} />
 
             <div style={{ marginBottom: 12 }}>
@@ -6720,6 +6950,32 @@ function PatternsModal({ onClose, observations, narrative, narrativeLoading, onA
 /* ---------- job post parser popup ---------- */
 /* ---------- morning digest popup ---------- */
 /* ---------- CSV backup reminder popup ---------- */
+/* ---------- missed content-day prompt ---------- */
+function MissedContentModal({ onClose, stage, onContinue, onSkip }) {
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 380, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+      >
+        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 8 }}>📝 Missed yesterday's content task</div>
+        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16 }}>
+          Yesterday's plan was to <strong style={{ color: C.ink }}>{CONTENT_STAGE_LABEL[stage]?.toLowerCase()}</strong> something, but it wasn't checked off. Carry it into today, or let it go and stick with today's regular plan?
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <Btn ghost onClick={onSkip} style={{ flex: 1 }}>Skip it</Btn>
+          <Btn onClick={onContinue} style={{ flex: 1 }}>Continue today</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CsvBackupPromptModal({ onClose, count, onDownload }) {
   return (
     <div
