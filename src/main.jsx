@@ -173,7 +173,7 @@ const mapContactStatusToAppStatus = (contactStatus) => CONTACT_TO_APP_STATUS[con
 /* pure: given an account's OLD and NEW contact lists plus the current applications
    array, returns the updated contacts (with linkedApplicationId set/cleared) and
    the updated applications array (linked entries created/updated/removed). */
-function syncContactsToApplications(accountCompany, oldContacts, newContacts, applications) {
+function syncContactsToApplications(accountCompany, accountWebsite, oldContacts, newContacts, applications) {
   let apps = applications.slice();
   const newIds = new Set((newContacts || []).map((c) => c.id));
 
@@ -195,13 +195,17 @@ function syncContactsToApplications(accountCompany, oldContacts, newContacts, ap
 
     const payload = {
       company: accountCompany,
+      website: accountWebsite,
       contact: c.name,
       email: c.email,
+      contactPhone: c.phone,
+      contactLinkedin: c.linkedin,
       source: "Accounts",
       status: mapContactStatusToAppStatus(c.status),
       contacted: c.contacted,
       outreachKind: c.outreachKind,
       followUps: c.followUps || [],
+      touchpoints: c.touchpoints || [],
       notes: c.notes,
       fromAccountContact: true,
     };
@@ -2418,6 +2422,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   const setContentGoalPerWeek = (n) =>
     mutate((s) => ({ ...s, contentGoal: { ...s.contentGoal, perWeek: Math.max(0, Math.round(+n || 0)) } }));
 
+  /* jumps from a synced application's "Source: Accounts" badge straight to
+     the linked account, in the Accounts tab, modal already open */
+  const openLinkedAccount = (app) => {
+    const acc = state.accounts.find((a) => normCompanyName(a.company) === normCompanyName(app.company));
+    if (!acc) return;
+    setMode(2);
+    setCrmView("accounts");
+    setModal({ kind: "account", entry: acc });
+  };
+
   const toggleContentScheduleDone = (dateStr) =>
     mutate((s) => {
       const entry = s.contentScheduleLog?.[dateStr];
@@ -2548,7 +2562,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       mutate((s) => {
         const oldContacts = entry?.contacts || [];
         const oldAppsById = new Map(s.applications.map((a) => [a.id, a]));
-        const { contacts: newContacts, applications: syncedApps } = syncContactsToApplications(data.company, oldContacts, data.contacts || [], s.applications);
+        const { contacts: newContacts, applications: syncedApps } = syncContactsToApplications(data.company, data.website, oldContacts, data.contacts || [], s.applications);
 
         /* any application present before sync but gone after (a contact was removed
            from the account) may have had a screenshot attached — clean it up so it
@@ -3565,9 +3579,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, minWidth: 130 }}>{cellInput(a, "role", { ph: "Role applied for" })}</td>
                       <td style={{ ...td, minWidth: 130 }} onClick={(e) => e.stopPropagation()}>
                         {a.fromAccountContact ? (
-                          <div title="Synced from Accounts — edit this contact there" style={{ fontFamily: mono, fontSize: 11, color: C.blue, display: "flex", alignItems: "center", gap: 4 }}>
+                          <button
+                            onClick={() => openLinkedAccount(a)}
+                            title="Open the linked account"
+                            style={{ background: "transparent", border: "none", fontFamily: mono, fontSize: 11, color: C.blue, display: "flex", alignItems: "center", gap: 4, cursor: "pointer", padding: 0, textDecoration: "underline" }}
+                          >
                             🏢 Accounts
-                          </div>
+                          </button>
                         ) : (
                           <>
                             <select
@@ -3827,10 +3845,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           </a>
                         )}
                       </td>
-                      <td style={td}>
-                        <span style={{ fontSize: 12, color: a.fromAccountContact ? C.blue : a.source ? C.ink : C.muted }}>
-                          {a.fromAccountContact ? "🏢 Accounts" : a.source || "—"}
-                        </span>
+                      <td style={td} onClick={(e) => a.fromAccountContact && e.stopPropagation()}>
+                        {a.fromAccountContact ? (
+                          <button
+                            onClick={() => openLinkedAccount(a)}
+                            style={{ background: "transparent", border: "none", fontSize: 12, color: C.blue, cursor: "pointer", padding: 0, textDecoration: "underline" }}
+                          >
+                            🏢 Accounts
+                          </button>
+                        ) : (
+                          <span style={{ fontSize: 12, color: a.source ? C.ink : C.muted }}>{a.source || "—"}</span>
+                        )}
                         {a.source === "Job board" && a.jobBoardName && (
                           <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.06em", color: C.blue, marginTop: 3 }}>{a.jobBoardName}</div>
                         )}
