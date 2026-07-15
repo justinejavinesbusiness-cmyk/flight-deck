@@ -273,6 +273,7 @@ function computeMilestoneWins(prevApp, newStatus) {
     date: today(),
     category: MILESTONE_LABEL[stage],
     text: `${MILESTONE_EMOJI[stage]} ${MILESTONE_LABEL[stage]} — ${companyName}`,
+    linkedAppId: prevApp?.id || null,
   }));
   return { milestonesLogged: [...already, ...newlyReached], wins };
 }
@@ -1504,6 +1505,7 @@ export default function FlightDeck() {
   useEffect(() => setContentPage(0), [contentFilter, contentSearch]);
   const [donutMode, setDonutMode] = useState("status");
   const [historyGroup, setHistoryGroup] = useState("date");
+  const [updatingWinId, setUpdatingWinId] = useState(null);
   const [coachLoading, setCoachLoading] = useState(null);
   const [coachError, setCoachError] = useState("");
   const [voiceBusy, setVoiceBusy] = useState(false);
@@ -1892,8 +1894,9 @@ export default function FlightDeck() {
       .slice(0, 6)
       .map((x) => `${x.date} ${x.name || "?"} (${x.intensity || "?"}/10) claim:"${x.claim || ""}" action:"${x.action || "none"}"`);
     const wins = (state.accomplishments || [])
+      .filter((a) => a.outcomeUpdate?.sentiment !== "negative") /* an outcome that later turned negative (rejected/bad fit) stays acknowledged in History, but stops being cited as current momentum */
       .slice(0, 10)
-      .map((a) => `${a.date}: ${a.text}${a.category ? ` [${a.category}]` : ""}`);
+      .map((a) => `${a.date}: ${a.text}${a.category ? ` [${a.category}]` : ""}${a.outcomeUpdate?.sentiment === "positive" && a.outcomeUpdate?.note ? ` (update: ${a.outcomeUpdate.note})` : ""}`);
     const pastWins = (state.accomplishments || [])
       .filter((a) => a.category === "Past Wins" && a.snapshot)
       .map((a) => {
@@ -2421,6 +2424,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       if (!entry) return s;
       return { ...s, contentScheduleLog: { ...s.contentScheduleLog, [dateStr]: { ...entry, done: !entry.done } } };
     });
+
+  /* records how an application/outreach win's outcome actually turned out —
+     the win itself (its original text/date/category) is never touched, this
+     only ever adds metadata alongside it. A negative update stops the coach
+     from citing it as current momentum (see buildContext); it stays fully
+     visible in History either way. */
+  const setWinOutcomeUpdate = (winId, sentiment, note) =>
+    mutate((s) => ({
+      ...s,
+      accomplishments: s.accomplishments.map((a) => (a.id === winId ? { ...a, outcomeUpdate: { sentiment, note: note || "", updatedAt: today() } } : a)),
+    }));
 
   /* housekeeping: archive hides an entry from the active view without
      touching status/contacted/tags, so nothing it feeds (goal, funnel,
@@ -3016,6 +3030,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 {list.map((a) => {
                   const isPastWin = a.category === "Past Wins" && a.snapshot;
                   const isMilestone = Object.values(MILESTONE_LABEL).includes(a.category) || a.category === "Published";
+                  const isAppMilestone = Object.values(MILESTONE_LABEL).includes(a.category); /* Reply/Screening/Interview/Final Round/Offer — application/outreach specific, unlike Published */
                   const isGoalMilestone = a.category === "Milestone";
                   const isCycle = a.category === "Cycle Complete" && a.snapshot;
                   return (
@@ -3091,6 +3106,31 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                             </div>
                           </div>
                           <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{a.date} · {a.category === "Published" ? "content, out in the world" : "auto-detected forward progress"}</div>
+
+                          {a.outcomeUpdate && (
+                            <div style={{ fontSize: 11, color: a.outcomeUpdate.sentiment === "negative" ? C.red : C.green, marginTop: 6, lineHeight: 1.5 }}>
+                              ↳ Update ({a.outcomeUpdate.updatedAt}): {a.outcomeUpdate.sentiment === "negative" ? "Didn't work out since" : "Still positive"}
+                              {a.outcomeUpdate.note ? ` — ${a.outcomeUpdate.note}` : ""}
+                            </div>
+                          )}
+
+                          {isAppMilestone && (
+                            <div onClick={(e) => e.stopPropagation()} style={{ marginTop: 8 }}>
+                              {updatingWinId === a.id ? (
+                                <WinUpdateForm
+                                  onCancel={() => setUpdatingWinId(null)}
+                                  onSave={(sentiment, note) => {
+                                    setWinOutcomeUpdate(a.id, sentiment, note);
+                                    setUpdatingWinId(null);
+                                  }}
+                                />
+                              ) : (
+                                <Btn ghost onClick={() => setUpdatingWinId(a.id)} style={{ padding: "5px 10px", fontSize: 11 }}>
+                                  {a.outcomeUpdate ? "Edit update" : "Update"}
+                                </Btn>
+                              )}
+                            </div>
+                          )}
                         </div>
                       ) : (
                         <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
@@ -6951,6 +6991,44 @@ function PatternsModal({ onClose, observations, narrative, narrativeLoading, onA
 /* ---------- morning digest popup ---------- */
 /* ---------- CSV backup reminder popup ---------- */
 /* ---------- missed content-day prompt ---------- */
+/* ---------- inline win outcome-update form ---------- */
+function WinUpdateForm({ onCancel, onSave }) {
+  const [sentiment, setSentiment] = useState(null);
+  const [note, setNote] = useState("");
+  return (
+    <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10 }}>
+      <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+        <button
+          onClick={() => setSentiment("negative")}
+          style={{ flex: 1, padding: "6px 8px", borderRadius: 8, border: `1px solid ${sentiment === "negative" ? C.red : C.panelEdge}`, background: sentiment === "negative" ? "rgba(248,113,113,0.15)" : "transparent", color: sentiment === "negative" ? C.red : C.muted, fontSize: 11, cursor: "pointer" }}
+        >
+          😕 Went negative
+        </button>
+        <button
+          onClick={() => setSentiment("positive")}
+          style={{ flex: 1, padding: "6px 8px", borderRadius: 8, border: `1px solid ${sentiment === "positive" ? C.green : C.panelEdge}`, background: sentiment === "positive" ? "rgba(74,222,128,0.15)" : "transparent", color: sentiment === "positive" ? C.green : C.muted, fontSize: 11, cursor: "pointer" }}
+        >
+          🙂 Still positive
+        </button>
+      </div>
+      <input
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        placeholder={sentiment === "negative" ? "e.g. rejected, or turned out to be a bad fit (optional)" : "add context (optional)"}
+        style={{ ...inputStyle, fontSize: 12, marginBottom: 8 }}
+      />
+      <div style={{ display: "flex", gap: 8 }}>
+        <Btn ghost onClick={onCancel} style={{ flex: 1, padding: "6px 10px", fontSize: 11 }}>
+          Cancel
+        </Btn>
+        <Btn onClick={() => sentiment && onSave(sentiment, note.trim())} disabled={!sentiment} style={{ flex: 1, padding: "6px 10px", fontSize: 11 }}>
+          Save
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
 function MissedContentModal({ onClose, stage, onContinue, onSkip }) {
   return (
     <div
