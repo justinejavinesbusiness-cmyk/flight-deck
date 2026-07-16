@@ -4536,6 +4536,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             onMove={moveContentStage}
             onDropStage={(id, stage) => updateContentField(id, "status", stage)}
             isDesktop={isDesktop}
+            openLink={openLink}
           />
         ) : (
           <>
@@ -4611,7 +4612,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                         {cellInput(c, "link", { ph: "https://…", onCommit: updateContentField })}
                         {c.link && openLink(c.link, { title: "Open published content" })}
-                        {c.assetsLink && openLink(c.assetsLink, { title: "Open video/photo assets", icon: "🎬" })}
+                        {c.assetsLink && openLink(c.assetsLink, { title: "Open video/photo assets", icon: "📁" })}
                       </div>
                     </td>
                     <td style={{ ...td, whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
@@ -4679,7 +4680,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 {(c.link || c.assetsLink) && (
                   <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
                     {c.link && openLink(c.link, { title: "Open published content" })}
-                    {c.assetsLink && openLink(c.assetsLink, { title: "Open video/photo assets", icon: "🎬" })}
+                    {c.assetsLink && openLink(c.assetsLink, { title: "Open video/photo assets", icon: "📁" })}
                   </div>
                 )}
                 {(() => {
@@ -7059,7 +7060,7 @@ function PatternsModal({ onClose, observations, narrative, narrativeLoading, onA
 /* ---------- missed content-day prompt ---------- */
 /* ---------- inline win outcome-update form ---------- */
 /* ---------- Content Kanban board ---------- */
-function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop }) {
+function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop, openLink }) {
   const [draggingId, setDraggingId] = useState(null);
   const [dragOverStage, setDragOverStage] = useState(null);
 
@@ -7143,6 +7144,12 @@ function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop }) {
                   <div style={{ fontSize: 13, fontWeight: 700, color: C.ink, lineHeight: 1.4 }}>{c.title || "Untitled"}</div>
                   <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{[c.type, (c.platforms || []).join(", ")].filter(Boolean).join(" · ") || "—"}</div>
                   {c.date && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>{c.date}</div>}
+                  {(c.link || c.assetsLink) && (
+                    <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", gap: 10, marginTop: 4 }}>
+                      {c.link && openLink(c.link, { title: "Open published content" })}
+                      {c.assetsLink && openLink(c.assetsLink, { title: "Open video/photo assets", icon: "📁" })}
+                    </div>
+                  )}
                   <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
                     <button
                       onClick={() => onMove(c.id, -1)}
