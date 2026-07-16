@@ -1494,6 +1494,7 @@ export default function FlightDeck() {
   const [accFilter, setAccFilter] = useState("active");
   const [contentSearch, setContentSearch] = useState("");
   const [contentFilter, setContentFilter] = useState("all");
+  const [contentView, setContentView] = useState("list");
   const [pipeSourceFilter, setPipeSourceFilter] = useState("");
   const [pipeStatusFilter, setPipeStatusFilter] = useState("");
   const [pipeFilterPanelOpen, setPipeFilterPanelOpen] = useState(false);
@@ -2418,6 +2419,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       return { ...s, content, accomplishments: newWins.length ? [...newWins, ...s.accomplishments] : s.accomplishments };
     });
     if (winMsg) setTimeout(() => flash(winMsg), 400);
+  };
+  /* board view's move-forward/back buttons — just another way to change
+     status, so it reuses updateContentField's existing win-detection rather
+     than duplicating it */
+  const moveContentStage = (id, direction) => {
+    const item = state.content.find((c) => c.id === id);
+    if (!item) return;
+    const curIdx = CONTENT_STATUSES.indexOf(item.status || "idea");
+    const nextIdx = curIdx + direction;
+    if (nextIdx < 0 || nextIdx >= CONTENT_STATUSES.length) return;
+    updateContentField(id, "status", CONTENT_STATUSES[nextIdx]);
   };
   const setContentGoalPerWeek = (n) =>
     mutate((s) => ({ ...s, contentGoal: { ...s.contentGoal, perWeek: Math.max(0, Math.round(+n || 0)) } }));
@@ -4498,8 +4510,29 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               ))}
             </select>
           )}
-          <Btn onClick={() => setModal({ kind: "content", entry: null })}>+ Add content</Btn>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <button
+              onClick={() => setContentView("list")}
+              title="List view"
+              style={{ padding: "8px 12px", borderRadius: 10, border: `1px solid ${contentView === "list" ? C.amber : C.panelEdge}`, background: contentView === "list" ? "rgba(245,185,66,0.12)" : "transparent", color: contentView === "list" ? C.amber : C.muted, cursor: "pointer", fontSize: 13 }}
+            >
+              ☰
+            </button>
+            <button
+              onClick={() => setContentView("board")}
+              title="Board view"
+              style={{ padding: "8px 12px", borderRadius: 10, border: `1px solid ${contentView === "board" ? C.amber : C.panelEdge}`, background: contentView === "board" ? "rgba(245,185,66,0.12)" : "transparent", color: contentView === "board" ? C.amber : C.muted, cursor: "pointer", fontSize: 13 }}
+            >
+              ▦
+            </button>
+            <Btn onClick={() => setModal({ kind: "content", entry: null })}>+ Add content</Btn>
+          </div>
         </div>
+
+        {contentView === "board" ? (
+          <ContentBoard items={shown} onOpen={(c) => setModal({ kind: "content", entry: c })} onMove={moveContentStage} />
+        ) : (
+          <>
 
         {shown.length === 0 && (
           <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
@@ -4658,6 +4691,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
           {isDesktop ? "Click any cell to edit · click platform tags to toggle them." : "Tap a card to edit."}
         </div>
+          </>
+        )}
       </>
     );
   };
@@ -7017,6 +7052,55 @@ function PatternsModal({ onClose, observations, narrative, narrativeLoading, onA
 /* ---------- CSV backup reminder popup ---------- */
 /* ---------- missed content-day prompt ---------- */
 /* ---------- inline win outcome-update form ---------- */
+/* ---------- Content Kanban board ---------- */
+function ContentBoard({ items, onOpen, onMove }) {
+  return (
+    <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 8 }}>
+      {CONTENT_STATUSES.map((stage, colIdx) => {
+        const colItems = items.filter((c) => (c.status || "idea") === stage);
+        return (
+          <div key={stage} style={{ flex: "0 0 240px", width: 240, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: 10, display: "flex", flexDirection: "column", maxHeight: "70vh" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexShrink: 0 }}>
+              <div style={{ fontFamily: mono, fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", color: contentStatusColor(stage), textTransform: "uppercase" }}>
+                {contentStatusLabel(stage)}
+              </div>
+              <div style={{ fontFamily: mono, fontSize: 11, color: C.muted }}>{colItems.length}</div>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, overflowY: "auto" }}>
+              {colItems.length === 0 && <div style={{ fontSize: 11, color: C.muted, textAlign: "center", padding: "12px 0" }}>Nothing here</div>}
+              {colItems.map((c) => (
+                <div key={c.id} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10, cursor: "pointer" }} onClick={() => onOpen(c)}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.ink, lineHeight: 1.4 }}>{c.title || "Untitled"}</div>
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{[c.type, (c.platforms || []).join(", ")].filter(Boolean).join(" · ") || "—"}</div>
+                  {c.date && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>{c.date}</div>}
+                  <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
+                    <button
+                      onClick={() => onMove(c.id, -1)}
+                      disabled={colIdx === 0}
+                      title={colIdx === 0 ? "" : `Move back to ${contentStatusLabel(CONTENT_STATUSES[colIdx - 1])}`}
+                      style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, borderRadius: 6, color: colIdx === 0 ? C.panelEdge : C.muted, fontSize: 11, padding: "3px 8px", cursor: colIdx === 0 ? "default" : "pointer" }}
+                    >
+                      ‹
+                    </button>
+                    <button
+                      onClick={() => onMove(c.id, 1)}
+                      disabled={colIdx === CONTENT_STATUSES.length - 1}
+                      title={colIdx === CONTENT_STATUSES.length - 1 ? "" : `Move forward to ${contentStatusLabel(CONTENT_STATUSES[colIdx + 1])}`}
+                      style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, borderRadius: 6, color: colIdx === CONTENT_STATUSES.length - 1 ? C.panelEdge : C.muted, fontSize: 11, padding: "3px 8px", cursor: colIdx === CONTENT_STATUSES.length - 1 ? "default" : "pointer" }}
+                    >
+                      ›
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function WinUpdateForm({ onCancel, onSave }) {
   const [sentiment, setSentiment] = useState(null);
   const [note, setNote] = useState("");
