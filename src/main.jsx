@@ -4530,7 +4530,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         </div>
 
         {contentView === "board" ? (
-          <ContentBoard items={shown} onOpen={(c) => setModal({ kind: "content", entry: c })} onMove={moveContentStage} />
+          <ContentBoard
+            items={shown}
+            onOpen={(c) => setModal({ kind: "content", entry: c })}
+            onMove={moveContentStage}
+            onDropStage={(id, stage) => updateContentField(id, "status", stage)}
+            isDesktop={isDesktop}
+          />
         ) : (
           <>
 
@@ -7053,13 +7059,51 @@ function PatternsModal({ onClose, observations, narrative, narrativeLoading, onA
 /* ---------- missed content-day prompt ---------- */
 /* ---------- inline win outcome-update form ---------- */
 /* ---------- Content Kanban board ---------- */
-function ContentBoard({ items, onOpen, onMove }) {
+function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop }) {
+  const [draggingId, setDraggingId] = useState(null);
+  const [dragOverStage, setDragOverStage] = useState(null);
+
   return (
-    <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 8 }}>
+    <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 8, justifyContent: isDesktop ? "center" : "flex-start" }}>
       {CONTENT_STATUSES.map((stage, colIdx) => {
         const colItems = items.filter((c) => (c.status || "idea") === stage);
+        const isDragOver = isDesktop && dragOverStage === stage;
         return (
-          <div key={stage} style={{ flex: "0 0 240px", width: 240, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: 10, display: "flex", flexDirection: "column", maxHeight: "70vh" }}>
+          <div
+            key={stage}
+            onDragOver={
+              isDesktop
+                ? (e) => {
+                    e.preventDefault();
+                    if (dragOverStage !== stage) setDragOverStage(stage);
+                  }
+                : undefined
+            }
+            onDragLeave={isDesktop ? () => setDragOverStage((s) => (s === stage ? null : s)) : undefined}
+            onDrop={
+              isDesktop
+                ? (e) => {
+                    e.preventDefault();
+                    const id = e.dataTransfer.getData("text/plain");
+                    if (id) onDropStage(id, stage);
+                    setDragOverStage(null);
+                    setDraggingId(null);
+                  }
+                : undefined
+            }
+            style={{
+              flex: "0 0 240px",
+              width: 240,
+              background: C.panel,
+              border: `1px solid ${isDragOver ? C.amber : C.panelEdge}`,
+              borderRadius: 12,
+              padding: 10,
+              display: "flex",
+              flexDirection: "column",
+              maxHeight: "70vh",
+              transition: "border-color 0.1s",
+            }}
+          >
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexShrink: 0 }}>
               <div style={{ fontFamily: mono, fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", color: contentStatusColor(stage), textTransform: "uppercase" }}>
                 {contentStatusLabel(stage)}
@@ -7067,9 +7111,35 @@ function ContentBoard({ items, onOpen, onMove }) {
               <div style={{ fontFamily: mono, fontSize: 11, color: C.muted }}>{colItems.length}</div>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 8, overflowY: "auto" }}>
-              {colItems.length === 0 && <div style={{ fontSize: 11, color: C.muted, textAlign: "center", padding: "12px 0" }}>Nothing here</div>}
+              {colItems.length === 0 && (
+                <div style={{ fontSize: 11, color: isDragOver ? C.amber : C.muted, textAlign: "center", padding: "12px 0" }}>
+                  {isDragOver ? "Drop here" : "Nothing here"}
+                </div>
+              )}
               {colItems.map((c) => (
-                <div key={c.id} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10, cursor: "pointer" }} onClick={() => onOpen(c)}>
+                <div
+                  key={c.id}
+                  draggable={isDesktop}
+                  onDragStart={
+                    isDesktop
+                      ? (e) => {
+                          e.dataTransfer.setData("text/plain", c.id);
+                          e.dataTransfer.effectAllowed = "move";
+                          setDraggingId(c.id);
+                        }
+                      : undefined
+                  }
+                  onDragEnd={isDesktop ? () => { setDraggingId(null); setDragOverStage(null); } : undefined}
+                  style={{
+                    background: C.bg,
+                    border: `1px solid ${C.panelEdge}`,
+                    borderRadius: 10,
+                    padding: 10,
+                    cursor: isDesktop ? "grab" : "pointer",
+                    opacity: draggingId === c.id ? 0.4 : 1,
+                  }}
+                  onClick={() => onOpen(c)}
+                >
                   <div style={{ fontSize: 13, fontWeight: 700, color: C.ink, lineHeight: 1.4 }}>{c.title || "Untitled"}</div>
                   <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{[c.type, (c.platforms || []).join(", ")].filter(Boolean).join(" · ") || "—"}</div>
                   {c.date && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>{c.date}</div>}
