@@ -224,7 +224,11 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
 
 /* ---- content management model ---- */
 const CONTENT_STATUSES = ["idea", "draft", "design", "scheduled", "published"];
-const contentStatusLabel = (s) => (s ? s : "idea");
+/* display labels only — the underlying stored status values (idea/draft/design/
+   scheduled/published) never change, so existing content and all filtering
+   logic stay exactly as they were. This just changes what's shown on screen. */
+const CONTENT_STATUS_LABELS = { idea: "Idea", draft: "Draft/Scripting", design: "Design/Film", scheduled: "Scheduled", published: "Published" };
+const contentStatusLabel = (s) => CONTENT_STATUS_LABELS[s] || CONTENT_STATUS_LABELS.idea;
 const contentStatusColor = (s) =>
   s === "published" ? C.green : s === "scheduled" ? C.amber : s === "design" ? C.blue : s === "draft" ? C.ink : C.muted;
 const CONTENT_TYPES = ["Blog", "Carousel", "Static post", "TikTok video", "Long-form video", "Short-form video", "Newsletter", "Other"];
@@ -4491,9 +4495,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 <button
                   key={s}
                   onClick={() => setContentFilter(s)}
-                  style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${contentFilter === s ? C.amber : C.panelEdge}`, background: contentFilter === s ? "rgba(245,185,66,0.12)" : "transparent", color: contentFilter === s ? C.amber : C.muted, cursor: "pointer", textTransform: "capitalize" }}
+                  style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${contentFilter === s ? C.amber : C.panelEdge}`, background: contentFilter === s ? "rgba(245,185,66,0.12)" : "transparent", color: contentFilter === s ? C.amber : C.muted, cursor: "pointer" }}
                 >
-                  {s === "all" ? `All (${items.length})` : `${s} (${items.filter((c) => (c.status || "idea") === s).length})`}
+                  {s === "all" ? `All (${items.length})` : `${contentStatusLabel(s)} (${items.filter((c) => (c.status || "idea") === s).length})`}
                 </button>
               ))}
             </div>
@@ -4537,6 +4541,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             onDropStage={(id, stage) => updateContentField(id, "status", stage)}
             isDesktop={isDesktop}
             openLink={openLink}
+            onAddToStage={(stage) => setModal({ kind: "content", entry: null, prefill: { status: stage } })}
           />
         ) : (
           <>
@@ -4573,7 +4578,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         style={{ ...selMini, fontFamily: mono, background: C.bg, color: contentStatusColor(c.status), border: `1px solid ${C.panelEdge}`, padding: "4px 6px", width: "100%" }}
                       >
                         {CONTENT_STATUSES.map((s) => (
-                          <option key={s} value={s}>{s}</option>
+                          <option key={s} value={s}>{contentStatusLabel(s)}</option>
                         ))}
                       </select>
                     </td>
@@ -5469,7 +5474,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     if (kind === "content")
       return {
         title: entry?.title || "",
-        status: entry?.status || "idea",
+        status: entry?.status || modal.prefill?.status || "idea",
         type: entry?.type || "",
         platforms: entry?.platforms ? [...entry.platforms] : [],
         link: entry?.link || "",
@@ -7060,7 +7065,7 @@ function PatternsModal({ onClose, observations, narrative, narrativeLoading, onA
 /* ---------- missed content-day prompt ---------- */
 /* ---------- inline win outcome-update form ---------- */
 /* ---------- Content Kanban board ---------- */
-function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop, openLink }) {
+function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop, openLink, onAddToStage }) {
   const [draggingId, setDraggingId] = useState(null);
   const [dragOverStage, setDragOverStage] = useState(null);
 
@@ -7109,7 +7114,16 @@ function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop, openLink 
               <div style={{ fontFamily: mono, fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", color: contentStatusColor(stage), textTransform: "uppercase" }}>
                 {contentStatusLabel(stage)}
               </div>
-              <div style={{ fontFamily: mono, fontSize: 11, color: C.muted }}>{colItems.length}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ fontFamily: mono, fontSize: 11, color: C.muted }}>{colItems.length}</div>
+                <button
+                  onClick={() => onAddToStage(stage)}
+                  title={`Add content directly to ${contentStatusLabel(stage)}`}
+                  style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, borderRadius: 6, color: C.muted, fontSize: 13, width: 22, height: 22, lineHeight: "20px", padding: 0, cursor: "pointer" }}
+                >
+                  +
+                </button>
+              </div>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 8, overflowY: "auto" }}>
               {colItems.length === 0 && (
