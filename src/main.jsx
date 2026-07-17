@@ -786,7 +786,7 @@ function triggerCsvDownload(rows, filename) {
 
 
 /* multi-step follow-ups: a.followUps = [{days, done}] counted from `contacted` */
-const DEFAULT_FOLLOWUPS = [3, 7, 14];
+const DEFAULT_FOLLOWUPS = [3, 7, 14]; /* days after the application date: day 3, day 7, day 14 */
 const normFollowUps = (a) => {
   if (Array.isArray(a.followUps)) return a.followUps; /* respects both a populated AND a deliberately-cleared [] array */
   if (a.followUpDays != null) return [{ days: +a.followUpDays || 7, done: false }];
