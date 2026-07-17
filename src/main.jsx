@@ -3637,8 +3637,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, minWidth: 130 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           {cellInput(a, "contact", { ph: "Name" })}
-                          {!a.fromAccountContact && <CopyButton text={a.email} title="Copy email" />}
-                          {!a.fromAccountContact && a.contactLinkedin && (
+                          <CopyButton text={a.email} title="Copy email" />
+                          {a.contactLinkedin && (
                             <a
                               href={a.contactLinkedin.startsWith("http") ? a.contactLinkedin : `https://${a.contactLinkedin}`}
                               target="_blank"
@@ -5718,11 +5718,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <Field label="Email" value={f.email} onChange={set("email")} placeholder="jane@acme.com" />
                 </div>
-                {!entry?.fromAccountContact && (
-                  <div style={{ paddingBottom: 10 }}>
-                    <CopyButton text={f.email} title="Copy email" />
-                  </div>
-                )}
+                <div style={{ paddingBottom: 10 }}>
+                  <CopyButton text={f.email} title="Copy email" />
+                </div>
               </div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
