@@ -403,9 +403,8 @@ function computeGoal(goal, apps) {
   const daysRemaining = Math.max(0, goal.days - elapsedCalendarDays); /* calendar days, same unit as "over N days" */
   const pastDeadline = t > deadline;
   const rollout = computeDailyRollout(goal, apps, fullQuota, Math.max(1, elapsedCalendarDays));
-  const todaysTarget = rollout.todaysTarget;
+  const rawTodaysTarget = rollout.todaysTarget;
   const carryIntoToday = rollout.carryIntoToday; /* >0 = shortfall carried in from yesterday, <0 = surplus banked, 0 = none */
-  const todayMet = actualToday >= todaysTarget;
   const stillRamping = goal.rampEnabled && elapsedCalendarDays < preset.rampDays;
 
   /* weekly breakdown, Mon-Sat buckets across the whole campaign span, ramp-aware.
@@ -439,6 +438,16 @@ function computeGoal(goal, apps) {
     });
   const thisWeekStart = iso(mondayOf(new Date(t + "T00:00:00")));
   const thisWeek = weeks.find((w) => w.weekStart === thisWeekStart) || null;
+
+  /* reconcile daily with weekly: today's target should never ask for more
+     than what's actually left to finish THIS week's own number — otherwise,
+     on (or near) the last day of a week, the daily view can demand more than
+     the weekly view says is even needed, which is exactly the confusing case
+     that prompted this fix. Only kicks in when it would matter (daily target
+     exceeds what's left this week); a normal mid-week target is untouched. */
+  const weeklyRemaining = thisWeek ? Math.max(0, thisWeek.target - thisWeek.actual) : null;
+  const todaysTarget = weeklyRemaining !== null ? Math.min(rawTodaysTarget, weeklyRemaining) : rawTodaysTarget;
+  const todayMet = actualToday >= todaysTarget;
 
   return {
     fullQuota,
