@@ -442,10 +442,15 @@ function computeGoal(goal, apps) {
   /* reconcile daily with weekly: today's target should never ask for more
      than what's actually left to finish THIS week's own number — otherwise,
      on (or near) the last day of a week, the daily view can demand more than
-     the weekly view says is even needed, which is exactly the confusing case
-     that prompted this fix. Only kicks in when it would matter (daily target
-     exceeds what's left this week); a normal mid-week target is untouched. */
-  const weeklyRemaining = thisWeek ? Math.max(0, thisWeek.target - thisWeek.actual) : null;
+     the weekly view says is even needed. Only kicks in when it would matter
+     (daily target exceeds what's left this week); a normal mid-week target
+     is untouched.
+     Crucially, this must be based on the week's progress as of the START of
+     today (excluding whatever's already been logged today) — otherwise the
+     target would keep shrinking in real time as today's own applications get
+     logged, chasing itself downward instead of staying fixed for the day. */
+  const thisWeekActualBeforeToday = Math.max(0, (thisWeek?.actual ?? 0) - actualToday);
+  const weeklyRemaining = thisWeek ? Math.max(0, thisWeek.target - thisWeekActualBeforeToday) : null;
   const todaysTarget = weeklyRemaining !== null ? Math.min(rawTodaysTarget, weeklyRemaining) : rawTodaysTarget;
   const todayMet = actualToday >= todaysTarget;
 
