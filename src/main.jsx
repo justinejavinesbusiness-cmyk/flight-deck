@@ -170,6 +170,59 @@ const isAccountOpen = (acc) => !acc.status;
    kept in sync as the contact's own status/tags/follow-ups change. */
 const CONTACT_TO_APP_STATUS = { "": "", outreach: "outreach", replied: "replied", "discovery call": "screening", ongoing: "interview", closed: "rejected" };
 const mapContactStatusToAppStatus = (contactStatus) => CONTACT_TO_APP_STATUS[contactStatus] ?? "";
+/* reverse of the above — used when converting a standalone application into
+   an account contact. The contact status model is coarser than the
+   application one (5 stages vs 11), so some detail is necessarily collapsed:
+   applied/followed up both become "outreach" (still pre-reply), screening
+   becomes "discovery call", interview/final round/offer all become "ongoing"
+   (there's no finer contact-side equivalent), and rejected/bad fit both
+   become "closed". */
+const APP_TO_CONTACT_STATUS = {
+  "": "",
+  outreach: "outreach",
+  applied: "outreach",
+  "followed up": "outreach",
+  replied: "replied",
+  screening: "discovery call",
+  interview: "ongoing",
+  "final round": "ongoing",
+  offer: "ongoing",
+  rejected: "closed",
+  "bad fit": "closed",
+};
+const mapAppStatusToContactStatus = (appStatus) => APP_TO_CONTACT_STATUS[appStatus] ?? "outreach";
+/* pure: builds a new account (with one contact) from a standalone
+   application's data — the actual linking back into a real application
+   happens via the normal sync pathway once this account is saved. */
+function convertApplicationToAccount(app) {
+  const contact = {
+    id: uid(),
+    name: app.contact || "",
+    position: "",
+    email: app.email || "",
+    phone: app.contactPhone || "",
+    linkedin: app.contactLinkedin || "",
+    notes: app.notes || "",
+    status: mapAppStatusToContactStatus(app.status),
+    outreachKind: app.outreachKind || "",
+    contacted: app.contacted || "",
+    followUps: Array.isArray(app.followUps) ? app.followUps.map((f) => ({ ...f })) : [],
+    touchpoints: Array.isArray(app.touchpoints) ? app.touchpoints.map((t) => ({ ...t })) : [],
+    linkedApplicationId: null,
+  };
+  return {
+    id: uid(),
+    company: app.company || "",
+    website: app.website || "",
+    industry: "",
+    headcount: "",
+    status: "",
+    highConfidence: !!app.highConfidence,
+    badReasons: [],
+    notes: "",
+    contacts: [contact],
+  };
+}
 /* pure: given an account's OLD and NEW contact lists plus the current applications
    array, returns the updated contacts (with linkedApplicationId set/cleared) and
    the updated applications array (linked entries created/updated/removed). */
@@ -806,13 +859,24 @@ const normFollowUps = (a) => {
   if (a.followUpDays != null) return [{ days: +a.followUpDays || 7, done: false }];
   return DEFAULT_FOLLOWUPS.map((d) => ({ days: d, done: false }));
 };
+/* cumulative due date for the follow-up at `index` — each entry's "days"
+   value is the GAP from the PREVIOUS follow-up (or from the application date
+   for the very first one), not a fixed offset from the application date on
+   its own. So with the default 3/7/14, the due dates land at day 3, day 10
+   (3+7), and day 24 (3+7+14) after the application — not independently at
+   day 3/7/14. A gap of 1 correctly means "the very next calendar day". */
+function followUpDueDate(contacted, fus, index) {
+  let totalDays = 0;
+  for (let i = 0; i <= index; i++) totalDays += +fus[i]?.days || 0;
+  return addDays(contacted, totalDays);
+}
 /* next pending follow-up → {date, index, total} or null when all done / no contact date */
 const nextFollowUp = (a) => {
   if (!a.contacted) return null;
   const fus = normFollowUps(a);
   const i = fus.findIndex((f) => !f.done);
   if (i === -1) return null;
-  return { date: addDays(a.contacted, +fus[i].days || 0), index: i, total: fus.length };
+  return { date: followUpDueDate(a.contacted, fus, i), index: i, total: fus.length };
 };
 const followUpOf = (a) => nextFollowUp(a)?.date || "";
 const isDue = (a) => {
@@ -1522,6 +1586,21 @@ export default function FlightDeck() {
      empty page after narrowing down a list */
   const [pipePage, setPipePage] = useState(0);
   useEffect(() => setPipePage(0), [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
+  /* bulk selection for converting applications to accounts */
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedAppIds, setSelectedAppIds] = useState(() => new Set());
+  useEffect(() => {
+    setSelectedAppIds(new Set());
+  }, [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
+  const toggleAppSelected = (id) =>
+    setSelectedAppIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const [confirmConvert, setConfirmConvert] = useState(false);
+  useEffect(() => setConfirmConvert(false), [selectedAppIds]);
   const [accPage, setAccPage] = useState(0);
   useEffect(() => setAccPage(0), [accFilter, accSearch]);
   const [contentPage, setContentPage] = useState(0);
@@ -2462,6 +2541,32 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     setModal({ kind: "account", entry: acc });
   };
 
+  /* bulk-converts selected standalone applications into accounts. Applications
+     already synced FROM an account (fromAccountContact) are silently skipped —
+     they're already an account relationship, there's nothing to convert. Each
+     new account is immediately run through the normal sync pathway so it gets
+     a properly linked application right away, and the original standalone
+     entry is removed (replaced by the newly-synced one, not duplicated). */
+  const convertApplicationsToAccounts = (ids) => {
+    let convertedCount = 0;
+    mutate((s) => {
+      let applications = s.applications.slice();
+      const accounts = [];
+      ids.forEach((id) => {
+        const app = applications.find((a) => a.id === id);
+        if (!app || app.fromAccountContact) return; /* already account-linked — nothing to convert */
+        applications = applications.filter((a) => a.id !== id);
+        const newAccount = convertApplicationToAccount(app);
+        const synced = syncContactsToApplications(newAccount.company, newAccount.website, [], newAccount.contacts, applications);
+        applications = synced.applications;
+        accounts.push({ ...newAccount, contacts: synced.contacts });
+        convertedCount++;
+      });
+      return { ...s, applications, accounts: [...accounts, ...s.accounts] };
+    }, "Converted to Accounts");
+    return convertedCount;
+  };
+
   const toggleContentScheduleDone = (dateStr) =>
     mutate((s) => {
       const entry = s.contentScheduleLog?.[dateStr];
@@ -3362,6 +3467,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </span>
               )}
             </button>
+            {crmView === "applications" && (
+              <Btn
+                ghost
+                onClick={() => {
+                  setSelectMode((m) => !m);
+                  setSelectedAppIds(new Set());
+                }}
+              >
+                {selectMode ? "Cancel select" : "☑ Select"}
+              </Btn>
+            )}
           </div>
         </div>
 
@@ -3382,6 +3498,41 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </Btn>
           )}
         </div>
+
+        {selectMode && (
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, background: C.panel, border: `1px solid ${C.amber}`, borderRadius: 10, padding: "10px 14px", marginBottom: 10, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 13, color: C.ink }}>
+              {selectedAppIds.size} selected
+              {[...selectedAppIds].some((id) => apps.find((a) => a.id === id)?.fromAccountContact) && (
+                <span style={{ color: C.muted, fontSize: 11 }}> (Accounts-sourced ones will be skipped)</span>
+              )}
+            </span>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Btn ghost onClick={() => setSelectedAppIds(new Set())} style={{ padding: "8px 12px", fontSize: 12 }} disabled={selectedAppIds.size === 0}>
+                Clear
+              </Btn>
+              {confirmConvert ? (
+                <Btn
+                  color={C.amber}
+                  onClick={() => {
+                    const n = convertApplicationsToAccounts([...selectedAppIds]);
+                    setSelectedAppIds(new Set());
+                    setSelectMode(false);
+                    setConfirmConvert(false);
+                    flash(`🏢 Converted ${n} to Account${n === 1 ? "" : "s"}`);
+                  }}
+                  style={{ padding: "8px 12px", fontSize: 12 }}
+                >
+                  Confirm convert?
+                </Btn>
+              ) : (
+                <Btn onClick={() => setConfirmConvert(true)} disabled={selectedAppIds.size === 0} style={{ padding: "8px 12px", fontSize: 12 }}>
+                  🏢 Convert to Accounts
+                </Btn>
+              )}
+            </div>
+          </div>
+        )}
 
         {isDesktop ? (
           <>
@@ -3591,13 +3742,24 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   return (
                     <tr key={a.id} style={{ background: due ? "rgba(248,113,113,0.06)" : a.highConfidence ? "rgba(245,185,66,0.05)" : "transparent" }}>
                       <td style={{ ...td, textAlign: "center", position: "sticky", left: 0, zIndex: 2, background: C.panel }} onClick={(e) => e.stopPropagation()}>
-                        <button
-                          onClick={() => updateAppField(a.id, "highConfidence", !a.highConfidence)}
-                          title={a.highConfidence ? "High confidence — click to unmark" : "Mark as high confidence"}
-                          style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: 16, color: a.highConfidence ? C.amber : C.panelEdge, padding: 0 }}
-                        >
-                          {a.highConfidence ? "⭐" : "☆"}
-                        </button>
+                        {selectMode ? (
+                          <input
+                            type="checkbox"
+                            checked={selectedAppIds.has(a.id)}
+                            disabled={a.fromAccountContact}
+                            onChange={() => toggleAppSelected(a.id)}
+                            title={a.fromAccountContact ? "Already linked to an account — nothing to convert" : "Select for bulk convert"}
+                            style={{ width: 16, height: 16, cursor: a.fromAccountContact ? "not-allowed" : "pointer", opacity: a.fromAccountContact ? 0.3 : 1 }}
+                          />
+                        ) : (
+                          <button
+                            onClick={() => updateAppField(a.id, "highConfidence", !a.highConfidence)}
+                            title={a.highConfidence ? "High confidence — click to unmark" : "Mark as high confidence"}
+                            style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: 16, color: a.highConfidence ? C.amber : C.panelEdge, padding: 0 }}
+                          >
+                            {a.highConfidence ? "⭐" : "☆"}
+                          </button>
+                        )}
                       </td>
                       <td style={{ ...td, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 170, position: "sticky", left: 34, zIndex: 2, background: C.panel, boxShadow: `2px 0 0 ${C.panelEdge}` }}>
                         {cellInput(a, "company", { ph: "Company" })}
@@ -3853,12 +4015,22 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   return (
                     <tr key={a.id} onClick={() => setModal({ kind: "application", entry: a })} style={{ cursor: "pointer", background: due ? "rgba(248,113,113,0.06)" : "transparent" }}>
                       <td style={{ ...td, textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
-                        <button
-                          onClick={() => updateAppField(a.id, "highConfidence", !a.highConfidence)}
-                          style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: 15, color: a.highConfidence ? C.amber : C.panelEdge, padding: 0 }}
-                        >
-                          {a.highConfidence ? "⭐" : "☆"}
-                        </button>
+                        {selectMode ? (
+                          <input
+                            type="checkbox"
+                            checked={selectedAppIds.has(a.id)}
+                            disabled={a.fromAccountContact}
+                            onChange={() => toggleAppSelected(a.id)}
+                            style={{ width: 16, height: 16, cursor: a.fromAccountContact ? "not-allowed" : "pointer", opacity: a.fromAccountContact ? 0.3 : 1 }}
+                          />
+                        ) : (
+                          <button
+                            onClick={() => updateAppField(a.id, "highConfidence", !a.highConfidence)}
+                            style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: 15, color: a.highConfidence ? C.amber : C.panelEdge, padding: 0 }}
+                          >
+                            {a.highConfidence ? "⭐" : "☆"}
+                          </button>
+                        )}
                       </td>
                       <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 150 }}>
                         {a.company || "Unnamed"}
@@ -5811,7 +5983,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>No follow-ups scheduled for this one.</div>
             )}
             {(f.followUps || []).map((fu, i) => {
-              const d = f.contacted ? addDays(f.contacted, +fu.days || 0) : "";
+              const d = f.contacted ? followUpDueDate(f.contacted, f.followUps, i) : "";
               const due = d && !fu.done && d <= today();
               return (
                 <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
@@ -6525,7 +6697,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
                       <span style={{ fontSize: 10, color: C.muted }}>Follow-ups:</span>
                       {fus.map((fu, fi) => {
-                        const due = c.contacted ? addDays(c.contacted, fu.days) : "";
+                        const due = c.contacted ? followUpDueDate(c.contacted, fus, fi) : "";
                         return (
                           <button
                             key={fi}
