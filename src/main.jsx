@@ -2521,7 +2521,22 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   /* excel-style inline cell commit */
   const updateAppField = (id, field, value) =>
-    mutate((s) => ({ ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
+    mutate((s) => {
+      const applications = s.applications.map((a) => (a.id === id ? { ...a, [field]: value } : a));
+      let accounts = s.accounts;
+      if (field === "followUps") {
+        const app = s.applications.find((a) => a.id === id);
+        if (app?.fromAccountContact) {
+          accounts = s.accounts.map((acc) => ({
+            ...acc,
+            contacts: (acc.contacts || []).map((c) =>
+              c.linkedApplicationId === id ? { ...c, followUps: Array.isArray(value) ? value.map((f) => ({ ...f })) : [] } : c
+            ),
+          }));
+        }
+      }
+      return { ...s, applications, accounts };
+    });
   const updateAccountField = (id, field, value) =>
     mutate((s) => ({ ...s, accounts: s.accounts.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
   const updateContentField = (id, field, value) => {
@@ -2721,7 +2736,19 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             applications = [{ id: uid(), ...data, milestonesLogged: m ? m.milestonesLogged : undefined }, ...s.applications];
           }
           if (addWins.length) winMsg = addWins.map((w) => w.text).join(" · ");
-          return { ...s, applications, accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments };
+          /* this application is linked to an account contact — keep the
+             contact's own copy of follow-ups in sync, so the account's next
+             save doesn't silently revert whatever changed here (checking a
+             follow-up done, adding/removing one, editing its day count) */
+          let accounts = s.accounts;
+          if (entry?.fromAccountContact && Array.isArray(data.followUps)) {
+            const synced = data.followUps.map((f) => ({ ...f }));
+            accounts = s.accounts.map((acc) => ({
+              ...acc,
+              contacts: (acc.contacts || []).map((c) => (c.linkedApplicationId === entry.id ? { ...c, followUps: synced } : c)),
+            }));
+          }
+          return { ...s, applications, accounts, accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments };
         },
         entry ? "Application updated" : "Application added — funnel updated"
       );
