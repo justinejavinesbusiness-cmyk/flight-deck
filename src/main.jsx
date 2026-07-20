@@ -405,8 +405,11 @@ function dailyTargetForDay(goal, dayIndex, fullQuota) {
 /* Rollover: walks day 1 -> uptoDayIndex, carrying yesterday's shortfall/surplus
    into today. Overachieving reduces tomorrow's target (never below 0);
    falling short adds the remainder on top of tomorrow's base target. Only
-   TODAY's number is exposed — future days aren't speculatively adjusted,
-   since their actuals aren't known yet. */
+   TODAY's number is speculatively exposed on its own — future days aren't
+   speculatively adjusted, since their actuals aren't known yet. Also returns
+   the full day-by-day breakdown (perDay), which is what lets the weekly view
+   be DERIVED from this same walk instead of running its own separate carry
+   — the two can never disagree if they're built from the same numbers. */
 function computeDailyRollout(goal, apps, fullQuota, uptoDayIndex) {
   const countsByDate = new Map();
   apps.forEach((a) => {
@@ -415,6 +418,7 @@ function computeDailyRollout(goal, apps, fullQuota, uptoDayIndex) {
   let carry = 0;
   let carryIntoToday = 0;
   let todaysEffective = fullQuota;
+  const perDay = [];
   for (let d = 1; d <= uptoDayIndex; d++) {
     const dateObj = new Date(goal.startDate + "T00:00:00");
     dateObj.setDate(dateObj.getDate() + (d - 1));
@@ -427,9 +431,10 @@ function computeDailyRollout(goal, apps, fullQuota, uptoDayIndex) {
     }
     const dateIso = iso(dateObj);
     const actual = countsByDate.get(dateIso) || 0;
+    perDay.push({ dayIndex: d, date: dateIso, base, effective, actual });
     carry = effective - actual; /* positive = shortfall carries forward; negative = surplus banked */
   }
-  return { todaysTarget: todaysEffective, carryIntoToday };
+  return { todaysTarget: todaysEffective, carryIntoToday, perDay };
 }
 
 /* pure: derive everything about a goal from the goal record + the pipeline */
@@ -455,17 +460,13 @@ function computeGoal(goal, apps) {
   const actualToday = apps.filter((a) => a.contacted === t && isGoalActivity(a)).length;
   const daysRemaining = Math.max(0, goal.days - elapsedCalendarDays); /* calendar days, same unit as "over N days" */
   const pastDeadline = t > deadline;
-  const rollout = computeDailyRollout(goal, apps, fullQuota, Math.max(1, elapsedCalendarDays));
-  const rawTodaysTarget = rollout.todaysTarget;
-  const carryIntoToday = rollout.carryIntoToday; /* >0 = shortfall carried in from yesterday, <0 = surplus banked, 0 = none */
   const stillRamping = goal.rampEnabled && elapsedCalendarDays < preset.rampDays;
 
-  /* weekly breakdown, Mon-Sat buckets across the whole campaign span, ramp-aware.
-     Same rollover principle as the daily target: a week that beats its target
-     reduces the next week's number; a week that falls short adds the
-     remainder on top of the next week's base target. Carry flows forward
-     week-to-week in one pass, independent of (and in addition to) the daily
-     carry above — they're complementary views of the same underlying data. */
+  /* weekly breakdown, Mon-Sat buckets — simple retrospective carry for EVERY
+     week first (a week that beats its target reduces the next week's number;
+     one that falls short adds the remainder on top). Once a week is over,
+     this stays a simple "what happened" lump total — it's not rewritten
+     day-by-day after the fact. */
   const weeksMap = new Map();
   let dayCounter = 0;
   for (let d = new Date(goal.startDate + "T00:00:00"); d <= new Date(deadline + "T00:00:00"); d.setDate(d.getDate() + 1)) {
@@ -486,26 +487,59 @@ function computeGoal(goal, apps) {
       const carryIn = weekCarry;
       const target = Math.max(0, w.baseTarget + carryIn);
       const weekEnd = addDays(w.weekStart, 5); /* Saturday — the week isn't "over" until this has passed */
-      weekCarry = weekEnd < t ? target - actual : 0; /* only carry from weeks that have FULLY CONCLUDED; the current week is still changing, so it must not push a premature shortfall onto next week */
+      weekCarry = weekEnd < t ? target - actual : 0; /* only carry from weeks that have FULLY CONCLUDED */
       return { ...w, target, actual, carryIn };
     });
   const thisWeekStart = iso(mondayOf(new Date(t + "T00:00:00")));
-  const thisWeek = weeks.find((w) => w.weekStart === thisWeekStart) || null;
+  const thisWeekIdx = weeks.findIndex((w) => w.weekStart === thisWeekStart);
 
-  /* reconcile daily with weekly: today's target should never ask for more
-     than what's actually left to finish THIS week's own number — otherwise,
-     on (or near) the last day of a week, the daily view can demand more than
-     the weekly view says is even needed. Only kicks in when it would matter
-     (daily target exceeds what's left this week); a normal mid-week target
-     is untouched.
-     Crucially, this must be based on the week's progress as of the START of
-     today (excluding whatever's already been logged today) — otherwise the
-     target would keep shrinking in real time as today's own applications get
-     logged, chasing itself downward instead of staying fixed for the day. */
-  const thisWeekActualBeforeToday = Math.max(0, (thisWeek?.actual ?? 0) - actualToday);
-  const weeklyRemaining = thisWeek ? Math.max(0, thisWeek.target - thisWeekActualBeforeToday) : null;
-  const todaysTarget = weeklyRemaining !== null ? Math.min(rawTodaysTarget, weeklyRemaining) : rawTodaysTarget;
+  /* UNIFY: today's target is derived from a fresh day-by-day walk across just
+     the CURRENT week's own days, seeded by that week's own carry-in from the
+     simple system above. This guarantees today's number is always literally
+     one of the terms the current week's own target is built from — the two
+     views can no longer disagree — without touching how already-concluded
+     weeks are shown. Days in the current week that are still ahead of today
+     contribute their plain base (their carry isn't known yet); days already
+     happened (or today) contribute their real rolled-over value. */
+  let todaysTarget, carryIntoToday;
+  if (thisWeekIdx !== -1) {
+    const wk = weeks[thisWeekIdx];
+    let walkCarry = wk.carryIn;
+    let rolledSum = 0;
+    let todaysEffective = null;
+    let carryBeforeToday = 0;
+    const cursor = new Date(thisWeekStart + "T00:00:00");
+    for (let i = 0; i < 6; i++) {
+      const dIso = iso(cursor);
+      const dayIndexInGoal = Math.floor((cursor - new Date(goal.startDate + "T00:00:00")) / 86400000) + 1;
+      const dayBase = dailyTargetForDay(goal, dayIndexInGoal, fullQuota);
+      if (dIso <= t) {
+        const effective = Math.max(0, dayBase + walkCarry);
+        if (dIso === t) {
+          todaysEffective = effective;
+          carryBeforeToday = walkCarry;
+        }
+        const actualForDay = apps.filter((a) => a.contacted === dIso && isGoalActivity(a)).length;
+        rolledSum += effective;
+        walkCarry = effective - actualForDay;
+      } else {
+        rolledSum += dayBase; /* day still ahead this week — plain base, no speculative carry */
+      }
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    weeks[thisWeekIdx] = { ...wk, target: rolledSum };
+    todaysTarget = todaysEffective ?? fullQuota;
+    carryIntoToday = carryBeforeToday;
+  } else {
+    /* today falls outside the goal's own span (e.g. goal already ended) —
+       fall back to the whole-campaign daily rollout so there's still a
+       sensible number rather than nothing */
+    const rollout = computeDailyRollout(goal, apps, fullQuota, Math.max(1, elapsedCalendarDays));
+    todaysTarget = rollout.todaysTarget;
+    carryIntoToday = rollout.carryIntoToday;
+  }
   const todayMet = actualToday >= todaysTarget;
+  const thisWeek = thisWeekIdx !== -1 ? weeks[thisWeekIdx] : null;
 
   return {
     fullQuota,
