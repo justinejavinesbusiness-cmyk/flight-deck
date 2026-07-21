@@ -194,22 +194,28 @@ const mapAppStatusToContactStatus = (appStatus) => APP_TO_CONTACT_STATUS[appStat
 /* pure: builds a new account (with one contact) from a standalone
    application's data — the actual linking back into a real application
    happens via the normal sync pathway once this account is saved. */
-function convertApplicationToAccount(app) {
-  const contact = {
+/* shared: builds a contact object from application-shaped data (company,
+   contact, email, phone, linkedin, status, etc.) — used both when converting
+   a whole application into an account, and when merging a second application
+   for the same company+role into an account as an additional contact. */
+function contactFromApplicationData(data) {
+  return {
     id: uid(),
-    name: app.contact || "",
+    name: data.contact || "",
     position: "",
-    email: app.email || "",
-    phone: app.contactPhone || "",
-    linkedin: app.contactLinkedin || "",
-    notes: app.notes || "",
-    status: mapAppStatusToContactStatus(app.status),
-    outreachKind: app.outreachKind || "",
-    contacted: app.contacted || "",
-    followUps: Array.isArray(app.followUps) ? app.followUps.map((f) => ({ ...f })) : [],
-    touchpoints: Array.isArray(app.touchpoints) ? app.touchpoints.map((t) => ({ ...t })) : [],
+    email: data.email || "",
+    phone: data.contactPhone || "",
+    linkedin: data.contactLinkedin || "",
+    notes: data.notes || "",
+    status: mapAppStatusToContactStatus(data.status),
+    outreachKind: data.outreachKind || "",
+    contacted: data.contacted || "",
+    followUps: Array.isArray(data.followUps) ? data.followUps.map((f) => ({ ...f })) : [],
+    touchpoints: Array.isArray(data.touchpoints) ? data.touchpoints.map((t) => ({ ...t })) : [],
     linkedApplicationId: null,
   };
+}
+function convertApplicationToAccount(app) {
   return {
     id: uid(),
     company: app.company || "",
@@ -220,8 +226,56 @@ function convertApplicationToAccount(app) {
     highConfidence: !!app.highConfidence,
     badReasons: [],
     notes: "",
-    contacts: [contact],
+    contacts: [contactFromApplicationData(app)],
   };
+}
+/* pure: is there already an OPEN, standalone application for the same
+   company + role? Case-insensitive, whitespace-trimmed on both sides. Synced
+   (already account-linked) entries are excluded — those are already exactly
+   what this feature would otherwise suggest creating. */
+function findDuplicateApplication(company, role, applications) {
+  const q = normCompanyName(company);
+  const roleQ = (role || "").trim().toLowerCase();
+  if (!q || !roleQ) return null;
+  return (applications || []).find((a) => !a.fromAccountContact && !a.archivedAt && normCompanyName(a.company) === q && (a.role || "").trim().toLowerCase() === roleQ) || null;
+}
+/* pure: merges a second application for the same company+role into an
+   account. If no account exists for the company yet, the FIRST (existing)
+   application becomes the account, exactly like a normal single conversion.
+   The new application's contact is added: as a genuinely NEW contact if the
+   name differs from anyone already on the account, or folded into the
+   matching existing contact (refreshing its outreach info) if the name is
+   the same person. Returns the updated accounts array; the caller is
+   responsible for removing the original standalone application(s) — the
+   normal sync pathway (once accounts are saved) creates the properly linked
+   replacement application(s). */
+function mergeApplicationIntoAccount(existingApp, newAppData, accounts) {
+  const q = normCompanyName(existingApp.company);
+  const existingAccount = (accounts || []).find((acc) => normCompanyName(acc.company) === q);
+  const newContact = contactFromApplicationData(newAppData);
+  const newContactName = (newAppData.contact || "").trim().toLowerCase();
+
+  if (existingAccount) {
+    const matchIdx = newContactName ? existingAccount.contacts.findIndex((c) => (c.name || "").trim().toLowerCase() === newContactName) : -1;
+    const contacts =
+      matchIdx !== -1
+        ? existingAccount.contacts.map((c, i) => (i === matchIdx ? { ...c, ...newContact, id: c.id, linkedApplicationId: c.linkedApplicationId } : c))
+        : [...existingAccount.contacts, newContact];
+    return (accounts || []).map((acc) => (acc.id === existingAccount.id ? { ...acc, contacts } : acc));
+  }
+
+  /* no account yet — the existing application becomes one, per the normal
+     single conversion, then the new application's contact is added alongside
+     the one that came from the existing application (never the same contact
+     twice, since a brand-new account only ever starts with one). */
+  const newAccount = convertApplicationToAccount(existingApp);
+  const existingContactName = (existingApp.contact || "").trim().toLowerCase();
+  if (newContactName && newContactName === existingContactName) {
+    newAccount.contacts = [{ ...newAccount.contacts[0], ...newContact, id: newAccount.contacts[0].id }];
+  } else {
+    newAccount.contacts = [...newAccount.contacts, newContact];
+  }
+  return [newAccount, ...(accounts || [])];
 }
 /* pure: given an account's OLD and NEW contact lists plus the current applications
    array, returns the updated contacts (with linkedApplicationId set/cleared) and
@@ -1595,6 +1649,7 @@ export default function FlightDeck() {
   const [supportOpen, setSupportOpen] = useState(false);
   const [focusModalOpen, setFocusModalOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null); /* { kind: "application"|"account", id, label } */
+  const [duplicateSuggestion, setDuplicateSuggestion] = useState(null); /* { pendingApp, duplicateApp } */
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false);
   const [patternsModalOpen, setPatternsModalOpen] = useState(false);
   const [housekeepingOpen, setHousekeepingOpen] = useState(false);
@@ -2616,6 +2671,37 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     return convertedCount;
   };
 
+  /* the user chose to merge a detected same-company-same-role duplicate into
+     an account, rather than keep it as a second standalone application. */
+  const resolveDuplicateAsMerge = () => {
+    if (!duplicateSuggestion) return;
+    const { pendingApp, duplicateApp } = duplicateSuggestion;
+    mutate((s) => {
+      const applications = s.applications.filter((a) => a.id !== duplicateApp.id);
+      const mergedAccounts = mergeApplicationIntoAccount(duplicateApp, pendingApp, s.accounts);
+      const q = normCompanyName(duplicateApp.company);
+      const affectedAccount = mergedAccounts.find((acc) => normCompanyName(acc.company) === q);
+      const oldAccountContacts = s.accounts.find((acc) => normCompanyName(acc.company) === q)?.contacts || [];
+      const synced = syncContactsToApplications(affectedAccount.company, affectedAccount.website, oldAccountContacts, affectedAccount.contacts, applications);
+      const accounts = mergedAccounts.map((acc) => (acc.id === affectedAccount.id ? { ...acc, contacts: synced.contacts } : acc));
+      return { ...s, applications: synced.applications, accounts };
+    }, "Merged into Account");
+    setDuplicateSuggestion(null);
+    flash("🏢 Merged into Account");
+  };
+  /* the user chose to keep it as a genuinely separate application (e.g.
+     reapplying after a rejection) — proceeds exactly like a normal save */
+  const resolveDuplicateAsSeparate = () => {
+    if (!duplicateSuggestion) return;
+    const { pendingApp } = duplicateSuggestion;
+    mutate((s) => {
+      const m = computeMilestoneWins({ status: "", milestonesLogged: [] }, pendingApp.status);
+      const applications = [{ id: uid(), ...pendingApp, milestonesLogged: m ? m.milestonesLogged : undefined }, ...s.applications];
+      return { ...s, applications, accomplishments: m ? [...m.wins, ...s.accomplishments] : s.accomplishments };
+    }, "Application added — funnel updated");
+    setDuplicateSuggestion(null);
+  };
+
   const toggleContentScheduleDone = (dateStr) =>
     mutate((s) => {
       const entry = s.contentScheduleLog?.[dateStr];
@@ -2717,6 +2803,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   const saveModal = (data) => {
     const { kind, entry } = modal;
     if (kind === "application") {
+      if (!entry) {
+        const dup = findDuplicateApplication(data.company, data.role, state.applications);
+        if (dup) {
+          setModal(null); /* close the "track application" form — the suggestion modal takes over from here */
+          setDuplicateSuggestion({ pendingApp: data, duplicateApp: dup });
+          return; /* don't save yet — wait for the user's choice */
+        }
+      }
       let winMsg = "";
       mutate(
         (s) => {
@@ -5623,6 +5717,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           onSkip={() => resolveMissedContent("skip")}
         />
       )}
+      {duplicateSuggestion && (
+        <DuplicateSuggestionModal
+          pendingApp={duplicateSuggestion.pendingApp}
+          duplicateApp={duplicateSuggestion.duplicateApp}
+          onMerge={resolveDuplicateAsMerge}
+          onKeepSeparate={resolveDuplicateAsSeparate}
+          onClose={resolveDuplicateAsSeparate}
+        />
+      )}
       {confirmDelete && (
         <ConfirmDeleteModal
           label={confirmDelete.label}
@@ -7310,6 +7413,41 @@ function PatternsModal({ onClose, observations, narrative, narrativeLoading, onA
 /* ---------- missed content-day prompt ---------- */
 /* ---------- inline win outcome-update form ---------- */
 /* ---------- Content Kanban board ---------- */
+/* ---------- duplicate application -> merge into Account suggestion ---------- */
+function DuplicateSuggestionModal({ pendingApp, duplicateApp, onMerge, onKeepSeparate, onClose }) {
+  const sameContact = (pendingApp.contact || "").trim().toLowerCase() === (duplicateApp.contact || "").trim().toLowerCase() && !!pendingApp.contact;
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 420, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+      >
+        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 8 }}>🏢 Same company, same role</div>
+        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16 }}>
+          You already have an application for <strong style={{ color: C.ink }}>{duplicateApp.role || "this role"}</strong> at{" "}
+          <strong style={{ color: C.ink }}>{duplicateApp.company}</strong> ({duplicateApp.contact || "no contact listed"}, status: {statusLabel(duplicateApp.status) || "blank"}).
+          {sameContact ? (
+            " This looks like the same person — merging will refresh that contact's info rather than track them twice."
+          ) : (
+            " This one has a different contact, though — merging will add them as a second contact on the same company's account, tracked as outreach rather than a separate application."
+          )}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <Btn onClick={onMerge}>🏢 Merge into Account</Btn>
+          <Btn ghost onClick={onKeepSeparate}>
+            Keep as a separate application
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop, openLink, onAddToStage }) {
   const [draggingId, setDraggingId] = useState(null);
   const [dragOverStage, setDragOverStage] = useState(null);
