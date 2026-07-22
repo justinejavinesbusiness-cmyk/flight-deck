@@ -456,6 +456,37 @@ function dailyTargetForDay(goal, dayIndex, fullQuota) {
   return Math.max(1, Math.round(startVal + (fullQuota - startVal) * frac));
 }
 
+/* Spread a signed WEEKLY rollover across a week's day-bases, Monday-first, each
+   working day absorbing at most its own base before the rest spills to the next
+   day — this is what stops a whole week's miss (or surplus) from dumping onto
+   Monday as one spike. Directly implements: "minus on Monday unless it exceeds,
+   then minus on Tuesday, and so on" — and the same, mirrored, for a shortfall.
+     rollIn > 0  → last week fell SHORT: add to days (a day can at most double,
+                   i.e. take +base); overflow spills to the next working day.
+     rollIn < 0  → last week OVERachieved: subtract from days (a day can drop to
+                   0 at most, i.e. give back -base); overflow spills forward.
+   Sundays (base 0) are rest days: they never absorb any rollover. Any remainder
+   that can't fit the whole week (|rollIn| bigger than the week's capacity) is
+   returned as `leftover` so nothing is silently lost — the caller carries it on. */
+function spreadRollover(dayBases, rollIn) {
+  let remaining = rollIn;
+  const dayTargets = dayBases.map((base) => {
+    if (base <= 0) return 0; /* rest day — no target, absorbs nothing */
+    if (remaining > 0) {
+      const add = Math.min(remaining, base); /* cap: at most double this day */
+      remaining -= add;
+      return base + add;
+    }
+    if (remaining < 0) {
+      const give = Math.min(base, -remaining); /* cap: down to 0 at most */
+      remaining += give;
+      return base - give;
+    }
+    return base;
+  });
+  return { dayTargets, leftover: remaining };
+}
+
 /* Rollover: walks day 1 -> uptoDayIndex, carrying yesterday's shortfall/surplus
    into today. Overachieving reduces tomorrow's target (never below 0);
    falling short adds the remainder on top of tomorrow's base target. Only
@@ -516,72 +547,93 @@ function computeGoal(goal, apps) {
   const pastDeadline = t > deadline;
   const stillRamping = goal.rampEnabled && elapsedCalendarDays < preset.rampDays;
 
-  /* weekly breakdown, Mon-Sat buckets — simple retrospective carry for EVERY
-     week first (a week that beats its target reduces the next week's number;
-     one that falls short adds the remainder on top). Once a week is over,
-     this stays a simple "what happened" lump total — it's not rewritten
-     day-by-day after the fact. */
-  const weeksMap = new Map();
+  /* ============================================================
+     TWO-LEVEL ROLLOVER — the whole goal is distributed across the weeks the
+     campaign spans, then across Mon–Sat within each week (Sunday = rest, 0):
+
+       LEVEL 1 · DAILY (within a week): each Mon–Sat day carries its own over/
+       under into the NEXT day only — +N if short, −N if ahead. Daily carry does
+       NOT jump the Sat→Mon boundary; the week hand-off is level 2's job, so a
+       rough week never lands on Monday as one spike.
+
+       LEVEL 2 · WEEKLY (between weeks): once a week has FULLY concluded (its
+       Saturday is in the past — "only on Saturday"), its net (its fair share +
+       what carried in − what was actually done) rolls into the next week and is
+       SPREAD via spreadRollover — Monday first, spilling to Tuesday, then
+       Wednesday, and so on. Short weeks add (plus), strong weeks subtract
+       (minus). An in-progress or future week emits no rollover of its own.
+     ============================================================ */
+
+  /* 1. bucket the campaign into Mon–Sat weeks, each carrying its ramp-aware
+        per-day base targets (Sundays kept as 0 so the week is always 7 slots) */
+  const weekBuckets = new Map();
   let dayCounter = 0;
   for (let d = new Date(goal.startDate + "T00:00:00"); d <= new Date(deadline + "T00:00:00"); d.setDate(d.getDate() + 1)) {
     dayCounter++;
-    if (d.getDay() === 0) continue;
     const wStart = iso(mondayOf(d));
-    const label = weekLabel(mondayOf(d));
-    if (!weeksMap.has(label)) weeksMap.set(label, { label, weekStart: wStart, workingDays: 0, baseTarget: 0 });
-    const wk = weeksMap.get(label);
-    wk.workingDays += 1;
-    wk.baseTarget += dailyTargetForDay(goal, dayCounter, fullQuota);
-  }
-  let weekCarry = 0;
-  const weeks = Array.from(weeksMap.values())
-    .sort((a, b) => a.weekStart.localeCompare(b.weekStart))
-    .map((w) => {
-      const actual = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length;
-      const carryIn = weekCarry;
-      const target = Math.max(0, w.baseTarget + carryIn);
-      const weekEnd = addDays(w.weekStart, 5); /* Saturday — the week isn't "over" until this has passed */
-      weekCarry = weekEnd < t ? target - actual : 0; /* only carry from weeks that have FULLY CONCLUDED */
-      return { ...w, target, actual, carryIn };
+    if (!weekBuckets.has(wStart)) weekBuckets.set(wStart, { weekStart: wStart, label: weekLabel(mondayOf(d)), days: [] });
+    const isSunday = d.getDay() === 0;
+    weekBuckets.get(wStart).days.push({
+      date: iso(d),
+      dow: d.getDay(), /* 0=Sun … 6=Sat */
+      base: isSunday ? 0 : dailyTargetForDay(goal, dayCounter, fullQuota),
     });
+  }
+
+  /* 2. walk the weeks in order, threading the signed weekly rollover through
+        spreadRollover. carryIn's sign convention: + = behind coming in, − =
+        ahead coming in. Only concluded weeks advance the carry; the moment we
+        reach the current (or a future) week, later weeks get a clean carryIn of
+        0 — their day targets are the honest spread plan, not a speculative one. */
+  const orderedWeeks = Array.from(weekBuckets.values()).sort((a, b) => a.weekStart.localeCompare(b.weekStart));
+  let rollIn = 0;
+  let stoppedCarrying = false;
+  const weeks = orderedWeeks.map((w) => {
+    const bases = w.days.map((d) => d.base);
+    const carryIn = stoppedCarrying ? 0 : rollIn;
+    const { dayTargets } = spreadRollover(bases, carryIn);
+    const baseSum = bases.reduce((s, b) => s + b, 0);
+    const workingDays = bases.filter((b) => b > 0).length;
+    const target = dayTargets.reduce((s, b) => s + b, 0);
+    const actual = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length;
+    const weekEnd = addDays(w.weekStart, 5); /* Saturday — week isn't "over" until this has passed */
+    const concluded = weekEnd < t;
+    if (concluded) {
+      /* net handed to next week = fair share + what came in − what got done;
+         computed from baseSum+carryIn (not the clamped target) so an oversized
+         rollover's un-absorbed remainder rides along and the total reconciles */
+      rollIn = baseSum + carryIn - actual;
+    } else {
+      stoppedCarrying = true;
+    }
+    const days = w.days.map((d, i) => ({ ...d, target: dayTargets[i] }));
+    return { label: w.label, weekStart: w.weekStart, workingDays, baseSum, target, actual, carryIn, days };
+  });
+
   const thisWeekStart = iso(mondayOf(new Date(t + "T00:00:00")));
   const thisWeekIdx = weeks.findIndex((w) => w.weekStart === thisWeekStart);
 
-  /* UNIFY: today's target is derived from a fresh day-by-day walk across just
-     the CURRENT week's own days, seeded by that week's own carry-in from the
-     simple system above. This guarantees today's number is always literally
-     one of the terms the current week's own target is built from — the two
-     views can no longer disagree — without touching how already-concluded
-     weeks are shown. Days in the current week that are still ahead of today
-     contribute their plain base (their carry isn't known yet); days already
-     happened (or today) contribute their real rolled-over value. */
+  /* 3. today's number: run LEVEL-1 daily rollover across the current week's
+        already-weekly-adjusted day targets. Days before today (and today) roll
+        their real over/under forward; future days this week aren't walked (their
+        actuals aren't known). Sunday shows 0 — it's a rest day. */
   let todaysTarget, carryIntoToday;
   if (thisWeekIdx !== -1) {
     const wk = weeks[thisWeekIdx];
-    let walkCarry = wk.carryIn;
-    let rolledSum = 0;
+    let dailyCarry = 0;
     let todaysEffective = null;
     let carryBeforeToday = 0;
-    const cursor = new Date(thisWeekStart + "T00:00:00");
-    for (let i = 0; i < 6; i++) {
-      const dIso = iso(cursor);
-      const dayIndexInGoal = Math.floor((cursor - new Date(goal.startDate + "T00:00:00")) / 86400000) + 1;
-      const dayBase = dailyTargetForDay(goal, dayIndexInGoal, fullQuota);
-      if (dIso <= t) {
-        const effective = Math.max(0, dayBase + walkCarry);
-        if (dIso === t) {
-          todaysEffective = effective;
-          carryBeforeToday = walkCarry;
-        }
-        const actualForDay = apps.filter((a) => a.contacted === dIso && isGoalActivity(a)).length;
-        rolledSum += effective;
-        walkCarry = effective - actualForDay;
-      } else {
-        rolledSum += dayBase; /* day still ahead this week — plain base, no speculative carry */
+    for (const d of wk.days) {
+      if (d.date > t) break; /* future day this week — daily carry not known yet */
+      const planned = d.target; /* already includes this week's spread weekly rollover */
+      const effective = d.dow === 0 ? 0 : Math.max(0, planned + dailyCarry); /* Sunday = rest */
+      if (d.date === t) {
+        todaysEffective = effective;
+        carryBeforeToday = dailyCarry;
       }
-      cursor.setDate(cursor.getDate() + 1);
+      const actualForDay = apps.filter((a) => a.contacted === d.date && isGoalActivity(a)).length;
+      dailyCarry = effective - actualForDay;
     }
-    weeks[thisWeekIdx] = { ...wk, target: rolledSum };
     todaysTarget = todaysEffective ?? fullQuota;
     carryIntoToday = carryBeforeToday;
   } else {
