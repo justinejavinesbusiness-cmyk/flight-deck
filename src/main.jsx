@@ -2082,7 +2082,17 @@ export default function FlightDeck() {
 
   /* ============ DERIVED ============ */
   const apps = state.applications;
-  const dueList = useMemo(() => apps.filter((a) => isDue(a) && !a.archivedAt), [apps]);
+  /* sorted most-overdue-first: this list feeds the dashboard card, the digest,
+     and the coach briefing, all of which show only the top few — so the oldest
+     waiting follow-ups are the ones that need to surface, not whichever
+     happened to be added to the pipeline first. */
+  const dueList = useMemo(
+    () =>
+      apps
+        .filter((a) => isDue(a) && !a.archivedAt)
+        .sort((a, b) => (followUpOf(a) || "9999-12-31").localeCompare(followUpOf(b) || "9999-12-31") || (a.contacted || "").localeCompare(b.contacted || "")),
+    [apps]
+  );
   const dueContactsCount = useMemo(
     () => (state.accounts || []).reduce((s, a) => s + (a.contacts || []).filter((c) => isContactDue(c) && !c.archivedAt).length, 0),
     [state.accounts]
@@ -3747,7 +3757,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           .some((f) => f.toLowerCase().includes(q));
       })
       .slice()
-      .sort((a, b) => (b.contacted || "").localeCompare(a.contacted || ""));
+      /* the Due filter is a work queue, not a browse view — the most overdue
+         follow-up has been waiting longest, so it goes first. Every other
+         filter keeps the default newest-contacted-first ordering. */
+      .sort((a, b) =>
+        pipeFilter === "due"
+          ? (followUpOf(a) || "9999-12-31").localeCompare(followUpOf(b) || "9999-12-31") ||
+            (a.contacted || "").localeCompare(b.contacted || "")
+          : (b.contacted || "").localeCompare(a.contacted || "")
+      );
     const shownPage = shown.slice(pipePage * PAGE_SIZE, (pipePage + 1) * PAGE_SIZE);
 
     const totalContacts = (state.accounts || []).reduce((s, a) => s + (a.contacts || []).length, 0);
@@ -4554,7 +4572,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         return [acc.company, acc.website, acc.industry, acc.notes].filter(Boolean).some((f) => f.toLowerCase().includes(q)) || contactMatch;
       })
       .slice()
-      .sort((a, b) => (a.company || "").localeCompare(b.company || ""));
+      /* when filtering to accounts with due contacts, order companies by their
+         most overdue contact so the queue reads oldest-first; otherwise
+         alphabetical for browsing */
+      .sort((a, b) => {
+        if (accFilter !== "dueContacts") return (a.company || "").localeCompare(b.company || "");
+        const soonest = (acc) =>
+          (acc.contacts || [])
+            .filter((c) => isContactDue(c) && !c.archivedAt)
+            .map((c) => followUpOf(c) || "9999-12-31")
+            .sort()[0] || "9999-12-31";
+        return soonest(a).localeCompare(soonest(b)) || (a.company || "").localeCompare(b.company || "");
+      });
     const shownAccountsPage = shownAccounts.slice(accPage * PAGE_SIZE, (accPage + 1) * PAGE_SIZE);
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
@@ -4571,7 +4600,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             const q = accSearch.trim().toLowerCase();
             return [c.name, c.email, c.position, c._company, c.linkedin].filter(Boolean).some((f) => f.toLowerCase().includes(q));
           })
-          .sort((a, b) => a._company.localeCompare(b._company))
+          /* Due contacts is a work queue too — most overdue first. The
+             Outreached list stays alphabetical by company for browsing. */
+          .sort((a, b) =>
+            accFilter === "dueContacts"
+              ? (followUpOf(a) || "9999-12-31").localeCompare(followUpOf(b) || "9999-12-31") || a._company.localeCompare(b._company)
+              : a._company.localeCompare(b._company)
+          )
       : [];
     const flatContactsPage = flatContacts.slice(accPage * PAGE_SIZE, (accPage + 1) * PAGE_SIZE);
 
