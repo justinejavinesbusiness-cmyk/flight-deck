@@ -436,6 +436,114 @@ const relatedApplications = (accountCompany, apps) => {
   return apps.filter((a) => normCompanyName(a.company) === key);
 };
 
+/* ============================================================
+   OPPORTUNITY CONVERGENCE — same company + same job title = one thing
+
+   Several pipeline entries can point at the SAME real opportunity: three
+   contacts messaged at one company, or an account contact alongside a
+   standalone application, all for one job title.
+
+   While those are still at "outreach" or "applied" they are genuinely
+   distinct work — three messages sent is three pieces of effort, and each
+   rightly counts 1 toward the goal. But the moment a company actually starts
+   evaluating you for that role, there is only ONE screening, ONE interview,
+   ONE final round, ONE offer, ONE rejection. Counting those per-entry
+   inflates both the goal and the funnel.
+
+   So from "screening" onward, every entry sharing a company + job title
+   collapses to a SINGLE count in goals and in every funnel metric — while
+   outreach and applied stay distinct, exactly as before.
+   ============================================================ */
+const CONVERGED_STATUSES = ["screening", "interview", "final round", "offer", "rejected", "bad fit"];
+const isConvergedStatus = (s) => CONVERGED_STATUSES.includes(s);
+const normRoleName = (s) => (s || "").trim().toLowerCase();
+/* the identity of a real opportunity: company + job title, both normalized.
+   Null when either is missing — an entry that can't be identified never
+   collapses into anything; it always counts on its own. */
+const opportunityKey = (a) => {
+  const c = normCompanyName(a?.company);
+  const r = normRoleName(a?.role);
+  return c && r ? `${c}||${r}` : null;
+};
+/* deterministic pick of which entry in a converged group is THE one that
+   counts: earliest contacted date wins (so the count stays in the week the
+   work actually started, instead of hopping around as statuses change),
+   tie-broken by id so the result never depends on array order. */
+const earlierEntry = (a, b) => {
+  const da = a?.contacted || "9999-12-31";
+  const db = b?.contacted || "9999-12-31";
+  if (da !== db) return da < db ? a : b;
+  return (a?.id || "") <= (b?.id || "") ? a : b;
+};
+/* pure: given every pipeline entry, returns only those that should COUNT.
+   Converged entries (screening onward) sharing one company+role are reduced
+   to a single representative; everything else — outreach, applied, followed
+   up, replied, and anything missing a company or role — passes through
+   untouched. Used by goals and by every funnel metric, never by the tables
+   themselves: the individual entries all remain visible and editable. */
+function collapseCountedEntries(apps) {
+  const rep = new Map();
+  (apps || []).forEach((a) => {
+    if (!isConvergedStatus(a?.status)) return;
+    const key = opportunityKey(a);
+    if (!key) return;
+    const cur = rep.get(key);
+    rep.set(key, cur ? earlierEntry(a, cur) : a);
+  });
+  if (!rep.size) return apps || [];
+  const keptIds = new Set(Array.from(rep.values()).map((a) => a.id));
+  return (apps || []).filter((a) => {
+    if (!isConvergedStatus(a?.status)) return true;
+    return opportunityKey(a) ? keptIds.has(a.id) : true;
+  });
+}
+
+/* pure: when one entry is moved to a converged stage, every other entry for
+   the same company + job title is describing that same event — so they're all
+   moved to the same status, and any account contact linked to them follows
+   suit (mapped into the coarser contact vocabulary). This is what keeps the
+   pipeline from showing one company at three different stages for one role.
+
+   Siblings get their milestone RECORD updated so history stays consistent,
+   but deliberately emit no win toasts: it was one screening, so it earns one
+   celebration — the source entry's — not one per contact. Returns updated
+   { applications, accounts, changed }; a no-op for non-converged statuses. */
+function propagateConvergedStatus(applications, accounts, sourceApp, newStatus) {
+  if (!isConvergedStatus(newStatus)) return { applications, accounts, changed: 0 };
+  const key = opportunityKey(sourceApp);
+  if (!key) return { applications, accounts, changed: 0 };
+  const sourceId = sourceApp?.id;
+  const affectedIds = new Set();
+  const nextApps = (applications || []).map((a) => {
+    if (a.id === sourceId) return a; /* the caller already set this one */
+    if (opportunityKey(a) !== key) return a;
+    if (a.status === newStatus) return a;
+    affectedIds.add(a.id);
+    const m = computeMilestoneWins(a, newStatus);
+    return {
+      ...a,
+      status: newStatus,
+      contacted: !a.contacted ? sourceApp?.contacted || a.contacted : a.contacted,
+      milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged,
+    };
+  });
+  /* linked account contacts follow too — including the source's own, so the
+     Accounts view never disagrees with the Pipeline view */
+  const contactStatus = mapAppStatusToContactStatus(newStatus);
+  const nextAccounts = (accounts || []).map((acc) => {
+    let touched = false;
+    const contacts = (acc.contacts || []).map((c) => {
+      const link = c.linkedApplicationId;
+      if (!link || (link !== sourceId && !affectedIds.has(link))) return c;
+      if (c.status === contactStatus) return c;
+      touched = true;
+      return { ...c, status: contactStatus };
+    });
+    return touched ? { ...acc, contacts } : acc;
+  });
+  return { applications: nextApps, accounts: nextAccounts, changed: affectedIds.size };
+}
+
 /* Aggressiveness controls BOTH how big the daily quota is AND, when ramp-up is
    on, how gently/quickly you build up to it. Chill = lower quota, slow 2-week
    warm-up. Aggressive = higher quota (pushes past the strict math), 3-day ramp. */
@@ -497,7 +605,7 @@ function spreadRollover(dayBases, rollIn) {
    — the two can never disagree if they're built from the same numbers. */
 function computeDailyRollout(goal, apps, fullQuota, uptoDayIndex) {
   const countsByDate = new Map();
-  apps.forEach((a) => {
+  collapseCountedEntries(apps).forEach((a) => {
     if (a.contacted && isGoalActivity(a)) countsByDate.set(a.contacted, (countsByDate.get(a.contacted) || 0) + 1);
   });
   let carry = 0;
@@ -540,9 +648,13 @@ function computeGoal(goal, apps) {
     expectedByNow += dailyTargetForDay(goal, i, fullQuota);
   }
 
-  const actualTotal = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && isGoalActivity(a)).length;
-  const actualByNow = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && a.contacted <= t && isGoalActivity(a)).length;
-  const actualToday = apps.filter((a) => a.contacted === t && isGoalActivity(a)).length;
+  /* every "actual" below counts COLLAPSED entries: several contacts chasing
+     one company+role converge to a single count once that role reaches
+     screening, so the goal reflects real opportunities, not duplicate rows */
+  const counted = collapseCountedEntries(apps);
+  const actualTotal = counted.filter((a) => a.contacted && a.contacted >= goal.startDate && isGoalActivity(a)).length;
+  const actualByNow = counted.filter((a) => a.contacted && a.contacted >= goal.startDate && a.contacted <= t && isGoalActivity(a)).length;
+  const actualToday = counted.filter((a) => a.contacted === t && isGoalActivity(a)).length;
   const daysRemaining = Math.max(0, goal.days - elapsedCalendarDays); /* calendar days, same unit as "over N days" */
   const pastDeadline = t > deadline;
   const stillRamping = goal.rampEnabled && elapsedCalendarDays < preset.rampDays;
@@ -595,7 +707,7 @@ function computeGoal(goal, apps) {
     const baseSum = bases.reduce((s, b) => s + b, 0);
     const workingDays = bases.filter((b) => b > 0).length;
     const target = dayTargets.reduce((s, b) => s + b, 0);
-    const actual = apps.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length;
+    const actual = counted.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length;
     const weekEnd = addDays(w.weekStart, 5); /* Saturday — week isn't "over" until this has passed */
     const concluded = weekEnd < t;
     if (concluded) {
@@ -631,7 +743,7 @@ function computeGoal(goal, apps) {
         todaysEffective = effective;
         carryBeforeToday = dailyCarry;
       }
-      const actualForDay = apps.filter((a) => a.contacted === d.date && isGoalActivity(a)).length;
+      const actualForDay = counted.filter((a) => a.contacted === d.date && isGoalActivity(a)).length;
       dailyCarry = effective - actualForDay;
     }
     todaysTarget = todaysEffective ?? fullQuota;
@@ -708,14 +820,17 @@ function buildCycleSnapshot(s, g, cycleNumber) {
   APP_STATUSES.forEach((st) => {
     statusCounts[st || "(not applied yet)"] = apps.filter((a) => (a.status ?? "") === st).length;
   });
-  const totalApps = apps.filter((a) => !isBlankStatus(a) && !isOutreach(a)).length;
-  const totalOutreach = apps.filter((a) => isOutreach(a)).length;
-  const replies = apps.filter((a) => reached(a, "replied")).length;
-  const screens = apps.filter((a) => reached(a, "screening")).length;
-  const interviews = apps.filter((a) => reached(a, "interview")).length;
-  const offers = apps.filter((a) => a.status === "offer" || (a.milestonesLogged || []).includes("offer")).length;
-  const badFits = apps.filter((a) => isBadFit(a)).length;
-  const highConfidence = apps.filter((a) => a.highConfidence).length;
+  /* funnel metrics count collapsed entries — one company+role that reached
+     screening is one screening, however many contacts were chasing it */
+  const counted = collapseCountedEntries(apps);
+  const totalApps = counted.filter((a) => !isBlankStatus(a) && !isOutreach(a)).length;
+  const totalOutreach = counted.filter((a) => isOutreach(a)).length;
+  const replies = counted.filter((a) => reached(a, "replied")).length;
+  const screens = counted.filter((a) => reached(a, "screening")).length;
+  const interviews = counted.filter((a) => reached(a, "interview")).length;
+  const offers = counted.filter((a) => a.status === "offer" || (a.milestonesLogged || []).includes("offer")).length;
+  const badFits = counted.filter((a) => isBadFit(a)).length;
+  const highConfidence = counted.filter((a) => a.highConfidence).length;
   const topOfFunnel = totalApps + totalOutreach;
   const conversionRatePct = topOfFunnel > 0 ? +((offers / topOfFunnel) * 100).toFixed(1) : 0;
 
@@ -2001,11 +2116,18 @@ export default function FlightDeck() {
       row.legacy.interviews += +w.interviews || 0;
       row.legacy.offers += +w.offers || 0;
     });
+    /* one company+role that reached screening is ONE screening no matter how
+       many contacts were chasing it — so metrics count collapsed entries.
+       Due follow-ups deliberately stay per-entry: those are real, separate
+       pieces of work owed to real, separate people. */
+    const countedIds = new Set(collapseCountedEntries(apps).map((a) => a.id));
     apps.forEach((a) => {
       if (isBlankStatus(a)) return; /* saved-for-later leads aren't funnel activity yet */
       const ws = weekStartOfDate(a.contacted);
       const label = ws ? weekLabel(new Date(ws + "T00:00:00")) : "No date set";
       const row = ensure(label, ws);
+      if (isDue(a)) row.due += 1;
+      if (!countedIds.has(a.id)) return; /* duplicate view of an opportunity already counted */
       /* an "outreach" status is a warm outreach, not yet an application */
       if (isOutreach(a)) row.d.outreach += 1;
       else row.d.apps += 1;
@@ -2013,7 +2135,6 @@ export default function FlightDeck() {
       if (reached(a, "screening")) row.d.screens += 1;
       if (reached(a, "interview")) row.d.interviews += 1;
       if (a.status === "offer" || (a.milestonesLogged || []).includes("offer")) row.d.offers += 1;
-      if (isDue(a)) row.due += 1;
     });
     return Array.from(map.values()).sort((x, y) => {
       if (x.weekStart && y.weekStart) return y.weekStart.localeCompare(x.weekStart);
@@ -2603,27 +2724,40 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   /* ---------- mutations ---------- */
   const setAppStatus = (id, status) => {
     let winMsg = "";
+    let syncMsg = "";
     mutate(
       (s) => {
         let addWins = [];
-        const applications = s.applications.map((a) => {
+        let updatedSource = null;
+        let applications = s.applications.map((a) => {
           if (a.id !== id) return a;
           const wasBlank = !a.status;
           const m = computeMilestoneWins(a, status);
           if (m) addWins = m.wins;
-          return {
+          updatedSource = {
             ...a,
             status,
             contacted: wasBlank && status && !a.contacted ? today() : a.contacted,
             milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged,
           };
+          return updatedSource;
         });
         if (addWins.length) winMsg = addWins.map((w) => w.text).join(" · ");
-        return { ...s, applications, accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments };
+        /* screening onward is a company-level event for that job title — bring
+           every sibling entry and linked contact to the same status */
+        let accounts = s.accounts;
+        if (updatedSource) {
+          const prop = propagateConvergedStatus(applications, accounts, updatedSource, status);
+          applications = prop.applications;
+          accounts = prop.accounts;
+          if (prop.changed) syncMsg = `🔗 ${prop.changed} other entr${prop.changed === 1 ? "y" : "ies"} for this role set to "${status}" — counted once`;
+        }
+        return { ...s, applications, accounts, accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments };
       },
       "Status updated — funnel recalculated"
     );
     if (winMsg) setTimeout(() => flash(winMsg), 400); /* surface the win after the status toast */
+    else if (syncMsg) setTimeout(() => flash(syncMsg), 400);
   };
 
   /* excel-style inline cell commit */
@@ -2894,6 +3028,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               contacts: (acc.contacts || []).map((c) => (c.linkedApplicationId === entry.id ? { ...c, followUps: synced } : c)),
             }));
           }
+          /* screening onward is a company-level event for that job title —
+             bring every sibling entry and linked contact to the same status */
+          const source = applications.find((a) => (entry ? a.id === entry.id : a.company === data.company && a.role === data.role && a.status === data.status));
+          if (source) {
+            const prop = propagateConvergedStatus(applications, accounts, source, data.status);
+            applications = prop.applications;
+            accounts = prop.accounts;
+          }
           return { ...s, applications, accounts, accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments };
         },
         entry ? "Application updated" : "Application added — funnel updated"
@@ -2926,9 +3068,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           return { ...a, milestonesLogged: prev.milestonesLogged || [] };
         });
 
-        const accounts = entry
+        let accounts = entry
           ? s.accounts.map((acc) => (acc.id === entry.id ? { ...acc, ...data, contacts: newContacts } : acc))
           : [{ id: uid(), ...data, contacts: newContacts }, ...s.accounts];
+
+        /* a contact moved to "discovery call"/"ongoing"/"closed" maps to a
+           converged application status — so the same company+role convergence
+           applies from this side too, keeping Accounts and Pipeline agreed */
+        let propagatedApps = finalApps;
+        finalApps.forEach((a) => {
+          if (!a.fromAccountContact || !isConvergedStatus(a.status)) return;
+          const prev = oldAppsById.get(a.id);
+          if (prev && prev.status === a.status) return; /* nothing newly changed here */
+          const src = propagatedApps.find((x) => x.id === a.id) || a;
+          const prop = propagateConvergedStatus(propagatedApps, accounts, src, a.status);
+          propagatedApps = prop.applications;
+          accounts = prop.accounts;
+        });
 
         /* capture a CSV backup row for any contact newly archived via the
            form's manual archive button (before it ever reaches tombstoning) */
@@ -2941,7 +3097,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         return {
           ...s,
           accounts,
-          applications: finalApps,
+          applications: propagatedApps,
           accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments,
           archivedCsvRows: newCsvRows.length ? [...s.archivedCsvRows, ...newCsvRows] : s.archivedCsvRows,
         };
@@ -3262,7 +3418,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           centerLabel={donutMode === "status" ? "BY STATUS" : donutMode === "source" ? "BY SOURCE" : "OUTREACH"}
           data={
             donutMode === "status"
-              ? APP_STATUSES.map((s) => ({ label: statusLabel(s), value: apps.filter((a) => (a.status ?? "") === s).length, color: statusDonutColor(s) }))
+              ? /* stage counts collapse converged duplicates — one company+role
+                   at screening is one screening slice, not one per contact */
+                (() => {
+                  const counted = collapseCountedEntries(apps);
+                  return APP_STATUSES.map((s) => ({ label: statusLabel(s), value: counted.filter((a) => (a.status ?? "") === s).length, color: statusDonutColor(s) }));
+                })()
               : donutMode === "source"
               ? (() => {
                   const buckets = new Map();
