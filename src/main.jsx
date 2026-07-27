@@ -2841,6 +2841,32 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     setModal({ kind: "account", entry: acc });
   };
 
+  /* jumps the other way: from an account's "N linked" cell straight into the
+     Applications view, filtered to just that company's entries. Uses "all" so
+     closed/bad-fit entries stay visible — the point is to see everything this
+     account is connected to, not just the open ones — and clears the source
+     and status filters so nothing silently hides a row. */
+  const openRelatedApplications = (company) => {
+    const name = (company || "").trim();
+    if (!name) return;
+    setMode(2);
+    setCrmView("applications");
+    setPipeFilter("all");
+    setPipeSourceFilter("");
+    setPipeStatusFilter("");
+    setPipeSearch(name);
+    setPipePage(0);
+  };
+
+  /* opens one specific application/outreach entry directly in its own modal —
+     used by the related-applications list inside the account modal */
+  const openApplicationEntry = (app) => {
+    if (!app) return;
+    setMode(2);
+    setCrmView("applications");
+    setModal({ kind: "application", entry: app });
+  };
+
   /* bulk-converts selected standalone applications into accounts. Applications
      already synced FROM an account (fromAccountContact) are silently skipped —
      they're already an account relationship, there's nothing to convert. Each
@@ -4876,12 +4902,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           <div style={{ fontFamily: mono, fontSize: 10, color: C.blue, marginTop: 4 }}>{outreachedCount} outreached</div>
                         )}
                       </td>
-                      <td style={{ ...td, minWidth: 150 }}>
+                      <td style={{ ...td, minWidth: 150 }} onClick={(e) => e.stopPropagation()}>
                         {related.length === 0 ? (
                           <span style={{ color: C.muted, fontSize: 12 }}>—</span>
                         ) : (
-                          <div style={{ fontSize: 12 }}>
-                            <span style={{ color: C.blue, fontWeight: 700 }}>{related.length} linked</span>
+                          <button
+                            onClick={() => openRelatedApplications(acc.company)}
+                            title={`Show ${acc.company || "this account"}'s applications & outreach in the Applications view`}
+                            style={{ background: "transparent", border: "none", padding: 0, textAlign: "left", cursor: "pointer", fontSize: 12, width: "100%" }}
+                          >
+                            <span style={{ color: C.blue, fontWeight: 700, textDecoration: "underline" }}>{related.length} linked →</span>
                             <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
                               {related
                                 .slice(0, 3)
@@ -4889,7 +4919,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                                 .join(", ")}
                               {related.length > 3 ? "…" : ""}
                             </div>
-                          </div>
+                          </button>
                         )}
                       </td>
                       <td style={{ ...td, minWidth: 150 }}>{cellInput(acc, "notes", { ph: "notes…", onCommit: updateAccountField })}</td>
@@ -4962,7 +4992,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   ))}
                   <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
                     {outreachedCount > 0 && <span style={{ fontSize: 11, color: C.blue }}>{outreachedCount} outreached</span>}
-                    {related.length > 0 && <span style={{ fontSize: 11, color: C.blue }}>{related.length} related app{related.length === 1 ? "" : "s"}</span>}
+                    {related.length > 0 && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation(); /* don't also open the account modal */
+                          openRelatedApplications(acc.company);
+                        }}
+                        style={{ background: "transparent", border: "none", padding: 0, fontSize: 11, color: C.blue, textDecoration: "underline", cursor: "pointer" }}
+                      >
+                        {related.length} related app{related.length === 1 ? "" : "s"} →
+                      </button>
+                    )}
                   </div>
                 </SwipeRow>
               );
@@ -4972,7 +5012,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         {rowsMobile && <Pagination page={accPage} setPage={setAccPage} total={shownAccounts.length} />}
 
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
-          {isDesktop ? "Click any cell to edit · click Contacts to manage the full contact list." : "Tap a row to manage contacts and details."} Related applications link automatically by company name.
+          {isDesktop ? "Click any cell to edit · click Contacts to manage the full contact list." : "Tap a row to manage contacts and details."} Related applications link automatically by company name — click the linked count to jump to them.
         </div>
           </>
         )}
@@ -5871,6 +5911,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             mutate((s) => ({ ...s, lastCsvPromptDate: today() }));
           }}
           onDeleteCsvRows={() => mutate((s) => ({ ...s, archivedCsvRows: [] }), "Archive backup cleared")}
+          onOpenApplication={openApplicationEntry}
         />
       )}
       {modal && modal.kind === "parseJobPost" && (
@@ -5986,7 +6027,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows }) {
+function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
     if (kind === "application") {
@@ -7208,13 +7249,36 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     <Label>Related applications ({related.length})</Label>
                     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                       {related.map((r) => (
-                        <div key={r.id} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "8px 10px", fontSize: 12 }}>
-                          <span style={{ fontWeight: 700 }}>{r.role || "Role not set"}</span>
-                          <span style={{ color: statusColor(r.status), marginLeft: 8, fontFamily: mono, fontSize: 11 }}>{statusLabel(r.status)}</span>
-                        </div>
+                        <button
+                          key={r.id}
+                          onClick={() => onOpenApplication && onOpenApplication(r)}
+                          title="Open this entry in the Applications view"
+                          style={{
+                            background: C.bg,
+                            border: `1px solid ${C.panelEdge}`,
+                            borderRadius: 8,
+                            padding: "8px 10px",
+                            fontSize: 12,
+                            textAlign: "left",
+                            cursor: onOpenApplication ? "pointer" : "default",
+                            color: C.ink,
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 8,
+                            width: "100%",
+                            boxSizing: "border-box",
+                          }}
+                        >
+                          <span style={{ fontWeight: 700, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.role || "Role not set"}</span>
+                          <span style={{ color: statusColor(r.status), fontFamily: mono, fontSize: 11, flexShrink: 0 }}>{statusLabel(r.status)}</span>
+                          {r.contacted && <span style={{ color: C.muted, fontFamily: mono, fontSize: 10, flexShrink: 0 }}>{r.contacted}</span>}
+                          <span style={{ marginLeft: "auto", color: C.blue, fontSize: 12, flexShrink: 0 }}>→</span>
+                        </button>
                       ))}
                     </div>
-                    <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>Linked automatically by matching company name.</div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+                      Linked automatically by matching company name. Click one to open it — unsaved changes here are discarded, so save first if you've edited anything.
+                    </div>
                   </div>
                 );
               })()}
