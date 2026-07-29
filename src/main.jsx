@@ -125,7 +125,12 @@ const addDays = (isoDate, n) => {
   const d = new Date(isoDate + "T00:00:00");
   if (isNaN(d)) return "";
   d.setDate(d.getDate() + (+n || 0));
-  return d.toISOString().slice(0, 10);
+  /* MUST use iso(), not d.toISOString(): the Date above is LOCAL midnight, and
+     toISOString converts to UTC — so anywhere east of Greenwich (PH is UTC+8,
+     local midnight = 16:00 UTC the day before) every result came back a full
+     day early. That made follow-ups fire a day sooner than scheduled and made
+     week-end land on Friday instead of Saturday. iso() offsets it back. */
+  return iso(d);
 };
 
 /* ---- application status model ---- */
@@ -7028,6 +7033,23 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               if (c.archivedAt) return null; /* archived — hidden from view, still present in data until it fully ages out */
               const setContact = (patch) => setF((p) => ({ ...p, contacts: p.contacts.map((x, j) => (j === i ? { ...x, ...patch } : x)) }));
               const fus = c.followUps || [];
+              /* Marking a contact as outreached (or any further stage) IS the
+                 act of recording that contact happened — so it stamps today's
+                 date and seeds the follow-up schedule automatically, the same
+                 way typing a date manually already did. Only fills a BLANK
+                 date: an existing one is real history and never overwritten,
+                 so back-dating an old outreach then setting its status still
+                 keeps the date you entered. */
+              const setContactStamped = (patch) => {
+                const willBeContacted = "status" in patch ? !!patch.status : !!c.status;
+                const needsDate = willBeContacted && !c.contacted;
+                if (!needsDate) return setContact(patch);
+                setContact({
+                  ...patch,
+                  contacted: today(),
+                  followUps: fus.length === 0 ? DEFAULT_FOLLOWUPS.map((d) => ({ days: d, done: false })) : fus,
+                });
+              };
               return (
                 <div key={c.id || i} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10, marginBottom: 8 }}>
                   <div style={{ display: "flex", gap: 8, marginBottom: 6, alignItems: "center" }}>
@@ -7097,7 +7119,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 6 }}>
                     <select
                       value={c.status}
-                      onChange={(e) => setContact({ status: e.target.value })}
+                      onChange={(e) => setContactStamped({ status: e.target.value })}
                       style={{ ...selectStyle, fontSize: 13, padding: "8px 10px", color: c.status ? contactStatusColor(c.status) : C.muted }}
                     >
                       {CONTACT_STATUSES.map((s) => (
@@ -7108,7 +7130,15 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       {OUTREACH_KINDS.map((k) => (
                         <button
                           key={k}
-                          onClick={() => setContact({ outreachKind: c.outreachKind === k ? "" : k })}
+                          onClick={() => {
+                            const turningOn = c.outreachKind !== k;
+                            /* picking warm/cold is itself declaring the outreach
+                               happened — so set the status too if it's still blank */
+                            setContactStamped({
+                              outreachKind: turningOn ? k : "",
+                              ...(turningOn && !c.status ? { status: "outreach" } : {}),
+                            });
+                          }}
                           style={{
                             flex: 1,
                             fontFamily: sans,
