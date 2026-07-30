@@ -645,7 +645,72 @@ const discoveryDateOf = (a) => a?.researchedAt || "";
    is permanent, because coverage measures progress against a fixed set. If
    working a company removed it from the pool, "14 of 45 covered" would become
    uncomputable as the pool drained. One record, two views. */
+/* ---- unified pool membership ----
+   A pool member can be tracked either as an APPLICATION (you're going after a
+   specific role) or as an ACCOUNT (you're going after the company, and will
+   work several contacts inside it). Both carry `fromPool`, so coverage counts
+   them the same way and the Pool tab lists them together — the distinction is
+   only about which shape of record fits the target.
+
+   Normalising here means computePoolGoal and the Pool view read one list
+   instead of each re-deriving the same thing from two arrays. */
+function poolMembers(state, apps) {
+  const out = new Map();
+  const put = (m) => {
+    const cur = out.get(m.key);
+    if (!cur) return out.set(m.key, m);
+    /* same company tracked both ways — merge rather than double-count */
+    out.set(m.key, {
+      ...cur,
+      worked: cur.worked || m.worked,
+      discovered: cur.discovered || m.discovered,
+      firstContact: [cur.firstContact, m.firstContact].filter(Boolean).sort()[0] || "",
+      discoveredAt: [cur.discoveredAt, m.discoveredAt].filter(Boolean).sort()[0] || "",
+      refs: [...cur.refs, ...m.refs],
+    });
+  };
+  (apps || []).forEach((a) => {
+    if (!isFromPool(a) || a.archivedAt || a.tombstoned) return;
+    const key = normCompanyName(a.company);
+    if (!key) return;
+    put({
+      key,
+      company: a.company,
+      kind: "application",
+      poolName: a.poolName || "",
+      hook: a.hook || "",
+      worked: poolCompanyWorked(a),
+      discovered: poolCompanyDiscovered(a),
+      firstContact: poolCompanyWorked(a) ? a.contacted : "",
+      discoveredAt: discoveryDateOf(a),
+      refs: [{ kind: "application", id: a.id, entry: a }],
+    });
+  });
+  (state?.accounts || []).forEach((acc) => {
+    if (!isFromPool(acc) || acc.archivedAt || acc.tombstoned) return;
+    const key = normCompanyName(acc.company);
+    if (!key) return;
+    /* an account is WORKED once any of its contacts has real activity */
+    const live = (acc.contacts || []).filter((c) => !c.archivedAt && !c.tombstoned && c.status && c.contacted);
+    const firstContact = live.map((c) => c.contacted).sort()[0] || "";
+    put({
+      key,
+      company: acc.company,
+      kind: "account",
+      poolName: acc.poolName || "",
+      hook: acc.hook || "",
+      worked: live.length > 0,
+      discovered: !!(acc.researchedAt || (acc.hook || "").trim()),
+      firstContact,
+      discoveredAt: acc.researchedAt || "",
+      refs: [{ kind: "account", id: acc.id, entry: acc }],
+    });
+  });
+  return Array.from(out.values());
+}
+
 const poolReadiness = (a) => (poolCompanyWorked(a) ? "contacted" : poolCompanyDiscovered(a) ? "hooked" : "parked");
+const memberReadiness = (m) => (m.worked ? "contacted" : m.discovered ? "hooked" : "parked");
 const POOL_READINESS_META = {
   parked: { label: "PARKED", color: "muted", hint: "no hook yet" },
   hooked: { label: "HOOKED", color: "amber", hint: "ready to write" },
@@ -736,25 +801,10 @@ function computePoolGoal(state, apps) {
   const cyc = cyclePhase(state?.settings);
   const floor = carryFloor(state?.settings);
 
-  /* distinct by company — coverage is about companies reached, not rows made */
-  const byCompany = new Map();
-  (apps || []).forEach((a) => {
-    if (!isFromPool(a) || a.archivedAt || a.tombstoned) return;
-    const key = normCompanyName(a.company);
-    if (!key) return;
-    const cur = byCompany.get(key) || { company: a.company, worked: false, discovered: false, poolName: a.poolName || "", firstContact: "", discoveredAt: "" };
-    if (poolCompanyWorked(a)) {
-      cur.worked = true;
-      if (a.contacted && (!cur.firstContact || a.contacted < cur.firstContact)) cur.firstContact = a.contacted;
-    }
-    if (poolCompanyDiscovered(a)) {
-      cur.discovered = true;
-      const d = discoveryDateOf(a);
-      if (d && (!cur.discoveredAt || d < cur.discoveredAt)) cur.discoveredAt = d;
-    }
-    byCompany.set(key, cur);
-  });
-  const members = Array.from(byCompany.values());
+  /* distinct by company across BOTH shapes — coverage is about companies
+     reached, not rows made, and a company tracked as an account counts the
+     same as one tracked as an application */
+  const members = poolMembers(state, apps);
   const total = members.length;
   const worked = members.filter((m) => m.worked).length;
   const remaining = total - worked;
@@ -3462,16 +3512,30 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      so there's no separate closure date to drift out of sync. Scoped to the Pool
      tab only — "+ Track application" stays free, because a referral or an inbound
      posting isn't outbound discovery. */
-  const addToPool = (nameRaw, hook) => {
+  const addToPool = (nameRaw, hook, kind) => {
     const name = (nameRaw || "").trim();
     if (!name) return;
     const key = normCompanyName(name);
     const phase = cyclePhase(state.settings);
-    const already = apps.some((a) => isFromPool(a) && !a.archivedAt && normCompanyName(a.company) === key);
+    const already =
+      apps.some((a) => isFromPool(a) && !a.archivedAt && normCompanyName(a.company) === key) ||
+      (state.accounts || []).some((acc) => isFromPool(acc) && !acc.archivedAt && normCompanyName(acc.company) === key);
     if (already) return flash("Already in the pool");
     if ((state.poolBench || []).some((b) => normCompanyName(b.company) === key)) return flash("Already on the bench");
     if (phase.phase !== "discovery") {
-      mutate((s) => ({ ...s, poolBench: [{ id: uid(), company: name, addedAt: today() }, ...(s.poolBench || [])] }), "🪑 Parked on the bench");
+      mutate((s) => ({ ...s, poolBench: [{ id: uid(), company: name, addedAt: today(), kind: kind || "application" }, ...(s.poolBench || [])] }), "🪑 Parked on the bench");
+      return;
+    }
+    const h = (hook || "").trim();
+    const poolName = `Cycle ${phase.cycleIndex + 1}`;
+    if (kind === "account") {
+      mutate((s) => ({
+        ...s,
+        accounts: [
+          { id: uid(), company: name, website: "", industry: "", headcount: "", status: "", notes: "", hook: h, researchedAt: h ? today() : "", fromPool: true, poolName, contacts: [] },
+          ...s.accounts,
+        ],
+      }), "🎯 Added to pool as an account");
       return;
     }
     mutate((s) => ({
@@ -3483,16 +3547,30 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           role: "",
           status: "", /* saved-for-later: a pool member costs nothing until written to */
           contacted: "",
-          hook: (hook || "").trim(),
-          researchedAt: (hook || "").trim() ? today() : "",
+          hook: h,
+          researchedAt: h ? today() : "",
           fromPool: true,
-          poolName: `Cycle ${phase.cycleIndex + 1}`,
+          poolName,
           followUps: [],
           milestonesLogged: [],
         },
         ...s.applications,
       ],
     }), "🎯 Added to pool");
+  };
+  /* escape hatch from the fast path: opens the full Application or Account
+     modal prefilled, for targets that deserve the whole record up front */
+  const openFullPoolForm = (nameRaw, hook, kind) => {
+    const name = (nameRaw || "").trim();
+    if (!name) return;
+    const phase = cyclePhase(state.settings);
+    if (phase.phase !== "discovery") return flash("Pool is closed — park it on the bench instead");
+    const h = (hook || "").trim();
+    setModal({
+      kind: kind === "account" ? "account" : "application",
+      entry: null,
+      prefill: { company: name, hook: h, researchedAt: h ? today() : "", fromPool: true, poolName: `Cycle ${phase.cycleIndex + 1}` },
+    });
   };
   /* pulls bench names into the pool — only meaningful once a discovery week
      has come round, which is exactly when the cycle reopens */
@@ -3502,35 +3580,36 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     mutate((s) => {
       const take = (s.poolBench || []).filter((b) => ids.includes(b.id));
       if (!take.length) return s;
-      const existing = new Set(s.applications.filter((a) => isFromPool(a)).map((a) => normCompanyName(a.company)));
-      const newApps = take
-        .filter((b) => !existing.has(normCompanyName(b.company)))
-        .map((b) => ({
-          id: uid(),
-          company: b.company,
-          role: "",
-          status: "",
-          contacted: "",
-          hook: "",
-          researchedAt: "",
-          fromPool: true,
-          poolName: `Cycle ${phase.cycleIndex + 1}`,
-          followUps: [],
-          milestonesLogged: [],
-        }));
-      return { ...s, poolBench: (s.poolBench || []).filter((b) => !ids.includes(b.id)), applications: [...newApps, ...s.applications] };
+      const existing = new Set([
+        ...s.applications.filter((a) => isFromPool(a)).map((a) => normCompanyName(a.company)),
+        ...(s.accounts || []).filter((a) => isFromPool(a)).map((a) => normCompanyName(a.company)),
+      ]);
+      const fresh = take.filter((b) => !existing.has(normCompanyName(b.company)));
+      const poolName = `Cycle ${phase.cycleIndex + 1}`;
+      /* the bench remembers which shape you meant when you parked it */
+      const newApps = fresh
+        .filter((b) => (b.kind || "application") !== "account")
+        .map((b) => ({ id: uid(), company: b.company, role: "", status: "", contacted: "", hook: "", researchedAt: "", fromPool: true, poolName, followUps: [], milestonesLogged: [] }));
+      const newAccts = fresh
+        .filter((b) => (b.kind || "application") === "account")
+        .map((b) => ({ id: uid(), company: b.company, website: "", industry: "", headcount: "", status: "", notes: "", hook: "", researchedAt: "", fromPool: true, poolName, contacts: [] }));
+      return {
+        ...s,
+        poolBench: (s.poolBench || []).filter((b) => !ids.includes(b.id)),
+        applications: [...newApps, ...s.applications],
+        accounts: [...newAccts, ...(s.accounts || [])],
+      };
     }, "🎯 Pulled into the pool");
   };
   const removeFromBench = (id) => mutate((s) => ({ ...s, poolBench: (s.poolBench || []).filter((b) => b.id !== id) }), "Removed from bench");
   /* writing the hook IS the discovery event — stamping researchedAt is what
      makes it count toward discovery-week progress */
-  const setPoolHook = (id, hook) =>
-    mutate((s) => ({
-      ...s,
-      applications: s.applications.map((a) =>
-        a.id === id ? { ...a, hook, researchedAt: hook.trim() ? a.researchedAt || today() : "" } : a
-      ),
-    }));
+  const setPoolHook = (id, hook, kind) =>
+    mutate((s) =>
+      kind === "account"
+        ? { ...s, accounts: (s.accounts || []).map((a) => (a.id === id ? { ...a, hook, researchedAt: hook.trim() ? a.researchedAt || today() : "" } : a)) }
+        : { ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, hook, researchedAt: hook.trim() ? a.researchedAt || today() : "" } : a)) }
+    );
 
   /* ============================================================
      POOL VIEW — the discovery half of the CRM.
@@ -3541,13 +3620,20 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      counted here but are shown as a link into the pipeline, not as rows —
      they're being worked over there now.
      ============================================================ */
+  /* opens whichever record backs this member — application or account */
+  const openPoolMember = (m) => {
+    const ref = m.refs[0];
+    if (!ref) return;
+    setModal({ kind: ref.kind, entry: ref.entry });
+  };
+
   const renderPool = () => {
     const pg = computePoolGoal(state, apps);
     const phase = pg.phase;
     const open = phase === "discovery";
-    const poolApps = apps.filter((a) => isFromPool(a) && !a.archivedAt);
+    const members = poolMembers(state, apps);
     const byReadiness = { parked: [], hooked: [], contacted: [] };
-    poolApps.forEach((a) => byReadiness[poolReadiness(a)].push(a));
+    members.forEach((m) => byReadiness[memberReadiness(m)].push(m));
     const bench = state.poolBench || [];
 
     const readinessBadge = (r) => {
@@ -3585,13 +3671,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         </div>
 
-        <PoolAdd open={open} onAdd={addToPool} />
+        <PoolAdd open={open} onAdd={addToPool} onOpenFull={openFullPoolForm} />
 
         {byReadiness.parked.length > 0 && (
           <>
             <Label>Need a hook ({byReadiness.parked.length})</Label>
-            {byReadiness.parked.map((a) => (
-              <PoolRow key={a.id} app={a} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={() => setModal({ kind: "application", entry: a })} />
+            {byReadiness.parked.map((m) => (
+              <PoolRow key={m.key} member={m} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={openPoolMember} />
             ))}
           </>
         )}
@@ -3599,8 +3685,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         {byReadiness.hooked.length > 0 && (
           <>
             <Label style={{ marginTop: 14 }}>Ready to write ({byReadiness.hooked.length})</Label>
-            {byReadiness.hooked.map((a) => (
-              <PoolRow key={a.id} app={a} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={() => setModal({ kind: "application", entry: a })} />
+            {byReadiness.hooked.map((m) => (
+              <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} />
             ))}
           </>
         )}
@@ -3629,7 +3715,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         )}
 
-        {poolApps.length === 0 && (
+        {members.length === 0 && (
           <div style={{ color: C.muted, fontSize: 13, padding: "18px 4px", textAlign: "center", lineHeight: 1.6 }}>
             The pool is empty. {open ? "Add the companies you'll work through this cycle — 40–50 in one or two sittings, then it closes." : "Discovery week has passed, so new names go to the bench."}
           </div>
@@ -3652,7 +3738,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             bench.map((b, i) => (
               <div key={b.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.panel, border: `1px solid ${i < 5 && open ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 6 }}>
                 <div>
-                  <div style={{ fontSize: 14 }}>{b.company}</div>
+                  <div style={{ fontSize: 14 }}>
+                    <span style={{ marginRight: 5, fontSize: 12 }}>{(b.kind || "application") === "account" ? "🏢" : "📋"}</span>
+                    {b.company}
+                  </div>
                   <div style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>
                     parked {b.addedAt}
                     {i < 5 && open ? " · next in" : ""}
@@ -4815,7 +4904,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               /* the Pool tab exists only while pool pacing is on — with the mode
                  off there is no closed set to work through, so an empty tab
                  would just be noise */
-              ...(state.settings?.goalMode === "pool" ? [["pool", `🎯 Pool (${apps.filter((a) => isFromPool(a) && !a.archivedAt).length})`]] : []),
+              ...(state.settings?.goalMode === "pool" ? [["pool", `🎯 Pool (${poolMembers(state, apps).length})`]] : []),
             ].map(([k, l]) => (
               <button
                 key={k}
@@ -7321,9 +7410,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         rampEnabled: entry?.rampEnabled || false,
       };
     if (kind === "winSnapshot") return { company: "", role: "", date: today() };
-    if (kind === "account")
+    if (kind === "account") {
+      const pre = modal.prefill || {};
       return {
-        company: entry?.company || "",
+        company: entry?.company || pre.company || "",
         website: entry?.website || "",
         industry: entry?.industry || "",
         headcount: entry?.headcount || "",
@@ -7331,6 +7421,12 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         highConfidence: entry?.highConfidence || false,
         badReasons: entry?.badReasons ? [...entry.badReasons] : [],
         notes: entry?.notes || "",
+        /* pool fields ride along so an account created from the Pool tab is a
+           first-class pool member, countable in coverage */
+        hook: entry?.hook ?? pre.hook ?? "",
+        researchedAt: entry?.researchedAt ?? pre.researchedAt ?? "",
+        fromPool: entry?.fromPool ?? pre.fromPool ?? false,
+        poolName: entry?.poolName ?? pre.poolName ?? "",
         contacts: entry?.contacts
           ? entry.contacts.map((c) => ({
               id: c.id || uid(),
@@ -7349,6 +7445,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             }))
           : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], linkedApplicationId: null }],
       };
+    }
     if (kind === "content")
       return {
         title: entry?.title || "",
@@ -8436,6 +8533,24 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             <Field label="Website" value={f.website} onChange={set("website")} placeholder="https://acme.com" />
             <Field label="Industry" value={f.industry} onChange={set("industry")} placeholder="e.g. Fintech, SaaS" />
             <Field label="Headcount" value={f.headcount} onChange={set("headcount")} placeholder="e.g. 50-200, 500+" />
+            {f.fromPool && (
+              <div style={{ marginBottom: 12 }}>
+                <Label>🎯 Pool hook — one line</Label>
+                <input
+                  value={f.hook}
+                  onChange={(e) => {
+                    const v = e.target.value.slice(0, 120);
+                    setF((p) => ({ ...p, hook: v, researchedAt: v.trim() ? p.researchedAt || today() : "" }));
+                  }}
+                  placeholder="Rebrand shipped 3 wks ago"
+                  style={inputStyle}
+                />
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 4, lineHeight: 1.5 }}>
+                  Writing the hook is the discovery event — it stamps the research date and counts toward this cycle's discovery target.
+                  {f.researchedAt ? ` Researched ${f.researchedAt}.` : ""}
+                </div>
+              </div>
+            )}
 
             <div style={{ marginBottom: 12 }}>
               <Label>Account status</Label>
@@ -9316,20 +9431,69 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
   );
 }
 
-/* the pool's own add form. Closed weeks don't hide it — they relabel it, so
-   parking a name is one action rather than a dead end you have to work around */
-function PoolAdd({ open, onAdd }) {
+/* The pool's add form. Two deliberate design calls:
+
+   1. TYPE CHOICE — a pool target is either an APPLICATION (going after a
+      specific role) or an ACCOUNT (going after the company, working several
+      contacts inside it). You pick; both count identically toward coverage.
+
+   2. FAST PATH BY DEFAULT — building a 45-company pool in two sittings means
+      the common case has to be company + hook + enter. So the inline form stays
+      minimal, and "More fields" opens the full Application or Account modal
+      prefilled when a target deserves the whole record up front.
+
+   Closed weeks don't hide the form, they relabel it — parking a name should be
+   one action, not a dead end you have to work around. */
+function PoolAdd({ open, onAdd, onOpenFull }) {
+  const [kind, setKind] = useState("application");
   const [company, setCompany] = useState("");
   const [hook, setHook] = useState("");
-  const submit = () => {
-    if (!company.trim()) return;
-    onAdd(company, hook);
+  const reset = () => {
     setCompany("");
     setHook("");
+  };
+  const submit = () => {
+    if (!company.trim()) return;
+    onAdd(company, hook, kind);
+    reset();
+  };
+  const full = () => {
+    if (!company.trim()) return;
+    onOpenFull(company, hook, kind);
+    reset();
   };
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
       <Label>{open ? "Add to pool" : "Park on the bench"}</Label>
+      {open && (
+        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+          {[
+            ["application", "📋 Application", "chasing one role"],
+            ["account", "🏢 Account", "several contacts"],
+          ].map(([k, label, sub]) => (
+            <button
+              key={k}
+              onClick={() => setKind(k)}
+              style={{
+                flex: 1,
+                textAlign: "left",
+                fontFamily: sans,
+                fontSize: 12,
+                fontWeight: 700,
+                padding: "8px 10px",
+                borderRadius: 10,
+                cursor: "pointer",
+                border: `1px solid ${kind === k ? C.amber : C.panelEdge}`,
+                background: kind === k ? "rgba(245,185,66,0.1)" : "transparent",
+                color: kind === k ? C.amber : C.muted,
+              }}
+            >
+              {label}
+              <div style={{ fontSize: 10, fontWeight: 400, color: C.muted, marginTop: 2 }}>{sub}</div>
+            </button>
+          ))}
+        </div>
+      )}
       <input value={company} onChange={(e) => setCompany(e.target.value)} placeholder="Company name" style={{ ...inputStyle, marginBottom: 6 }} onKeyDown={(e) => e.key === "Enter" && submit()} />
       {open && (
         <>
@@ -9337,9 +9501,16 @@ function PoolAdd({ open, onAdd }) {
           <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>One recent post, one launch, one hire. Five minutes, not a dossier.</div>
         </>
       )}
-      <Btn onClick={submit} disabled={!company.trim()} style={{ width: "100%", marginTop: 8 }}>
-        {open ? "🎯 Add to pool" : "🪑 Park on bench"}
-      </Btn>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <Btn onClick={submit} disabled={!company.trim()} style={{ flex: 2 }}>
+          {open ? `🎯 Add as ${kind}` : "🪑 Park on bench"}
+        </Btn>
+        {open && (
+          <Btn ghost onClick={full} disabled={!company.trim()} style={{ flex: 1 }}>
+            More fields…
+          </Btn>
+        )}
+      </div>
     </div>
   );
 }
@@ -9347,14 +9518,21 @@ function PoolAdd({ open, onAdd }) {
 /* one pool member. The hook is editable inline because writing it IS the
    discovery event — making that a modal trip would be friction on the exact
    action the whole cycle is built around. */
-function PoolRow({ app, badge, onHook, onOpen }) {
-  const [draft, setDraft] = useState(app.hook || "");
-  const dirty = draft !== (app.hook || "");
+function PoolRow({ member, badge, onHook, onOpen }) {
+  const [draft, setDraft] = useState(member.hook || "");
+  const dirty = draft !== (member.hook || "");
+  const ref = member.refs[0];
+  const save = () => ref && onHook(ref.id, draft, ref.kind);
+  const contactCount = member.kind === "account" ? (ref?.entry?.contacts || []).filter((c) => !c.archivedAt).length : 0;
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", marginBottom: 6 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6 }}>
-        <span onClick={onOpen} style={{ fontSize: 14, fontWeight: 700, cursor: "pointer", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {app.company || "Unnamed"}
+        <span onClick={() => onOpen(member)} style={{ fontSize: 14, fontWeight: 700, cursor: "pointer", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span style={{ marginRight: 5, fontSize: 12 }} title={member.kind === "account" ? "Tracked as an account" : "Tracked as an application"}>
+            {member.kind === "account" ? "🏢" : "📋"}
+          </span>
+          {member.company || "Unnamed"}
+          {contactCount > 0 && <span style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}> · {contactCount} contact{contactCount === 1 ? "" : "s"}</span>}
         </span>
         {badge}
       </div>
@@ -9364,15 +9542,15 @@ function PoolRow({ app, badge, onHook, onOpen }) {
           onChange={(e) => setDraft(e.target.value.slice(0, 120))}
           placeholder="Hook — one line"
           style={{ ...inputStyle, fontSize: 13, padding: "7px 10px" }}
-          onKeyDown={(e) => e.key === "Enter" && dirty && onHook(app.id, draft)}
+          onKeyDown={(e) => e.key === "Enter" && dirty && save()}
         />
         {dirty && (
-          <Btn onClick={() => onHook(app.id, draft)} style={{ padding: "7px 11px", fontSize: 12, flexShrink: 0 }}>
+          <Btn onClick={save} style={{ padding: "7px 11px", fontSize: 12, flexShrink: 0 }}>
             Save
           </Btn>
         )}
       </div>
-      {app.researchedAt && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>researched {app.researchedAt}</div>}
+      {member.discoveredAt && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>researched {member.discoveredAt}</div>}
     </div>
   );
 }
