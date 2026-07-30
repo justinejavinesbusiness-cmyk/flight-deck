@@ -601,6 +601,98 @@ function computePublishedMilestoneWin(oldCount, newCount) {
 const isGoalActivity = (a) => !isBlankStatus(a);
 /* links an Account to Applications sharing the same company name (trimmed, case-insensitive) */
 const normCompanyName = (s) => (s || "").trim().toLowerCase();
+/* ============================================================
+   POOL INTEGRATION — the receiving end of Pool Mode
+
+   Pool Mode (a separate parallel build) pushes companies here as
+   applications carrying `fromPool: true` and the pool's name. Two things
+   follow from that tag:
+
+     · the row is badged, so you can always see which companies arrived from
+       a deliberate pool build rather than from ad-hoc browsing
+     · POOL PACING MODE becomes possible — a different goal model entirely
+
+   Why a different goal model: the standard goal is "N applications over N
+   days", which is unbounded by construction. You can never be ahead, only
+   behind. The pool philosophy replaces that with COVERAGE of a closed set:
+   a finite, completable target. The daily number stops being a quota you
+   invent and becomes a simple consequence of one weekly write budget.
+   ============================================================ */
+const isFromPool = (a) => !!a?.fromPool;
+const DEFAULT_POOL_WEEKLY_WRITE = 8;
+/* a pool company counts as covered on the same terms the rest of the app uses
+   for "this was real activity": a genuine status plus a contact date */
+const poolCompanyWorked = (a) => !!(a?.status && a?.contacted);
+
+/* Coverage + pacing over the pool-tagged companies. Distinct by company, so
+   several entries for one company (multiple roles or contacts) count once —
+   coverage is about companies reached, not rows created. */
+function computePoolGoal(state, apps) {
+  /* NOTE the ?? rather than ||: a deliberate 0 means "no weekly pacing, just
+     show me coverage", and `0 || DEFAULT` would silently override that. */
+  const raw = state?.settings?.poolWeeklyWrite;
+  const weeklyTarget = Math.max(0, Number.isFinite(+raw) ? +raw : DEFAULT_POOL_WEEKLY_WRITE);
+  const byCompany = new Map();
+  (apps || []).forEach((a) => {
+    if (!isFromPool(a) || a.archivedAt || a.tombstoned) return;
+    const key = normCompanyName(a.company);
+    if (!key) return;
+    const cur = byCompany.get(key) || { company: a.company, worked: false, poolName: a.poolName || "", firstContact: "" };
+    if (poolCompanyWorked(a)) {
+      cur.worked = true;
+      if (a.contacted && (!cur.firstContact || a.contacted < cur.firstContact)) cur.firstContact = a.contacted;
+    }
+    byCompany.set(key, cur);
+  });
+  const members = Array.from(byCompany.values());
+  const total = members.length;
+  const worked = members.filter((m) => m.worked).length;
+  const remaining = total - worked;
+  const mon = iso(mondayOfToday());
+  const writtenThisWeek = members.filter((m) => m.worked && m.firstContact && m.firstContact >= mon).length;
+
+  /* today's number: the weekly budget spread across Mon–Sat (Sunday rests),
+     then the SAME daily carry the rest of the app uses — short days push onto
+     tomorrow, strong days relieve it. No week-to-week rollover here: a closed
+     pool already bounds the work, so stacking debt across weeks would just
+     re-create the infinite quota this mode exists to remove. */
+  const perDay = weeklyTarget > 0 ? Math.max(1, Math.ceil(weeklyTarget / 6)) : 0;
+  const t = today();
+  let dailyCarry = 0;
+  let todaysTarget = 0;
+  let carryIntoToday = 0;
+  for (let i = 0; i < 7; i++) {
+    const d = addDays(mon, i);
+    if (d > t) break;
+    const dow = new Date(d + "T00:00:00").getDay();
+    const base = dow === 0 ? 0 : perDay;
+    const effective = Math.max(0, base + dailyCarry);
+    if (d === t) {
+      todaysTarget = Math.min(effective, Math.max(0, remaining + members.filter((m) => m.worked && m.firstContact === t).length));
+      carryIntoToday = dailyCarry;
+    }
+    const done = members.filter((m) => m.worked && m.firstContact === d).length;
+    dailyCarry = effective - done;
+  }
+  const doneToday = members.filter((m) => m.worked && m.firstContact === t).length;
+  return {
+    total,
+    worked,
+    remaining,
+    pct: total ? Math.round((worked / total) * 100) : 0,
+    weeklyTarget,
+    writtenThisWeek,
+    perDay,
+    todaysTarget,
+    carryIntoToday,
+    doneToday,
+    todayMet: doneToday >= todaysTarget,
+    weeksToCover: weeklyTarget > 0 && remaining > 0 ? Math.ceil(remaining / weeklyTarget) : 0,
+    poolName: members.find((m) => m.poolName)?.poolName || "",
+    members,
+  };
+}
+
 const relatedApplications = (accountCompany, apps) => {
   const key = normCompanyName(accountCompany);
   if (!key) return [];
@@ -1605,6 +1697,10 @@ function migrate(saved) {
      on one day used to make all 20 follow-ups come due on the same later day —
      a wall of red that trains you to ignore the flag entirely. 0 = no cap. */
   if (typeof s.settings.followUpDailyCap !== "number") s.settings.followUpDailyCap = DEFAULT_FOLLOWUP_DAILY_CAP;
+  /* "standard" = the original N-over-N-days quota. "pool" = coverage pacing
+     over Pool Mode's closed company set. */
+  if (s.settings.goalMode !== "pool") s.settings.goalMode = s.settings.goalMode === "pool" ? "pool" : s.settings.goalMode || "standard";
+  if (typeof s.settings.poolWeeklyWrite !== "number") s.settings.poolWeeklyWrite = DEFAULT_POOL_WEEKLY_WRITE;
   s.accounts = s.accounts.map((a) => ({ ...a, contacts: Array.isArray(a.contacts) ? a.contacts : [] }));
   /* one-time cleanup: a past bug dropped linkedApplicationId every time the
      account form reopened, causing outreach on a contact to spawn a fresh
@@ -3599,6 +3695,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               .slice(0, 10) || DEFAULT_FOLLOWUPS,
             timezoneOffset: typeof data.timezoneOffset === "number" ? data.timezoneOffset : 8,
             followUpDailyCap: Math.max(0, Math.min(99, +data.followUpDailyCap || 0)),
+            goalMode: data.goalMode === "pool" ? "pool" : "standard",
+            poolWeeklyWrite: Math.max(0, Math.min(99, +data.poolWeeklyWrite || 0)),
           },
           contentGoal: {
             ...s.contentGoal,
@@ -3705,6 +3803,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   const renderDashboard = () => {
     const g = computeGoal(state.goal, apps);
+    const poolMode = state.settings?.goalMode === "pool";
+    const pg = poolMode ? computePoolGoal(state, apps) : null;
     const isRestDay = new Date(today() + "T00:00:00").getDay() === 0;
     return (
     <>
@@ -3718,6 +3818,56 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <div style={{ fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 8 }}>Take a break today</div>
           <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, fontStyle: "italic", maxWidth: 380, margin: "0 auto" }}>{restDayQuote(today())}</div>
           <div style={{ fontSize: 11, color: C.muted, marginTop: 12 }}>No quota today — Sundays are for rest, not the funnel.</div>
+        </div>
+      ) : poolMode && pg && pg.total > 0 ? (
+        /* ---- POOL PACING ----
+           Replaces the open-ended daily quota with coverage of a closed set.
+           The headline is "X of Y companies", because that is finite and can
+           actually be finished; the daily number underneath is just the
+           weekly write budget spread across Mon–Sat. */
+        <div
+          onClick={() => setMode(1)}
+          style={{ background: C.panel, border: `1px solid ${pg.pct === 100 ? C.green : pg.todayMet ? C.green : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14, cursor: "pointer" }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <Label>🎯 Pool coverage{pg.poolName ? ` — ${pg.poolName}` : ""}</Label>
+            <span style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.green, border: `1px solid ${C.panelEdge}`, borderRadius: 20, padding: "3px 9px" }}>POOL PACE</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 6 }}>
+            <div style={{ fontFamily: mono, fontSize: 40, fontWeight: 800, color: pg.pct === 100 ? C.green : C.ink, lineHeight: 1.1 }}>
+              {pg.worked} / {pg.total}
+            </div>
+            <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.4 }}>
+              companies worked
+              <br />
+              {pg.remaining === 0 ? "✓ pool covered — time to refresh" : `${pg.remaining} left · ~${pg.weeksToCover} wk${pg.weeksToCover === 1 ? "" : "s"} at ${pg.weeklyTarget}/wk`}
+            </div>
+          </div>
+          <div style={{ height: 8, background: C.bg, borderRadius: 4, marginTop: 10, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
+            <div style={{ height: "100%", width: `${pg.pct}%`, background: pg.pct === 100 ? C.green : C.blue, borderRadius: 4, transition: "width 0.3s ease" }} />
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.panelEdge}` }}>
+            <div>
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted }}>TODAY</div>
+              <div style={{ fontFamily: mono, fontSize: 18, fontWeight: 800, color: pg.todayMet ? C.green : C.amber }}>
+                {pg.doneToday} / {pg.todaysTarget}
+              </div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted }}>THIS WEEK</div>
+              <div style={{ fontFamily: mono, fontSize: 18, fontWeight: 800, color: pg.writtenThisWeek >= pg.weeklyTarget ? C.green : C.ink }}>
+                {pg.writtenThisWeek} / {pg.weeklyTarget}
+              </div>
+            </div>
+          </div>
+          {pg.carryIntoToday !== 0 && (
+            <div style={{ fontSize: 11, color: pg.carryIntoToday > 0 ? C.red : C.green, marginTop: 8 }}>
+              {pg.carryIntoToday > 0 ? `⬆ +${pg.carryIntoToday} carried from yesterday` : `⬇ ${Math.abs(pg.carryIntoToday)} banked — lighter today`}
+            </div>
+          )}
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.5 }}>
+            No week-to-week debt in this mode — a closed pool already bounds the work.
+          </div>
         </div>
       ) : state.goal && g ? (
         <div
@@ -4171,6 +4321,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         })(),
       },
       { key: "checkPost", label: `⚠ Check posting (${apps.filter((a) => postingNeedsCheck(a) && !a.archivedAt).length})` },
+      { key: "fromPool", label: `🎯 From pool (${apps.filter((a) => isFromPool(a) && !a.archivedAt).length})` },
       { key: "badFit", label: `🚫 Bad fit (${apps.filter((a) => isBadFit(a) && !a.archivedAt).length})` },
       { key: "repliedRejected", label: `✉ Replied, then no (${apps.filter((a) => isRepliedThenRejected(a) && !a.archivedAt).length})` },
       { key: "noReply", label: `🔇 Closed, no reply (${apps.filter((a) => isRejectedNoReply(a) && !a.archivedAt).length})` },
@@ -4185,6 +4336,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? isDue(a)
           : pipeFilter === "checkPost"
           ? postingNeedsCheck(a)
+          : pipeFilter === "fromPool"
+          ? isFromPool(a)
           : pipeFilter === "blank"
           ? isBlankStatus(a)
           : pipeFilter === "active"
@@ -4652,6 +4805,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       </td>
                       <td style={{ ...td, minWidth: 130 }}>
                         {cellInput(a, "role", { ph: "Role applied for" })}
+                        {isFromPool(a) && (
+                          <div
+                            title={`Came from ${a.poolName || "a pool build"} in Pool Mode`}
+                            style={{ marginTop: 3, display: "inline-block", background: "rgba(74,222,128,0.12)", border: `1px solid ${C.green}`, borderRadius: 5, color: C.green, fontFamily: mono, fontSize: 9, padding: "1px 5px", letterSpacing: 0.4 }}
+                          >
+                            🎯 POOL{a.poolName ? ` · ${a.poolName}` : ""}
+                          </div>
+                        )}
                         {isReapply(a) && (
                           <button
                             onClick={(e) => {
@@ -4984,6 +5145,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 150 }}>
                         {a.company || "Unnamed"}
                         {a.role && <div style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}>{a.role}</div>}
+                        {isFromPool(a) && (
+                          <span style={{ display: "inline-block", marginTop: 3, marginRight: 4, background: "rgba(74,222,128,0.12)", border: `1px solid ${C.green}`, borderRadius: 5, color: C.green, fontFamily: mono, fontSize: 9, fontWeight: 400, padding: "1px 5px", letterSpacing: 0.4 }}>
+                            🎯 POOL
+                          </span>
+                        )}
                         {isReapply(a) && (
                           <span
                             style={{
@@ -6550,7 +6716,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolWeeklyWrite: state.settings?.poolWeeklyWrite, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -6730,6 +6896,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         day: entry?.day ?? 1,
         followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String),
         followUpDailyCap: String(modal.followUpDailyCap ?? DEFAULT_FOLLOWUP_DAILY_CAP),
+        goalMode: modal.goalMode === "pool" ? "pool" : "standard",
+        poolWeeklyWrite: String(modal.poolWeeklyWrite ?? DEFAULT_POOL_WEEKLY_WRITE),
         contentBufferTarget: String(modal.contentBufferTarget ?? DEFAULT_CONTENT_BUFFER_TARGET),
         contentIdeaFloor: String(modal.contentIdeaFloor ?? DEFAULT_CONTENT_IDEA_FLOOR),
         timezoneOffset: entry?.timezoneOffset ?? 8,
@@ -7516,6 +7684,60 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               onChange={(e) => set("followUpDailyCap")(e.target.value)}
               style={{ ...inputStyle, width: 90, fontFamily: mono, padding: "8px 10px", marginBottom: 16 }}
             />
+
+            <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <Label>🎯 Goal model</Label>
+              <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+                Standard is the original target-over-days quota — unbounded, so you can only ever be behind. Pool pacing replaces it with coverage of the closed company set
+                pushed over from Pool Mode: finite, and something you can actually finish.
+              </div>
+              {[
+                { key: "standard", label: "Standard — N over N days", sub: "Daily quota with pace ramps and weekly rollover" },
+                { key: "pool", label: "Pool pacing — cover the pool", sub: "Coverage headline, weekly write budget, no cross-week debt" },
+              ].map((opt) => (
+                <button
+                  key={opt.key}
+                  onClick={() => set("goalMode")(opt.key)}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    textAlign: "left",
+                    background: f.goalMode === opt.key ? "rgba(74,222,128,0.09)" : "transparent",
+                    border: `1px solid ${f.goalMode === opt.key ? C.green : C.panelEdge}`,
+                    color: f.goalMode === opt.key ? C.green : C.muted,
+                    borderRadius: 10,
+                    padding: "9px 12px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                    marginBottom: 6,
+                  }}
+                >
+                  {f.goalMode === opt.key ? "◉" : "○"} {opt.label}
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{opt.sub}</div>
+                </button>
+              ))}
+              {f.goalMode === "pool" && (
+                <>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 6 }}>Companies to write per week</div>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    value={f.poolWeeklyWrite}
+                    onChange={(e) => set("poolWeeklyWrite")(e.target.value)}
+                    style={{ ...inputStyle, width: 90, fontFamily: mono, padding: "8px 10px" }}
+                  />
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 6 }}>
+                    Spread across Mon–Sat. A 45-company pool at 8/week covers in about six weeks, matching Pool Mode's closure window. Your playbook targets 20–25/week, so
+                    this is a deliberate trade of volume for repeatability — worth watching your reply rate to see if it pays.
+                  </div>
+                </>
+              )}
+              {f.goalMode === "pool" && (
+                <div style={{ fontSize: 11, color: C.amber, lineHeight: 1.5, marginTop: 8 }}>
+                  Pool pacing needs companies tagged 🎯 POOL. If none have been pushed over from Pool Mode yet, the standard goal card keeps showing.
+                </div>
+              )}
+            </div>
 
             <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
               <Label>📦 Content commitment targets</Label>

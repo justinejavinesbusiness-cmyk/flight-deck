@@ -108,7 +108,21 @@ function migratePool(raw) {
     builtOn: p.builtOn || today(),
     closedUntil: p.closedUntil || addDays(p.builtOn || today(), CLOSED_WEEKS * 7),
     targetSize: +p.targetSize || POOL_SIZE,
-    members: Array.isArray(p.members) ? p.members.map((m) => ({ id: m.id || uid(), company: m.company || "", hook: m.hook || "", hookedAt: m.hookedAt || "", researchSecs: +m.researchSecs || 0, workedAt: m.workedAt || "", note: m.note || "" })) : [],
+    members: Array.isArray(p.members)
+      ? p.members.map((m) => ({
+          id: m.id || uid(),
+          company: m.company || "",
+          hook: m.hook || "",
+          hookedAt: m.hookedAt || "",
+          researchSecs: +m.researchSecs || 0,
+          workedAt: m.workedAt || "",
+          note: m.note || "",
+          /* "existing" = adopted from Flight Deck data, already lives there.
+             "new" = first appeared here, so Flight Deck has never seen it. */
+          origin: m.origin === "new" ? "new" : "existing",
+          pushedAt: m.pushedAt || "",
+        }))
+      : [],
   }));
   if (typeof s.weeklyWriteTarget !== "number") s.weeklyWriteTarget = 8;
   return s;
@@ -159,19 +173,30 @@ const memberWorked = (m, digest) => !!(m.workedAt || digest.get(normCompany(m.co
 const memberHooked = (m) => !!(m.hook || "").trim();
 
 function poolStats(pool, digest) {
-  if (!pool) return { total: 0, worked: 0, hooked: 0, unhooked: 0, ready: 0, pct: 0 };
+  if (!pool) return { total: 0, worked: 0, hooked: 0, unhooked: 0, ready: 0, pct: 0, inFlightDeck: 0, newHere: 0, pending: 0 };
   const total = pool.members.length;
   let worked = 0,
     hooked = 0,
-    ready = 0;
+    ready = 0,
+    inFlightDeck = 0,
+    newHere = 0,
+    pending = 0;
   pool.members.forEach((m) => {
     const w = memberWorked(m, digest);
     const h = memberHooked(m);
     if (w) worked++;
     if (h) hooked++;
     if (h && !w) ready++;
+    /* "already in Flight Deck" means either adopted from it, already pushed,
+       or independently present there now — all three mean no push needed */
+    const known = m.origin === "existing" || !!m.pushedAt || digest.has(normCompany(m.company));
+    if (known) inFlightDeck++;
+    else {
+      newHere++;
+      pending++;
+    }
   });
-  return { total, worked, hooked, unhooked: total - hooked, ready, pct: total ? Math.round((worked / total) * 100) : 0 };
+  return { total, worked, hooked, unhooked: total - hooked, ready, pct: total ? Math.round((worked / total) * 100) : 0, inFlightDeck, newHere, pending };
 }
 const poolIsClosed = (pool) => !!pool && pool.closedUntil > today();
 
@@ -346,7 +371,17 @@ function PoolMode() {
   const createPool = (companies) => {
     const id = uid();
     const built = today();
-    const members = companies.map((c) => ({ id: uid(), company: c, hook: "", hookedAt: "", researchSecs: 0, workedAt: "", note: "" }));
+    const members = companies.map((c) => ({
+      id: uid(),
+      company: typeof c === "string" ? c : c.company,
+      origin: typeof c === "string" ? "new" : c.origin || "new",
+      hook: "",
+      hookedAt: "",
+      researchSecs: 0,
+      workedAt: "",
+      note: "",
+      pushedAt: "",
+    }));
     setPs((s) => ({
       ...s,
       adopted: true,
@@ -371,8 +406,10 @@ function PoolMode() {
       setPs((s) => ({ ...s, bench: [{ id: uid(), company: n, addedAt: today() }, ...s.bench] }));
       return flash("Pool is closed — parked on the bench");
     }
-    mutatePool((p) => ({ ...p, members: [...p.members, { id: uid(), company: n, hook: "", hookedAt: "", researchSecs: 0, workedAt: "", note: "" }] }));
-    flash("Added to pool");
+    /* typed in here, so Flight Deck has never seen it — mark it for pushing */
+    const origin = digest.has(normCompany(n)) ? "existing" : "new";
+    mutatePool((p) => ({ ...p, members: [...p.members, { id: uid(), company: n, origin, hook: "", hookedAt: "", researchSecs: 0, workedAt: "", note: "", pushedAt: "" }] }));
+    flash(origin === "new" ? "Added — new to Flight Deck" : "Added — already in Flight Deck");
   };
 
   const setHook = (memberId, hook, secs) =>
@@ -393,11 +430,77 @@ function PoolMode() {
       bench: s.bench.slice(take.length),
       pools: s.pools.map((p) =>
         p.id === s.activePoolId
-          ? { ...p, closedUntil: addDays(built, CLOSED_WEEKS * 7), members: [...p.members, ...take.map((b) => ({ id: uid(), company: b.company, hook: "", hookedAt: "", researchSecs: 0, workedAt: "", note: "" }))] }
+          ? {
+              ...p,
+              closedUntil: addDays(built, CLOSED_WEEKS * 7),
+              members: [
+                ...p.members,
+                ...take.map((b) => ({ id: uid(), company: b.company, origin: digest.has(normCompany(b.company)) ? "existing" : "new", hook: "", hookedAt: "", researchSecs: 0, workedAt: "", note: "", pushedAt: "" })),
+              ],
+            }
           : p
       ),
     }));
     flash(`Added ${take.length} from the bench · closed again until ${fmt(addDays(built, CLOSED_WEEKS * 7))}`);
+  };
+
+  /* ============================================================
+     PUSH TO FLIGHT DECK — the ONLY write to the main record in this app.
+
+     Deliberately append-only and user-triggered, never automatic:
+       1. fetch the main record fresh, immediately before writing, so the
+          read-modify-write window is as small as possible
+       2. refuse outright if it doesn't look like a real Flight Deck record
+          (no applications array) — better to do nothing than to clobber
+       3. append new applications only. Existing entries are passed through
+          byte-for-byte; nothing is edited, reordered or removed
+       4. pass the coach object straight back unchanged
+       5. mark members pushedAt so a second press can't duplicate them
+
+     Pushed entries carry fromPool + poolName, which is what makes them
+     badgeable in Flight Deck and countable by pool pacing. Status is left
+     BLANK on purpose: pushing is not outreach. It lands as a tracked lead
+     that won't inflate your funnel until you actually write to it.
+     ============================================================ */
+  const [pushing, setPushing] = useState(false);
+  const pushToFlightDeck = async () => {
+    if (!pool || pushing) return;
+    const pending = pool.members.filter((m) => m.origin === "new" && !m.pushedAt && !digest.has(normCompany(m.company)));
+    if (!pending.length) return flash("Nothing new to push");
+    setPushing(true);
+    try {
+      const remote = await rpc("fd_get", { k: keyRef.current });
+      const data = remote?.data;
+      if (!data || !Array.isArray(data.applications)) {
+        setPushing(false);
+        return flash("Couldn't read Flight Deck safely — nothing was written");
+      }
+      const existing = new Set(data.applications.map((a) => normCompany(a.company)).filter(Boolean));
+      const toAdd = pending.filter((m) => !existing.has(normCompany(m.company)));
+      if (!toAdd.length) {
+        mutatePool((p) => ({ ...p, members: p.members.map((m) => (pending.some((x) => x.id === m.id) ? { ...m, pushedAt: today() } : m)) }));
+        setPushing(false);
+        return flash("All already in Flight Deck — marked as pushed");
+      }
+      const newApps = toAdd.map((m) => ({
+        id: "fd" + Math.random().toString(36).slice(2, 10),
+        company: m.company,
+        role: "",
+        status: "", /* saved-for-later: counts nothing until you actually write */
+        contacted: "",
+        notes: m.hook ? `Pool hook: ${m.hook}` : "",
+        fromPool: true,
+        poolName: pool.name,
+        followUps: [],
+        milestonesLogged: [],
+      }));
+      await rpc("fd_set", { k: keyRef.current, d: { ...data, applications: [...newApps, ...data.applications] }, c: remote.coach || {} });
+      mutatePool((p) => ({ ...p, members: p.members.map((m) => (pending.some((x) => x.id === m.id) ? { ...m, pushedAt: today() } : m)) }));
+      flash(`Pushed ${newApps.length} to Flight Deck · tagged 🎯 POOL`);
+    } catch (e) {
+      flash("Push failed — nothing was written");
+    }
+    setPushing(false);
   };
 
   /* weekly write pace — the only recurring number in this version */
@@ -507,6 +610,33 @@ function PoolMode() {
             </div>
           </Card>
 
+          <Card edge={stats.pending > 0 ? C.blue : C.panelEdge}>
+            <Label>Flight Deck sync</Label>
+            <div style={{ display: "flex", gap: 14, marginBottom: 10 }}>
+              <div>
+                <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 800, color: C.green }}>{stats.inFlightDeck}</div>
+                <div style={{ fontSize: 11, color: C.muted }}>in Flight Deck</div>
+              </div>
+              <div>
+                <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 800, color: stats.pending > 0 ? C.blue : C.muted }}>{stats.pending}</div>
+                <div style={{ fontSize: 11, color: C.muted }}>new here only</div>
+              </div>
+            </div>
+            {stats.pending > 0 ? (
+              <>
+                <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 10 }}>
+                  Pushing adds them as tracked leads tagged 🎯 POOL — blank status, so nothing inflates your funnel until you actually write. Existing entries are never
+                  touched.
+                </div>
+                <Btn onClick={pushToFlightDeck} disabled={pushing} style={{ width: "100%" }}>
+                  {pushing ? "Pushing…" : `Push ${stats.pending} to Flight Deck`}
+                </Btn>
+              </>
+            ) : (
+              <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55 }}>Every company here is already tracked in Flight Deck. Nothing to push.</div>
+            )}
+          </Card>
+
           <Card edge={closed ? C.panelEdge : C.amber}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
               <span style={{ fontSize: 15 }}>{closed ? "🔒" : "🔓"}</span>
@@ -575,9 +705,25 @@ function BuildScreen({ digest, onCreate }) {
           {candidates.length} companies already exist in your Flight Deck data — {candidates.filter((c) => !c.worked).length} of them never contacted. Take them as your starting
           pool, then top up. Once built, the pool closes for {CLOSED_WEEKS} weeks.
         </div>
-        <Btn onClick={() => onCreate([...[...picked].map((k) => digest.get(k)?.company).filter(Boolean), ...manualNames])} disabled={total === 0} style={{ width: "100%", marginTop: 12 }}>
+        <Btn
+          onClick={() =>
+            onCreate([
+              /* adopted from Flight Deck — already tracked there, never pushed */
+              ...[...picked].map((k) => digest.get(k)?.company).filter(Boolean).map((c) => ({ company: c, origin: "existing" })),
+              /* typed here — Flight Deck has never seen these, so they're pushable */
+              ...manualNames.map((c) => ({ company: c, origin: "new" })),
+            ])
+          }
+          disabled={total === 0}
+          style={{ width: "100%", marginTop: 12 }}
+        >
           Build pool and close it
         </Btn>
+        {manualNames.length > 0 && (
+          <div style={{ fontSize: 11, color: C.blue, marginTop: 8, lineHeight: 1.5 }}>
+            {picked.size} already in Flight Deck · {manualNames.length} new, pushable to Flight Deck after building
+          </div>
+        )}
       </Card>
 
       <Card>
@@ -743,7 +889,12 @@ function WriteSession({ pool, digest, onWorked, onDone, target, written }) {
           <Card key={m.id}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
               <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: 15, fontWeight: 700 }}>{m.company}</div>
+                <div style={{ fontSize: 15, fontWeight: 700 }}>
+                  {m.company}
+                  {m.origin === "new" && !m.pushedAt && !digest.has(normCompany(m.company)) && (
+                    <span style={{ fontFamily: mono, fontSize: 9, color: C.blue, border: `1px solid ${C.blue}`, borderRadius: 4, padding: "1px 4px", marginLeft: 6, verticalAlign: "middle" }}>NOT IN FD</span>
+                  )}
+                </div>
                 <div style={{ fontSize: 13, color: C.amber, marginTop: 3, lineHeight: 1.45 }}>{m.hook}</div>
                 {m.researchSecs > 0 && (
                   <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>
