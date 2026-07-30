@@ -234,15 +234,53 @@ function convertApplicationToAccount(app) {
     contacts: [contactFromApplicationData(app)],
   };
 }
+/* ---- reapplications ----
+   Applying to the same company + job title a second time is a genuinely
+   different thing from a duplicate row: the first attempt CLOSED (rejected,
+   bad fit, or an offer you turned down) and you're taking another swing,
+   usually months later after a new posting. That deserves its own tag — both
+   so the history is honest in interviews ("yes, I applied in March") and so
+   the funnel doesn't read a reapplication as a fresh cold lead.
+
+   Attempts are numbered: the original is attempt 1, the first reapplication
+   is 2, and so on. The number matters beyond display — it separates the
+   convergence groups, so a new attempt reaching "screening" never drags the
+   old rejected entry along with it. */
+const attemptOf = (a) => Math.max(1, +a?.attempt || 1);
+const isReapply = (a) => attemptOf(a) > 1;
+/* pure: every non-archived entry for this company+role, excluding one id
+   (the entry being edited). Includes account-linked entries — a reapplication
+   after an account contact went cold is still a reapplication. */
+function findPriorAttempts(company, role, applications, excludeId) {
+  const q = normCompanyName(company);
+  const roleQ = normRoleName(role);
+  if (!q || !roleQ) return [];
+  return (applications || [])
+    .filter((a) => a.id !== excludeId && !a.archivedAt && normCompanyName(a.company) === q && normRoleName(a.role) === roleQ)
+    .sort((a, b) => attemptOf(b) - attemptOf(a) || (b.contacted || "").localeCompare(a.contacted || ""));
+}
+/* the attempt number a NEW entry should take for this company+role */
+const nextAttemptNumber = (company, role, applications) => {
+  const prior = findPriorAttempts(company, role, applications, null);
+  return prior.length ? Math.max(...prior.map(attemptOf)) + 1 : 1;
+};
+
 /* pure: is there already an OPEN, standalone application for the same
    company + role? Case-insensitive, whitespace-trimmed on both sides. Synced
    (already account-linked) entries are excluded — those are already exactly
-   what this feature would otherwise suggest creating. */
+   what this feature would otherwise suggest creating. Entries that have CLOSED
+   (rejected / bad fit / offer) are excluded too: a second application after a
+   closed one isn't a duplicate at all, it's a reapplication, and it routes to
+   findPriorAttempts and the reapply prompt instead. */
 function findDuplicateApplication(company, role, applications) {
   const q = normCompanyName(company);
   const roleQ = (role || "").trim().toLowerCase();
   if (!q || !roleQ) return null;
-  return (applications || []).find((a) => !a.fromAccountContact && !a.archivedAt && normCompanyName(a.company) === q && (a.role || "").trim().toLowerCase() === roleQ) || null;
+  return (
+    (applications || []).find(
+      (a) => !a.fromAccountContact && !a.archivedAt && isOpenApp(a) && normCompanyName(a.company) === q && (a.role || "").trim().toLowerCase() === roleQ
+    ) || null
+  );
 }
 /* pure: merges a second application for the same company+role into an
    account. If no account exists for the company yet, the FIRST (existing)
@@ -336,6 +374,95 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
 
 /* ---- content management model ---- */
 const CONTENT_STATUSES = ["idea", "draft", "design", "scheduled", "published"];
+
+/* ============================================================
+   CONTENT COMMITMENT DEVICES
+
+   The weekly count alone is a LAGGING indicator — it only tells you you've
+   failed after the week is gone. These four measures give the content goal
+   actual teeth without turning it into a guilt machine:
+
+     · BUFFER — how many finished pieces are queued and ready to go. The real
+       failure mode isn't missing a publish day, it's having nothing banked.
+       Missing a day with 3 in reserve is fine; 0 in reserve is the emergency.
+     · IDEA FLOOR — a minimum stock of raw ideas, because "no idea ready to
+       work on" is what actually kills a design day.
+     · STREAK + FREEZE — consecutive weeks hitting the target, with one freeze
+       per calendar month that absorbs a miss without breaking the chain. A
+       naked streak is brittle: one bad week during a hard job-search stretch
+       and the whole device gets abandoned. The freeze is what makes it hold.
+     · SKIP REASONS — skipping is no longer free and silent. Each miss records
+       WHY, which turns a pile of guilt into a diagnosis: four missed design
+       days in five weeks means the schedule is wrong, not that you are.
+   ============================================================ */
+const CONTENT_SKIP_REASONS = [
+  { key: "noIdea", label: "No idea ready to work on", fix: "Your idea bank ran dry — the fix is an ideation session, not more discipline." },
+  { key: "noTime", label: "No time — job search took priority", fix: "This is the search working as intended. Content is nurturing, not the engine." },
+  { key: "stalled", label: "Idea exists but stalled at design", fix: "The piece is too ambitious for one sitting. Shrink the scope, not the schedule." },
+  { key: "motivation", label: "Honestly just didn't feel like it", fix: "The most normal reason there is. This is exactly what the buffer and freeze are for." },
+];
+const skipReasonLabel = (k) => CONTENT_SKIP_REASONS.find((r) => r.key === k)?.label || k;
+const DEFAULT_CONTENT_BUFFER_TARGET = 2;
+const DEFAULT_CONTENT_IDEA_FLOOR = 5;
+/* "ready to publish" = finished and queued. Published items have already gone
+   out, so they're not buffer any more. */
+const contentBufferCount = (items) => (items || []).filter((c) => c.status === "scheduled").length;
+const contentIdeaCount = (items) => (items || []).filter((c) => (c.status || "idea") === "idea").length;
+/* a piece is overdue when it committed to a ship-by date that has passed and
+   it still hasn't gone out */
+const contentOverdue = (c) => !!(c?.shipBy && c.status !== "published" && c.shipBy < today());
+
+/* published count for the week containing a given Monday */
+const publishedInWeek = (items, weekStart) =>
+  (items || []).filter((c) => c.status === "published" && c.date && weekStartOfDate(c.date) === weekStart).length;
+/* how many freeze credits a given calendar month grants and has left. One per
+   month, so a single rough week is survivable but a rough month isn't papered
+   over. */
+const freezesUsedInMonth = (frozenWeeks, ym) => (frozenWeeks || []).filter((w) => w.slice(0, 7) === ym).length;
+const canFreezeWeek = (frozenWeeks, weekStart) => freezesUsedInMonth(frozenWeeks, weekStart.slice(0, 7)) < 1;
+/* Walks BACKWARD from the current week counting consecutive weeks that either
+   hit the target or were frozen. The in-progress week only counts once it's
+   already met — it can never break the streak, since it isn't over yet.
+   Returns { weeks, brokenAt, frozenUsed } where brokenAt is the first failed
+   week start (null if the streak reaches the very first tracked week). */
+function computeContentStreak(items, perWeek, frozenWeeks, startBound) {
+  if (!perWeek || perWeek <= 0) return { weeks: 0, brokenAt: null, thisWeekMet: false };
+  const frozen = new Set(frozenWeeks || []);
+  const thisWeek = iso(mondayOfToday());
+  const thisWeekMet = publishedInWeek(items, thisWeek) >= perWeek;
+  let weeks = thisWeekMet ? 1 : 0;
+  let cursor = addDays(thisWeek, -7);
+  let brokenAt = null;
+  /* cap the walk so a long-lived dataset can't spin: a year of weeks is plenty */
+  for (let i = 0; i < 52; i++) {
+    if (startBound && cursor < startBound) break;
+    const met = publishedInWeek(items, cursor) >= perWeek || frozen.has(cursor);
+    if (!met) {
+      brokenAt = cursor;
+      break;
+    }
+    weeks++;
+    cursor = addDays(cursor, -7);
+  }
+  return { weeks, brokenAt, thisWeekMet };
+}
+/* aggregates logged skip reasons over a trailing window so the app can name
+   the actual bottleneck instead of just counting misses */
+function contentSkipPatterns(log, days) {
+  const cutoff = addDays(today(), -(days || 35));
+  const byReason = new Map();
+  const byStage = new Map();
+  let total = 0;
+  Object.entries(log || {}).forEach(([date, e]) => {
+    if (date < cutoff || !e?.missed || !e?.skipReason) return;
+    total++;
+    byReason.set(e.skipReason, (byReason.get(e.skipReason) || 0) + 1);
+    if (e.stage) byStage.set(e.stage, (byStage.get(e.stage) || 0) + 1);
+  });
+  const top = [...byReason.entries()].sort((a, b) => b[1] - a[1])[0] || null;
+  const topStage = [...byStage.entries()].sort((a, b) => b[1] - a[1])[0] || null;
+  return { total, topReason: top ? { key: top[0], count: top[1] } : null, topStage: topStage ? { stage: topStage[0], count: topStage[1] } : null };
+}
 /* display labels only — the underlying stored status values (idea/draft/design/
    scheduled/published) never change, so existing content and all filtering
    logic stay exactly as they were. This just changes what's shown on screen. */
@@ -462,13 +589,16 @@ const relatedApplications = (accountCompany, apps) => {
 const CONVERGED_STATUSES = ["screening", "interview", "final round", "offer", "rejected", "bad fit"];
 const isConvergedStatus = (s) => CONVERGED_STATUSES.includes(s);
 const normRoleName = (s) => (s || "").trim().toLowerCase();
-/* the identity of a real opportunity: company + job title, both normalized.
-   Null when either is missing — an entry that can't be identified never
-   collapses into anything; it always counts on its own. */
+/* the identity of a real opportunity: company + job title + attempt number,
+   all normalized. Null when company or role is missing — an entry that can't
+   be identified never collapses into anything; it always counts on its own.
+   The attempt number keeps a REAPPLICATION separate from the original: they
+   share a company and role but they are two distinct shots at the job, so a
+   new attempt reaching screening must not drag the old rejected entry with it. */
 const opportunityKey = (a) => {
   const c = normCompanyName(a?.company);
   const r = normRoleName(a?.role);
-  return c && r ? `${c}||${r}` : null;
+  return c && r ? `${c}||${r}||${attemptOf(a)}` : null;
 };
 /* deterministic pick of which entry in a converged group is THE one that
    counts: earliest contacted date wins (so the count stays in the week the
@@ -1038,6 +1168,37 @@ function computeSynthesis(state, apps, zone) {
    contact, notes, salary, screenshots, etc.) discarded for good. From your
    perspective it's gone; the numbers never move regardless. Applies uniformly
    to every archived entry, with no special-casing by status. */
+/* ---- real last-activity date ----
+   `contacted` is only the FIRST touch. An entry you diligently followed up on
+   last week has real recent activity, and treating it as untouched since the
+   original contact date makes the staleness sweep propose archiving your most
+   actively-worked leads. So last activity = the latest of:
+     · contacted (the first touch)
+     · every completed follow-up (doneAt when we have it; otherwise that
+       follow-up's scheduled due date, which is close enough for entries
+       completed before doneAt stamping existed)
+     · every logged touch point date
+   Works for both applications and account contacts — they share these fields. */
+function lastActivityDate(a) {
+  if (!a) return "";
+  let latest = a.contacted || "";
+  const bump = (d) => {
+    if (d && d > latest) latest = d;
+  };
+  const fus = Array.isArray(a.followUps) ? a.followUps : [];
+  fus.forEach((f, i) => {
+    if (!f?.done) return;
+    bump(f.doneAt || (a.contacted ? followUpDueDate(a.contacted, fus, i) : ""));
+  });
+  (a.touchpoints || []).forEach((t) => bump(t?.date));
+  return latest;
+}
+/* whole days between a date and today (negative if the date is in the future) */
+const daysSince = (isoDate) => {
+  if (!isoDate) return null;
+  return Math.floor((new Date(today() + "T00:00:00") - new Date(isoDate + "T00:00:00")) / 86400000);
+};
+
 const HOUSEKEEPING_STALE_DAYS = 30;
 const HOUSEKEEPING_TOMBSTONE_DAYS = 30;
 function computeHousekeepingProposals(state, apps) {
@@ -1047,18 +1208,35 @@ function computeHousekeepingProposals(state, apps) {
   apps.forEach((a) => {
     if (a.archivedAt || a.tombstoned || a.fromAccountContact) return; /* synced entries are managed via their contact, not directly */
     if (!isOpenApp(a)) return; /* closed already — nothing to clean up */
-    if (!a.contacted || a.contacted > cutoff) return;
-    const days = Math.floor((new Date(today()) - new Date(a.contacted)) / 86400000);
-    proposals.push({ type: "application", id: a.id, label: a.company || "Unnamed application", detail: `No activity in ${days} days (last: ${a.contacted}).` });
+    /* measured from REAL last activity, not the original contact date — an
+       entry followed up on recently is being actively worked, not rotting */
+    const last = lastActivityDate(a);
+    if (!last || last > cutoff) return;
+    const days = daysSince(last);
+    const viaFollowUp = last !== a.contacted;
+    proposals.push({
+      type: "application",
+      id: a.id,
+      label: a.company || "Unnamed application",
+      detail: `No activity in ${days} days (last${viaFollowUp ? " touch" : ""}: ${last}).`,
+    });
   });
 
   (state.accounts || []).forEach((acc) => {
     (acc.contacts || []).forEach((c) => {
       if (c.archivedAt || c.tombstoned) return;
       if (!isContactOpen(c) || !isContactOutreached(c)) return;
-      if (!c.contacted || c.contacted > cutoff) return;
-      const days = Math.floor((new Date(today()) - new Date(c.contacted)) / 86400000);
-      proposals.push({ type: "contact", accountId: acc.id, contactId: c.id, label: `${c.name || "Unnamed"} @ ${acc.company || "Unnamed account"}`, detail: `No activity in ${days} days (last: ${c.contacted}).` });
+      const last = lastActivityDate(c);
+      if (!last || last > cutoff) return;
+      const days = daysSince(last);
+      const viaFollowUp = last !== c.contacted;
+      proposals.push({
+        type: "contact",
+        accountId: acc.id,
+        contactId: c.id,
+        label: `${c.name || "Unnamed"} @ ${acc.company || "Unnamed account"}`,
+        detail: `No activity in ${days} days (last${viaFollowUp ? " touch" : ""}: ${last}).`,
+      });
     });
   });
 
@@ -1113,7 +1291,27 @@ function triggerCsvDownload(rows, filename) {
 
 
 /* multi-step follow-ups: a.followUps = [{days, done}] counted from `contacted` */
+/* ---- job posting freshness ----
+   A posting you applied to weeks ago may already be filled or expired, which
+   makes a follow-up pointless (or worse, makes you look like you didn't check).
+   `postVerified` records the last date you confirmed the posting was still
+   live; when it's never been checked we fall back to the contact date, since
+   that's the last moment the posting was definitely real. */
+const POSTING_STALE_DAYS = 21;
+const postingCheckedOn = (a) => a?.postVerified || a?.contacted || "";
+const postingNeedsCheck = (a) => {
+  if (!a?.postLink) return false; /* nothing to re-check */
+  if (!isOpenApp(a) || isBlankStatus(a)) return false;
+  const checked = postingCheckedOn(a);
+  if (!checked) return false;
+  return checked <= addDays(today(), -POSTING_STALE_DAYS);
+};
+
 const DEFAULT_FOLLOWUPS = [3, 7, 14]; /* days after the application date: day 3, day 7, day 14 */
+/* how many follow-ups count as one day's realistic workload. Used two ways:
+   to spread NEW entries off already-loaded days, and to split the due list
+   into "today's batch" vs "queued behind it" so the UI never shows a wall. */
+const DEFAULT_FOLLOWUP_DAILY_CAP = 8;
 const normFollowUps = (a) => {
   if (Array.isArray(a.followUps)) return a.followUps; /* respects both a populated AND a deliberately-cleared [] array */
   if (a.followUpDays != null) return [{ days: +a.followUpDays || 7, done: false }];
@@ -1139,6 +1337,50 @@ const nextFollowUp = (a) => {
   return { date: followUpDueDate(a.contacted, fus, i), index: i, total: fus.length };
 };
 const followUpOf = (a) => nextFollowUp(a)?.date || "";
+
+/* ---- follow-up load smoothing ----
+   Counts how many OPEN entries already have their next follow-up landing on
+   each date. Used to keep a newly-added entry from piling onto a day that's
+   already full: batch-adding 20 applications on one Monday otherwise schedules
+   20 follow-ups for the same Thursday. */
+function followUpLoadByDate(applications, accounts) {
+  const load = new Map();
+  const add = (d) => {
+    if (d) load.set(d, (load.get(d) || 0) + 1);
+  };
+  (applications || []).forEach((a) => {
+    if (a.archivedAt || a.tombstoned || !isOpenApp(a) || isBlankStatus(a)) return;
+    add(followUpOf(a));
+  });
+  (accounts || []).forEach((acc) =>
+    (acc.contacts || []).forEach((c) => {
+      if (c.archivedAt || c.tombstoned || !isContactOpen(c) || !isContactOutreached(c)) return;
+      add(followUpOf(c));
+    })
+  );
+  return load;
+}
+/* Returns a follow-up array whose FIRST gap is nudged forward just far enough
+   that its due date lands on a day under the cap — later gaps are relative to
+   it, so the whole chain shifts with it and the intervals you configured are
+   preserved exactly. Never pulls a date earlier, never shifts more than a week,
+   and no-ops when capping is off or the day already has room. */
+function spreadFollowUps(followUps, contacted, load, cap) {
+  const fus = (followUps || []).map((f) => ({ ...f }));
+  if (!cap || cap <= 0 || !contacted || !fus.length) return fus;
+  const baseGap = Math.max(0, +fus[0].days || 0);
+  for (let shift = 0; shift <= 7; shift++) {
+    const candidate = addDays(contacted, baseGap + shift);
+    if ((load.get(candidate) || 0) < cap) {
+      fus[0] = { ...fus[0], days: baseGap + shift };
+      return fus;
+    }
+  }
+  return fus; /* every nearby day is full — leave it alone rather than push it out indefinitely */
+}
+/* splits a due list into the batch worth doing today and the rest, so the UI
+   can show a realistic ask instead of every overdue item at once */
+const splitDueByCap = (list, cap) => (!cap || cap <= 0 || list.length <= cap ? { batch: list, queued: [] } : { batch: list.slice(0, cap), queued: list.slice(cap) });
 const isDue = (a) => {
   if (isBlankStatus(a)) return false; /* not applied/reached out yet — nothing to follow up on */
   const n = nextFollowUp(a);
@@ -1269,7 +1511,7 @@ const DEFAULT_STATE = {
   applications: [],
   accounts: [],
   content: [],
-  contentGoal: { perWeek: 3 },
+  contentGoal: { perWeek: 3, bufferTarget: DEFAULT_CONTENT_BUFFER_TARGET, ideaFloor: DEFAULT_CONTENT_IDEA_FLOOR, frozenWeeks: [] },
   contentSchedule: { idea: [1], draft: [2, 3], design: [4], scheduled: [5] }, /* weekday index: 0=Sun..6=Sat. Default: Mon ideate, Tue/Wed draft, Thu design, Fri schedule/queue */
   contentScheduleLog: {}, /* keyed by date "YYYY-MM-DD" -> { stage, done, missed } */
   funnel: [],
@@ -1300,6 +1542,9 @@ function migrate(saved) {
   if (!Array.isArray(s.content)) s.content = [];
   if (!Array.isArray(s.archivedCsvRows)) s.archivedCsvRows = [];
   if (!s.contentGoal || typeof s.contentGoal !== "object") s.contentGoal = { perWeek: 3 };
+  if (typeof s.contentGoal.bufferTarget !== "number") s.contentGoal.bufferTarget = DEFAULT_CONTENT_BUFFER_TARGET;
+  if (typeof s.contentGoal.ideaFloor !== "number") s.contentGoal.ideaFloor = DEFAULT_CONTENT_IDEA_FLOOR;
+  if (!Array.isArray(s.contentGoal.frozenWeeks)) s.contentGoal.frozenWeeks = [];
   if (!s.contentSchedule || typeof s.contentSchedule !== "object") s.contentSchedule = { idea: [1], draft: [2, 3], design: [4], scheduled: [5] };
   ["idea", "draft", "design", "scheduled"].forEach((k) => {
     if (!Array.isArray(s.contentSchedule[k])) s.contentSchedule[k] = [];
@@ -1312,6 +1557,10 @@ function migrate(saved) {
   if (typeof s.settings.timezoneOffset !== "number") s.settings.timezoneOffset = 8;
   if (!Array.isArray(s.settings.followUpDefaults) || !s.settings.followUpDefaults.length)
     s.settings.followUpDefaults = [...DEFAULT_FOLLOWUPS];
+  /* max follow-ups to surface as "today's" work. Batch-adding 20 applications
+     on one day used to make all 20 follow-ups come due on the same later day —
+     a wall of red that trains you to ignore the flag entirely. 0 = no cap. */
+  if (typeof s.settings.followUpDailyCap !== "number") s.settings.followUpDailyCap = DEFAULT_FOLLOWUP_DAILY_CAP;
   s.accounts = s.accounts.map((a) => ({ ...a, contacts: Array.isArray(a.contacts) ? a.contacts : [] }));
   /* one-time cleanup: a past bug dropped linkedApplicationId every time the
      account form reopened, causing outreach on a contact to spawn a fresh
@@ -1822,6 +2071,7 @@ export default function FlightDeck() {
   const [focusModalOpen, setFocusModalOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null); /* { kind: "application"|"account", id, label } */
   const [duplicateSuggestion, setDuplicateSuggestion] = useState(null); /* { pendingApp, duplicateApp } */
+  const [reapplySuggestion, setReapplySuggestion] = useState(null); /* { pendingApp, priorAttempts } */
   const [weeklyModalOpen, setWeeklyModalOpen] = useState(false);
   const [patternsModalOpen, setPatternsModalOpen] = useState(false);
   const [housekeepingOpen, setHousekeepingOpen] = useState(false);
@@ -2314,7 +2564,18 @@ export default function FlightDeck() {
         .slice(0, 5)
         .map((c) => `${c.title || "Untitled"} [${c.status || "idea"}${c.type ? `, ${c.type}` : ""}]`)
         .join("; ");
-      return `Content: ${doneThisWeek}/${perWeek} this week, ${published} published total. Recent: ${recent}. Content is nurturing/staying visible to your network — NOT a job-search conversion tactic. Never frame it as "this will get you interviews"; the goal is consistency and genuine presence, full stop.`;
+      return `Content: ${doneThisWeek}/${perWeek} this week, ${published} published total. Recent: ${recent}. ${(() => {
+        const buffer = contentBufferCount(items);
+        const ideas = contentIdeaCount(items);
+        const bt = state.contentGoal?.bufferTarget ?? DEFAULT_CONTENT_BUFFER_TARGET;
+        const fl = state.contentGoal?.ideaFloor ?? DEFAULT_CONTENT_IDEA_FLOOR;
+        const st = computeContentStreak(items, perWeek, state.contentGoal?.frozenWeeks || []);
+        const pat = contentSkipPatterns(state.contentScheduleLog, 35);
+        const overdue = items.filter(contentOverdue).length;
+        return `Commitment signals: ready-to-publish buffer ${buffer}/${bt}, idea bank ${ideas}/${fl}, streak ${st.weeks} week(s)${overdue ? `, ${overdue} piece(s) past their ship-by date` : ""}.${
+          pat.total >= 3 && pat.topReason ? ` Skip pattern over 5 weeks: ${pat.total} missed days, most often "${skipReasonLabel(pat.topReason.key)}" (${pat.topReason.count}x).` : ""
+        } If the buffer is empty or the idea bank is below its floor, that's the actionable constraint — name it rather than telling them to try harder. A skip reason of "job search took priority" is CORRECT prioritisation and must never be treated as a failure.`;
+      })()} Content is nurturing/staying visible to your network — NOT a job-search conversion tactic. Never frame it as "this will get you interviews"; the goal is consistency and genuine presence, full stop.`;
     })();
     const now = new Date(today() + "T00:00:00");
     return [
@@ -2623,19 +2884,35 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     if (entry && entry.missed && !entry.resolved) setMissedContentPrompt({ date: yesterday, stage: entry.stage });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
-  const resolveMissedContent = (choice) => {
+  const resolveMissedContent = (choice, reason) => {
     if (!missedContentPrompt) return;
     const { date, stage } = missedContentPrompt;
     mutate((s) => {
-      const log = { ...s.contentScheduleLog, [date]: { ...s.contentScheduleLog[date], resolved: true } };
+      /* recording WHY is the point: a skip is no longer free and silent, and
+         the reasons aggregate into a diagnosis of what's actually blocking */
+      const log = { ...s.contentScheduleLog, [date]: { ...s.contentScheduleLog[date], resolved: true, skipReason: reason || s.contentScheduleLog[date]?.skipReason || "" } };
       if (choice === "continue") {
         const t = today();
-        log[t] = { stage, done: false, missed: false };
+        log[t] = { stage, done: false, missed: false, carriedFrom: date };
       }
       return { ...s, contentScheduleLog: log };
     });
     setMissedContentPrompt(null);
   };
+
+  /* spends this month's single freeze credit on a given week, so one bad week
+     doesn't wipe out a long streak. Deliberately manual — the freeze is a
+     decision you make, not something the app grants silently. */
+  const freezeContentWeek = (weekStart) =>
+    mutate((s) => {
+      const frozen = s.contentGoal?.frozenWeeks || [];
+      if (frozen.includes(weekStart) || !canFreezeWeek(frozen, weekStart)) return s;
+      return { ...s, contentGoal: { ...s.contentGoal, frozenWeeks: [...frozen, weekStart] } };
+    }, "❄️ Week frozen — streak protected");
+  const setContentBufferTarget = (n) =>
+    mutate((s) => ({ ...s, contentGoal: { ...s.contentGoal, bufferTarget: Math.max(0, Math.round(+n || 0)) } }));
+  const setContentIdeaFloor = (n) =>
+    mutate((s) => ({ ...s, contentGoal: { ...s.contentGoal, ideaFloor: Math.max(0, Math.round(+n || 0)) } }));
 
   /* every 28 days (or whenever a goal cycle completes — see the milestone
      effect below), remind the person their archive backup exists and is
@@ -2898,6 +3175,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     return convertedCount;
   };
 
+  /* nudges a brand-new entry's follow-up chain off days that are already at
+     the daily cap, so adding a batch of applications doesn't schedule the
+     whole batch's follow-ups onto one date */
+  const smoothedFollowUps = (s, data) =>
+    spreadFollowUps(data.followUps, data.contacted, followUpLoadByDate(s.applications, s.accounts), s.settings?.followUpDailyCap ?? DEFAULT_FOLLOWUP_DAILY_CAP);
+
   /* the user chose to merge a detected same-company-same-role duplicate into
      an account, rather than keep it as a second standalone application. */
   const resolveDuplicateAsMerge = () => {
@@ -2923,11 +3206,49 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const { pendingApp } = duplicateSuggestion;
     mutate((s) => {
       const m = computeMilestoneWins({ status: "", milestonesLogged: [] }, pendingApp.status);
-      const applications = [{ id: uid(), ...pendingApp, milestonesLogged: m ? m.milestonesLogged : undefined }, ...s.applications];
+      const applications = [{ id: uid(), ...pendingApp, followUps: smoothedFollowUps(s, pendingApp), milestonesLogged: m ? m.milestonesLogged : undefined }, ...s.applications];
       return { ...s, applications, accomplishments: m ? [...m.wins, ...s.accomplishments] : s.accomplishments };
     }, "Application added — funnel updated");
     setDuplicateSuggestion(null);
   };
+
+  /* the user confirmed this is a reapplication — it saves as its own entry,
+     numbered as the next attempt for that company+role. The attempt number is
+     what keeps it from converging with the earlier closed attempt later on. */
+  const resolveAsReapply = () => {
+    if (!reapplySuggestion) return;
+    const { pendingApp } = reapplySuggestion;
+    mutate((s) => {
+      const attempt = nextAttemptNumber(pendingApp.company, pendingApp.role, s.applications);
+      const m = computeMilestoneWins({ status: "", milestonesLogged: [] }, pendingApp.status);
+      const applications = [{ id: uid(), ...pendingApp, attempt, followUps: smoothedFollowUps(s, pendingApp), milestonesLogged: m ? m.milestonesLogged : undefined }, ...s.applications];
+      return { ...s, applications, accomplishments: m ? [...m.wins, ...s.accomplishments] : s.accomplishments };
+    }, "Reapplication tracked");
+    setReapplySuggestion(null);
+    flash("↻ Tagged as a reapplication");
+  };
+  /* the user said it isn't a reapplication (e.g. the old row was a mistake, or
+     it's a genuinely different posting that happens to share a title) — saves
+     as a plain new entry at attempt 1 */
+  const resolveReapplyAsNew = () => {
+    if (!reapplySuggestion) return;
+    const { pendingApp } = reapplySuggestion;
+    mutate((s) => {
+      const m = computeMilestoneWins({ status: "", milestonesLogged: [] }, pendingApp.status);
+      const applications = [{ id: uid(), ...pendingApp, followUps: smoothedFollowUps(s, pendingApp), milestonesLogged: m ? m.milestonesLogged : undefined }, ...s.applications];
+      return { ...s, applications, accomplishments: m ? [...m.wins, ...s.accomplishments] : s.accomplishments };
+    }, "Application added — funnel updated");
+    setReapplySuggestion(null);
+  };
+  /* manual toggle from the application row — lets an entry be tagged (or
+     untagged) as a reapplication after the fact, without redoing the form */
+  const toggleReapplyTag = (id) =>
+    mutate((s) => {
+      const app = s.applications.find((a) => a.id === id);
+      if (!app) return s;
+      const attempt = isReapply(app) ? 1 : nextAttemptNumber(app.company, app.role, s.applications.filter((a) => a.id !== id));
+      return { ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, attempt } : a)) };
+    }, "Reapply tag updated");
 
   const toggleContentScheduleDone = (dateStr) =>
     mutate((s) => {
@@ -3037,6 +3358,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           setDuplicateSuggestion({ pendingApp: data, duplicateApp: dup });
           return; /* don't save yet — wait for the user's choice */
         }
+        /* no OPEN entry, but a closed one for the same company+role means this
+           is very likely a reapplication — ask rather than assume, since it
+           could also just be a stale row worth leaving alone */
+        const prior = findPriorAttempts(data.company, data.role, state.applications, null);
+        if (prior.length) {
+          setModal(null);
+          setReapplySuggestion({ pendingApp: data, priorAttempts: prior });
+          return;
+        }
       }
       let winMsg = "";
       mutate(
@@ -3054,7 +3384,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             /* brand-new entry created directly at an advanced status (rare, but possible) */
             const m = computeMilestoneWins({ status: "", milestonesLogged: [] }, data.status);
             if (m) addWins = m.wins;
-            applications = [{ id: uid(), ...data, milestonesLogged: m ? m.milestonesLogged : undefined }, ...s.applications];
+            applications = [{ id: uid(), ...data, followUps: smoothedFollowUps(s, data), milestonesLogged: m ? m.milestonesLogged : undefined }, ...s.applications];
           }
           if (addWins.length) winMsg = addWins.map((w) => w.text).join(" · ");
           /* this application is linked to an account contact — keep the
@@ -3211,6 +3541,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               .filter((d) => d > 0)
               .slice(0, 10) || DEFAULT_FOLLOWUPS,
             timezoneOffset: typeof data.timezoneOffset === "number" ? data.timezoneOffset : 8,
+            followUpDailyCap: Math.max(0, Math.min(99, +data.followUpDailyCap || 0)),
+          },
+          contentGoal: {
+            ...s.contentGoal,
+            bufferTarget: Math.max(0, Math.min(99, +data.contentBufferTarget || 0)),
+            ideaFloor: Math.max(0, Math.min(99, +data.contentIdeaFloor || 0)),
           },
           contentSchedule: {
             idea: Array.isArray(data.contentSchedule?.idea) ? data.contentSchedule.idea : [],
@@ -3508,20 +3844,35 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       </div>
 
       {/* due follow-ups queue */}
-      {dueList.length > 0 && (
-        <div style={{ background: "rgba(248,113,113,0.07)", border: `1px solid ${C.red}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
-          <Label>⚑ Follow-ups due — clear these first</Label>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 6 }}>
-            {dueList.slice(0, 6).map((a) => (
-              <div key={a.id} onClick={() => setModal({ kind: "application", entry: a })} style={{ display: "flex", justifyContent: "space-between", gap: 8, cursor: "pointer", fontSize: 13 }}>
-                <span style={{ fontWeight: 700 }}>{a.company || "Unnamed"}</span>
-                <span style={{ fontFamily: mono, fontSize: 11, color: C.red, flexShrink: 0 }}>due {followUpOf(a)}</span>
-              </div>
-            ))}
-            {dueList.length > 6 && <div style={{ fontSize: 11, color: C.muted }}>+ {dueList.length - 6} more in the Pipeline</div>}
+      {dueList.length > 0 && (() => {
+        /* show a realistic ask, not the whole backlog. dueList is sorted
+           oldest-first, so the batch is genuinely the highest-priority slice —
+           and naming the rest as "queued" rather than "overdue" keeps a big
+           backlog from reading as failure every single morning. */
+        const cap = state.settings?.followUpDailyCap ?? DEFAULT_FOLLOWUP_DAILY_CAP;
+        const { batch, queued } = splitDueByCap(dueList, cap);
+        return (
+          <div style={{ background: "rgba(248,113,113,0.07)", border: `1px solid ${C.red}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
+            <Label>
+              ⚑ Follow-ups — {batch.length} for today{queued.length ? ` · ${queued.length} queued` : ""}
+            </Label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 6 }}>
+              {batch.slice(0, 6).map((a) => (
+                <div key={a.id} onClick={() => setModal({ kind: "application", entry: a })} style={{ display: "flex", justifyContent: "space-between", gap: 8, cursor: "pointer", fontSize: 13 }}>
+                  <span style={{ fontWeight: 700 }}>{a.company || "Unnamed"}</span>
+                  <span style={{ fontFamily: mono, fontSize: 11, color: C.red, flexShrink: 0 }}>due {followUpOf(a)}</span>
+                </div>
+              ))}
+              {batch.length > 6 && <div style={{ fontSize: 11, color: C.muted }}>+ {batch.length - 6} more in today's batch</div>}
+              {queued.length > 0 && (
+                <div style={{ fontSize: 11, color: C.muted, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 6, marginTop: 2 }}>
+                  {queued.length} more waiting behind these — clear today's {batch.length} first. Oldest are at the top.
+                </div>
+              )}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {coachError && (
         <div style={{ marginTop: 12, background: "rgba(248,113,113,0.08)", border: `1px solid ${C.red}`, borderRadius: 10, padding: "10px 12px", fontSize: 13, color: C.red }}>
@@ -3756,6 +4107,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       { key: "highConfidence", label: `⭐ High confidence (${apps.filter((a) => a.highConfidence && !a.archivedAt).length})` },
       { key: "blank", label: `◻ Saved for later (${apps.filter((a) => isBlankStatus(a) && !a.archivedAt).length})` },
       { key: "due", label: `⚑ Due (${dueList.length})` },
+      { key: "checkPost", label: `⚠ Check posting (${apps.filter((a) => postingNeedsCheck(a) && !a.archivedAt).length})` },
       { key: "badFit", label: `🚫 Bad fit (${apps.filter((a) => isBadFit(a) && !a.archivedAt).length})` },
       { key: "closed", label: `Closed (${apps.filter((a) => !isOpenApp(a) && !a.archivedAt).length})` },
       { key: "all", label: `All (${apps.filter((a) => !a.archivedAt).length})` },
@@ -3766,6 +4118,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .filter((a) =>
         pipeFilter === "due"
           ? isDue(a)
+          : pipeFilter === "checkPost"
+          ? postingNeedsCheck(a)
           : pipeFilter === "blank"
           ? isBlankStatus(a)
           : pipeFilter === "active"
@@ -3795,6 +4149,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         pipeFilter === "due"
           ? (followUpOf(a) || "9999-12-31").localeCompare(followUpOf(b) || "9999-12-31") ||
             (a.contacted || "").localeCompare(b.contacted || "")
+          : pipeFilter === "checkPost"
+          ? /* longest-unverified first — same work-queue logic as Due */
+            (postingCheckedOn(a) || "9999-12-31").localeCompare(postingCheckedOn(b) || "9999-12-31")
           : (b.contacted || "").localeCompare(a.contacted || "")
       );
     const shownPage = shown.slice(pipePage * PAGE_SIZE, (pipePage + 1) * PAGE_SIZE);
@@ -4185,7 +4542,32 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {a.website && openLink(a.website, { title: "Open website" })}
                         </div>
                       </td>
-                      <td style={{ ...td, minWidth: 130 }}>{cellInput(a, "role", { ph: "Role applied for" })}</td>
+                      <td style={{ ...td, minWidth: 130 }}>
+                        {cellInput(a, "role", { ph: "Role applied for" })}
+                        {isReapply(a) && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleReapplyTag(a.id);
+                            }}
+                            title={`Reapplication — attempt #${attemptOf(a)}. Click to remove the tag.`}
+                            style={{
+                              marginTop: 3,
+                              background: "rgba(245,185,66,0.12)",
+                              border: `1px solid ${C.amber}`,
+                              borderRadius: 5,
+                              color: C.amber,
+                              fontFamily: mono,
+                              fontSize: 9,
+                              padding: "1px 5px",
+                              cursor: "pointer",
+                              letterSpacing: 0.4,
+                            }}
+                          >
+                            ↻ REAPPLY #{attemptOf(a)}
+                          </button>
+                        )}
+                      </td>
                       <td style={{ ...td, minWidth: 130 }} onClick={(e) => e.stopPropagation()}>
                         {a.fromAccountContact ? (
                           <button
@@ -4265,6 +4647,19 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           {cellInput(a, "postLink", { ph: "https://…" })}
                           {a.postLink && openLink(a.postLink, { title: "Open job post" })}
+                        {postingNeedsCheck(a) && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              updateAppField(a.id, "postVerified", today());
+                              flash("✓ Posting confirmed live today");
+                            }}
+                            title={`Posting not confirmed live in ${daysSince(postingCheckedOn(a))} days — open the link to check, then click to mark it verified today.`}
+                            style={{ marginTop: 3, display: "block", background: "rgba(245,185,66,0.12)", border: `1px solid ${C.amber}`, borderRadius: 5, color: C.amber, fontFamily: mono, fontSize: 9, padding: "1px 5px", cursor: "pointer", letterSpacing: 0.4 }}
+                          >
+                            ⚠ CHECK POST · {daysSince(postingCheckedOn(a))}d
+                          </button>
+                        )}
                         </div>
                       </td>
                       <td style={{ ...td, minWidth: 150 }} onClick={(e) => e.stopPropagation()}>
@@ -4452,6 +4847,25 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 150 }}>
                         {a.company || "Unnamed"}
                         {a.role && <div style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}>{a.role}</div>}
+                        {isReapply(a) && (
+                          <span
+                            style={{
+                              display: "inline-block",
+                              marginTop: 3,
+                              background: "rgba(245,185,66,0.12)",
+                              border: `1px solid ${C.amber}`,
+                              borderRadius: 5,
+                              color: C.amber,
+                              fontFamily: mono,
+                              fontSize: 9,
+                              fontWeight: 400,
+                              padding: "1px 5px",
+                              letterSpacing: 0.4,
+                            }}
+                          >
+                            ↻ REAPPLY #{attemptOf(a)}
+                          </span>
+                        )}
                         {a.website && (
                           <a
                             href={a.website.startsWith("http") ? a.website : "https://" + a.website}
@@ -4494,6 +4908,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           </a>
                         ) : (
                           <span style={{ color: C.muted, fontSize: 12 }}>—</span>
+                        )}
+                        {postingNeedsCheck(a) && (
+                          <div style={{ marginTop: 3, color: C.amber, fontFamily: mono, fontSize: 9, letterSpacing: 0.4 }}>⚠ CHECK POST · {daysSince(postingCheckedOn(a))}d</div>
                         )}
                       </td>
                       <td style={{ ...td, minWidth: 110 }}>
@@ -5107,6 +5524,91 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </div>
           )}
         </div>
+
+        {/* ---- commitment strip: the leading indicators ----
+            The weekly count above only tells you you've failed after the fact.
+            These three tell you BEFORE: what's banked, what streak is at risk,
+            and whether the idea well has run dry. */}
+        {(() => {
+          const bufferTarget = state.contentGoal?.bufferTarget ?? DEFAULT_CONTENT_BUFFER_TARGET;
+          const ideaFloor = state.contentGoal?.ideaFloor ?? DEFAULT_CONTENT_IDEA_FLOOR;
+          const frozenWeeks = state.contentGoal?.frozenWeeks || [];
+          const buffer = contentBufferCount(items);
+          const ideas = contentIdeaCount(items);
+          const streak = computeContentStreak(items, perWeek, frozenWeeks);
+          const lastWeek = addDays(thisWeekStart, -7);
+          const lastWeekPublished = publishedInWeek(items, lastWeek);
+          const lastWeekMissed = perWeek > 0 && lastWeekPublished < perWeek && !frozenWeeks.includes(lastWeek);
+          const freezeAvailable = canFreezeWeek(frozenWeeks, lastWeek);
+          const overdueCount = items.filter(contentOverdue).length;
+          const patterns = contentSkipPatterns(state.contentScheduleLog, 35);
+          const cell = (label, value, sub, color) => (
+            <div style={{ flex: 1, minWidth: 96, background: C.panel, border: `1px solid ${color || C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, textTransform: "uppercase" }}>{label}</div>
+              <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: color || C.ink, lineHeight: 1.25, marginTop: 2 }}>{value}</div>
+              <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.4, marginTop: 2 }}>{sub}</div>
+            </div>
+          );
+          return (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {cell(
+                  "❄️ Streak",
+                  `${streak.weeks} wk${streak.weeks === 1 ? "" : "s"}`,
+                  streak.weeks > 0 ? "consecutive weeks on target" : "hit this week's target to start one",
+                  streak.weeks > 0 ? C.green : C.panelEdge
+                )}
+                {cell(
+                  "📦 Ready to publish",
+                  `${buffer} / ${bufferTarget}`,
+                  buffer >= bufferTarget ? "banked — a missed day costs nothing" : buffer === 0 ? "nothing banked. This is the real risk." : "below your buffer",
+                  buffer >= bufferTarget ? C.green : buffer === 0 ? C.red : C.amber
+                )}
+                {cell(
+                  "💡 Idea bank",
+                  `${ideas} / ${ideaFloor}`,
+                  ideas >= ideaFloor ? "well stocked" : "running dry — ideate before drafting",
+                  ideas >= ideaFloor ? C.green : C.amber
+                )}
+              </div>
+
+              {/* the freeze offer — only surfaced when there's actually a week to save */}
+              {lastWeekMissed && streak.weeks === 0 && freezeAvailable && (
+                <div style={{ marginTop: 8, background: "rgba(96,165,250,0.08)", border: `1px solid ${C.blue}`, borderRadius: 12, padding: "10px 12px" }}>
+                  <div style={{ fontSize: 12, color: C.ink, lineHeight: 1.5 }}>
+                    Last week came in at {lastWeekPublished}/{perWeek}. You have one freeze left this month — spend it to protect the streak.
+                  </div>
+                  <button
+                    onClick={() => freezeContentWeek(lastWeek)}
+                    style={{ marginTop: 8, background: "transparent", border: `1px solid ${C.blue}`, color: C.blue, borderRadius: 10, padding: "7px 12px", fontSize: 12, cursor: "pointer" }}
+                  >
+                    ❄️ Freeze {weekLabel(new Date(lastWeek + "T00:00:00"))}
+                  </button>
+                </div>
+              )}
+
+              {overdueCount > 0 && (
+                <div style={{ marginTop: 8, fontSize: 12, color: C.red }}>
+                  ⚠ {overdueCount} piece{overdueCount === 1 ? "" : "s"} past its ship-by date — ship it or move the date on purpose.
+                </div>
+              )}
+
+              {/* diagnosis, not guilt: name the pattern and what it implies */}
+              {patterns.total >= 3 && patterns.topReason && (
+                <div style={{ marginTop: 8, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
+                  <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, marginBottom: 4 }}>SKIP PATTERN · LAST 5 WEEKS</div>
+                  <div style={{ fontSize: 12, color: C.ink, lineHeight: 1.5 }}>
+                    {patterns.total} missed day{patterns.total === 1 ? "" : "s"}, most often: <strong>{skipReasonLabel(patterns.topReason.key)}</strong> ({patterns.topReason.count}×)
+                    {patterns.topStage ? ` · usually on ${CONTENT_STAGE_LABEL[patterns.topStage.stage]?.toLowerCase() || patterns.topStage.stage} day` : ""}.
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                    {CONTENT_SKIP_REASONS.find((r) => r.key === patterns.topReason.key)?.fix}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
           <input
@@ -5906,7 +6408,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -6005,10 +6507,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       )}
       {missedContentPrompt && (
         <MissedContentModal
-          onClose={() => resolveMissedContent("skip")}
+          onClose={() => {}}
           stage={missedContentPrompt.stage}
-          onContinue={() => resolveMissedContent("continue")}
-          onSkip={() => resolveMissedContent("skip")}
+          onContinue={(reason) => resolveMissedContent("continue", reason)}
+          onSkip={(reason) => resolveMissedContent("skip", reason)}
         />
       )}
       {duplicateSuggestion && (
@@ -6018,6 +6520,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           onMerge={resolveDuplicateAsMerge}
           onKeepSeparate={resolveDuplicateAsSeparate}
           onClose={resolveDuplicateAsSeparate}
+        />
+      )}
+      {reapplySuggestion && (
+        <ReapplySuggestionModal
+          pendingApp={reapplySuggestion.pendingApp}
+          priorAttempts={reapplySuggestion.priorAttempts}
+          onConfirm={resolveAsReapply}
+          onKeepNew={resolveReapplyAsNew}
+          onClose={resolveReapplyAsNew}
         />
       )}
       {confirmDelete && (
@@ -6044,6 +6555,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         source: entry?.source || pre.source || "",
         jobBoardName: entry?.jobBoardName || pre.jobBoardName || "",
         postLink: entry?.postLink || pre.postLink || "",
+        postVerified: entry?.postVerified || "",
         postShot: entry?.postShot || "",
         screenshotLink: entry?.screenshotLink || "",
         salary: entry?.salary || pre.salary || "",
@@ -6060,6 +6572,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         outreachChannel: entry?.outreachChannel || "",
         badReasons: entry?.badReasons ? [...entry.badReasons] : [],
         highConfidence: entry?.highConfidence || false,
+        attempt: attemptOf(entry || {}),
         notes: entry?.notes || pre.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
         touchpoints: entry?.touchpoints ? entry.touchpoints.map((t) => ({ ...t })) : [],
@@ -6073,6 +6586,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
       return {
         day: entry?.day ?? 1,
         followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String),
+        followUpDailyCap: String(modal.followUpDailyCap ?? DEFAULT_FOLLOWUP_DAILY_CAP),
+        contentBufferTarget: String(modal.contentBufferTarget ?? DEFAULT_CONTENT_BUFFER_TARGET),
+        contentIdeaFloor: String(modal.contentIdeaFloor ?? DEFAULT_CONTENT_IDEA_FLOOR),
         timezoneOffset: entry?.timezoneOffset ?? 8,
         contentSchedule: entry?.contentSchedule
           ? { idea: [...entry.contentSchedule.idea], draft: [...entry.contentSchedule.draft], design: [...entry.contentSchedule.design], scheduled: [...entry.contentSchedule.scheduled] }
@@ -6124,6 +6640,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         link: entry?.link || "",
         assetsLink: entry?.assetsLink || "",
         date: entry?.date || today(),
+        shipBy: entry?.shipBy || "",
         hook: entry?.hook || "",
         outline: entry?.outline || "",
         draft: entry?.draft || "",
@@ -6203,7 +6720,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     if (kind === "application") {
       onSave({
         ...f,
-        followUps: (f.followUps || []).map((x) => ({ days: Math.max(0, +x.days || 0), done: !!x.done })),
+        followUps: (f.followUps || []).map((x) => ({ days: Math.max(0, +x.days || 0), done: !!x.done, doneAt: x.doneAt || "" })),
         custom: (f.custom || []).filter((c) => c.k || c.v),
       });
     } else if (kind === "account") {
@@ -6309,6 +6826,30 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               </div>
             )}
             <Field label="Link to the job post" value={f.postLink} onChange={set("postLink")} placeholder="https://linkedin.com/jobs/…" />
+            {f.postLink ? (
+              <div style={{ marginBottom: 12 }}>
+                <Label>Posting last confirmed live</Label>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input
+                    type="date"
+                    value={f.postVerified || ""}
+                    onChange={(e) => set("postVerified")(e.target.value)}
+                    style={{ ...inputStyle, flex: 1, fontFamily: mono, padding: "8px 10px", colorScheme: "dark" }}
+                  />
+                  <button
+                    onClick={() => set("postVerified")(today())}
+                    style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.blue, borderRadius: 10, padding: "9px 12px", fontSize: 12, cursor: "pointer", flexShrink: 0, whiteSpace: "nowrap" }}
+                  >
+                    ✓ Still live today
+                  </button>
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                  {postingNeedsCheck({ ...f, id: entry?.id })
+                    ? `⚠ Not confirmed in ${daysSince(postingCheckedOn(f))} days — worth opening the link before you follow up again.`
+                    : "Open the link and hit this whenever you re-check that the role is still posted."}
+                </div>
+              </div>
+            ) : null}
             <div style={{ marginBottom: 12 }}>
               <Label>…or upload a screenshot of the post</Label>
               {f.postShot ? (
@@ -6461,7 +7002,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   </div>
                   <button
                     onClick={() =>
-                      setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, done: !x.done } : x)) }))
+                      setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, done: !x.done, doneAt: !x.done ? today() : "" } : x)) }))
                     }
                     title={fu.done ? "Mark not done" : "Mark done"}
                     style={{ background: "transparent", border: `1px solid ${fu.done ? C.green : C.panelEdge}`, color: fu.done ? C.green : C.muted, borderRadius: 10, width: 34, height: 34, cursor: "pointer", flexShrink: 0 }}
@@ -6505,6 +7046,30 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   Saved for later — won't count in your funnel or need a contact date until you set a real status.
                 </div>
               )}
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <Label>Reapplication?</Label>
+              <button
+                onClick={() => setF((p) => ({ ...p, attempt: attemptOf(p) > 1 ? 1 : 2 }))}
+                style={{
+                  width: "100%",
+                  boxSizing: "border-box",
+                  textAlign: "left",
+                  background: attemptOf(f) > 1 ? "rgba(245,185,66,0.1)" : "transparent",
+                  border: `1px solid ${attemptOf(f) > 1 ? C.amber : C.panelEdge}`,
+                  color: attemptOf(f) > 1 ? C.amber : C.muted,
+                  borderRadius: 10,
+                  padding: "9px 12px",
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                {attemptOf(f) > 1 ? `↻ Tagged as a reapplication (attempt #${attemptOf(f)})` : "☐ Not a reapplication"}
+              </button>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                Tag this when you&apos;ve applied to the same role at the same company before. Keeps both attempts in your history and stops them being counted as one opportunity.
+              </div>
             </div>
 
             {(f.status === "outreach" || f.outreachKind || f.outreachChannel) && (
@@ -6767,6 +7332,52 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             >
               + Add follow-up
             </button>
+
+            <Label>Max follow-ups per day</Label>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+              Adding a batch of applications on one day would otherwise land every one of their follow-ups on the same later day. New entries get nudged forward (up to a
+              week) onto a lighter day, and the Dashboard shows this many as today's batch with the rest queued behind. Set 0 to turn both off.
+            </div>
+            <input
+              type="number"
+              inputMode="numeric"
+              value={f.followUpDailyCap}
+              onChange={(e) => set("followUpDailyCap")(e.target.value)}
+              style={{ ...inputStyle, width: 90, fontFamily: mono, padding: "8px 10px", marginBottom: 16 }}
+            />
+
+            <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <Label>📦 Content commitment targets</Label>
+              <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+                The weekly count only tells you you've missed after the week is gone. These two tell you beforehand: how many finished pieces to keep banked, and the minimum
+                raw ideas to hold so a design day never starts from a blank page.
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 4 }}>
+                <div>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Ready-to-publish buffer</div>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    value={f.contentBufferTarget}
+                    onChange={(e) => set("contentBufferTarget")(e.target.value)}
+                    style={{ ...inputStyle, width: "100%", fontFamily: mono, padding: "8px 10px", boxSizing: "border-box" }}
+                  />
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Idea bank floor</div>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    value={f.contentIdeaFloor}
+                    onChange={(e) => set("contentIdeaFloor")(e.target.value)}
+                    style={{ ...inputStyle, width: "100%", fontFamily: mono, padding: "8px 10px", boxSizing: "border-box" }}
+                  />
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 4 }}>
+                You also get one streak freeze per calendar month, offered in Content mode when a missed week would otherwise break the chain.
+              </div>
+            </div>
 
             <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
               <Label>📝 Content schedule — which day for which stage?</Label>
@@ -7184,7 +7795,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                         return (
                           <button
                             key={fi}
-                            onClick={() => setContact({ followUps: fus.map((x, xi) => (xi === fi ? { ...x, done: !x.done } : x)) })}
+                            onClick={() => setContact({ followUps: fus.map((x, xi) => (xi === fi ? { ...x, done: !x.done, doneAt: !x.done ? today() : "" } : x)) })}
                             title={due ? `Due ${due}` : ""}
                             style={{
                               fontFamily: mono,
@@ -7339,7 +7950,15 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             </div>
             <Field label="Link to the content (if published)" value={f.link} onChange={set("link")} placeholder="https://…" />
             <Field label="Link to assets (video / photo)" value={f.assetsLink} onChange={set("assetsLink")} placeholder="Google Drive, Dropbox, raw file link…" />
-            <Field label="Date" type="date" value={f.date} onChange={set("date")} />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <Field label="Date" type="date" value={f.date} onChange={set("date")} />
+              <Field label="Ship by (commitment)" type="date" value={f.shipBy} onChange={set("shipBy")} />
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: -6, marginBottom: 12 }}>
+              {contentOverdue({ ...f })
+                ? `⚠ Past its ship-by date by ${daysSince(f.shipBy)} day${daysSince(f.shipBy) === 1 ? "" : "s"}. Either ship it or move the date deliberately — don't let it just sit.`
+                : "Naming the day you'll publish is the commitment. Overdue pieces get flagged on the board."}
+            </div>
 
             <div style={{ marginBottom: 12 }}>
               <Label>Platforms (select all that apply)</Label>
@@ -7790,6 +8409,50 @@ function DuplicateSuggestionModal({ pendingApp, duplicateApp, onMerge, onKeepSep
   );
 }
 
+function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNew, onClose }) {
+  const latest = priorAttempts[0];
+  const gapDays = latest?.contacted && pendingApp.contacted ? Math.round((new Date(pendingApp.contacted + "T00:00:00") - new Date(latest.contacted + "T00:00:00")) / 86400000) : null;
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 420, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+      >
+        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 8 }}>↻ You&apos;ve applied here before</div>
+        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 12 }}>
+          <strong style={{ color: C.ink }}>{pendingApp.role || "This role"}</strong> at <strong style={{ color: C.ink }}>{pendingApp.company}</strong> already has{" "}
+          {priorAttempts.length === 1 ? "an earlier attempt" : `${priorAttempts.length} earlier attempts`} on record
+          {gapDays != null && gapDays > 0 ? ` — the last one ${gapDays} day${gapDays === 1 ? "" : "s"} ago` : ""}.
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+          {priorAttempts.slice(0, 4).map((p) => (
+            <div key={p.id} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "7px 10px", fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>#{attemptOf(p)}</span>
+              <span style={{ color: statusColor(p.status), fontFamily: mono, fontSize: 11 }}>{statusLabel(p.status) || "no status"}</span>
+              {p.contacted && <span style={{ marginLeft: "auto", color: C.muted, fontFamily: mono, fontSize: 10 }}>{p.contacted}</span>}
+            </div>
+          ))}
+        </div>
+        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 14 }}>
+          Tagging it keeps both attempts in your history — useful when they ask &ldquo;have you applied before?&rdquo; — and stops the new attempt from being merged with the old
+          one in your funnel counts.
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <Btn onClick={onConfirm}>↻ Tag as reapplication</Btn>
+          <Btn ghost onClick={onKeepNew}>
+            No — track as a new application
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop, openLink, onAddToStage }) {
   const [draggingId, setDraggingId] = useState(null);
   const [dragOverStage, setDragOverStage] = useState(null);
@@ -7872,7 +8535,9 @@ function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop, openLink,
                   onDragEnd={isDesktop ? () => { setDraggingId(null); setDragOverStage(null); } : undefined}
                   style={{
                     background: C.bg,
-                    border: `1px solid ${C.panelEdge}`,
+                    /* overdue commitments read red — a ship-by date you set and
+                       blew past is the strongest signal on this board */
+                    border: `1px solid ${contentOverdue(c) ? C.red : C.panelEdge}`,
                     borderRadius: 10,
                     padding: 10,
                     cursor: isDesktop ? "grab" : "pointer",
@@ -7883,6 +8548,11 @@ function ContentBoard({ items, onOpen, onMove, onDropStage, isDesktop, openLink,
                   <div style={{ fontSize: 13, fontWeight: 700, color: C.ink, lineHeight: 1.4 }}>{c.title || "Untitled"}</div>
                   <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{[c.type, (c.platforms || []).join(", ")].filter(Boolean).join(" · ") || "—"}</div>
                   {c.date && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>{c.date}</div>}
+                  {c.shipBy && c.status !== "published" && (
+                    <div style={{ fontFamily: mono, fontSize: 10, color: contentOverdue(c) ? C.red : C.muted, marginTop: 2 }}>
+                      {contentOverdue(c) ? `⚠ ship-by ${c.shipBy} · ${daysSince(c.shipBy)}d late` : `ship by ${c.shipBy}`}
+                    </div>
+                  )}
                   {(c.link || c.assetsLink) && (
                     <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", gap: 10, marginTop: 4 }}>
                       {c.link && openLink(c.link, { title: "Open published content" })}
@@ -7955,25 +8625,53 @@ function WinUpdateForm({ onCancel, onSave }) {
 }
 
 function MissedContentModal({ onClose, stage, onContinue, onSkip }) {
+  const [reason, setReason] = useState("");
+  const picked = CONTENT_SKIP_REASONS.find((r) => r.key === reason);
   return (
     <div
-      onClick={onClose}
       onTouchStart={(e) => e.stopPropagation()}
       onTouchEnd={(e) => e.stopPropagation()}
       style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        style={{ width: "100%", maxWidth: 380, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box" }}
+        style={{ width: "100%", maxWidth: 400, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 20, boxSizing: "border-box", maxHeight: "85vh", overflowY: "auto" }}
       >
         <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 8 }}>📝 Missed yesterday's content task</div>
-        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 16 }}>
-          Yesterday's plan was to <strong style={{ color: C.ink }}>{CONTENT_STAGE_LABEL[stage]?.toLowerCase()}</strong> something, but it wasn't checked off. Carry it into today, or let it go and stick with today's regular plan?
+        <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.55, marginBottom: 14 }}>
+          Yesterday's plan was to <strong style={{ color: C.ink }}>{CONTENT_STAGE_LABEL[stage]?.toLowerCase()}</strong> something. What got in the way? No wrong answers — this is
+          how the app learns whether your schedule needs changing.
         </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+          {CONTENT_SKIP_REASONS.map((r) => (
+            <button
+              key={r.key}
+              onClick={() => setReason(r.key)}
+              style={{
+                textAlign: "left",
+                background: reason === r.key ? "rgba(245,185,66,0.1)" : "transparent",
+                border: `1px solid ${reason === r.key ? C.amber : C.panelEdge}`,
+                color: reason === r.key ? C.amber : C.muted,
+                borderRadius: 10,
+                padding: "9px 12px",
+                fontSize: 13,
+                cursor: "pointer",
+              }}
+            >
+              {reason === r.key ? "◉" : "○"} {r.label}
+            </button>
+          ))}
+        </div>
+        {picked && <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 14, fontStyle: "italic" }}>{picked.fix}</div>}
         <div style={{ display: "flex", gap: 10 }}>
-          <Btn ghost onClick={onSkip} style={{ flex: 1 }}>Skip it</Btn>
-          <Btn onClick={onContinue} style={{ flex: 1 }}>Continue today</Btn>
+          <Btn ghost disabled={!reason} onClick={() => onSkip(reason)} style={{ flex: 1 }}>
+            Let it go
+          </Btn>
+          <Btn disabled={!reason} onClick={() => onContinue(reason)} style={{ flex: 1 }}>
+            Do it today
+          </Btn>
         </div>
+        {!reason && <div style={{ fontSize: 11, color: C.muted, marginTop: 8, textAlign: "center" }}>Pick a reason to continue</div>}
       </div>
     </div>
   );
