@@ -485,9 +485,48 @@ const isOpenApp = (a) => !["offer", "rejected", "bad fit"].includes(a.status);
    Falls back to the current status for stages outside the milestone list
    (or older data saved before milestonesLogged existed). */
 const reached = (a, stage) => {
+  if (stage === "replied" && a?.gotReply) return true; /* explicitly recorded reply outranks status position */
   if ((a.milestonesLogged || []).includes(stage)) return true;
   return a.status !== "rejected" && a.status !== "bad fit" && (STAGE_IDX[a.status] ?? 0) >= STAGE_IDX[stage];
 };
+
+/* ---- "they replied, then rejected me" ----
+   Status is a single position, so moving an entry to "rejected" or "bad fit"
+   erases the fact that a human ever answered — unless you happened to step
+   through "replied" first and logged the milestone. That loses the single most
+   diagnostic distinction in the whole funnel:
+
+     · rejected WITH a reply  → your resume/outreach worked. A person read it
+       and engaged. The leak is later, in the conversation.
+     · rejected with NO reply → nothing got through. The leak is the
+       resume/ATS/opening-message layer, exactly as the playbook's Part 4
+       diagnosis says.
+
+   `gotReply` records that fact independently of status, so it survives any
+   later status change. Works identically on applications and account contacts,
+   since both carry the same field. */
+const hadReply = (a) => !!(a?.gotReply || (a?.milestonesLogged || []).includes("replied") || (a?.status !== "rejected" && a?.status !== "bad fit" && (STAGE_IDX[a?.status] ?? 0) >= STAGE_IDX.replied));
+/* the interesting case worth its own filter and badge: a real answer that
+   still ended in a no */
+const isRepliedThenRejected = (a) => !isOpenApp(a) && a?.status !== "offer" && hadReply(a);
+/* the other side of the same coin — silence, which points at a different fix */
+const isRejectedNoReply = (a) => !isOpenApp(a) && a?.status !== "offer" && !hadReply(a);
+/* pure: called on every status change. If an entry is being CLOSED from a stage
+   that already implied a reply, latch gotReply so the fact isn't silently lost
+   the moment the status moves on. Never un-sets it — clearing a mis-set reply
+   is a deliberate manual action, not a side effect of editing something else. */
+const latchReply = (prevEntry, newStatus) =>
+  (newStatus === "rejected" || newStatus === "bad fit") && hadReply(prevEntry) ? { gotReply: true } : {};
+/* contact-side equivalents. Contacts use a coarser 5-stage vocabulary, so we
+   translate to the application scale before judging — "discovery call" and
+   "ongoing" both sit past a reply, and "closed" is the collapse that would
+   otherwise lose it. */
+const contactHadReply = (c) => {
+  if (c?.gotReply) return true;
+  const mapped = mapContactStatusToAppStatus(c?.status);
+  return mapped !== "rejected" && mapped !== "bad fit" && (STAGE_IDX[mapped] ?? 0) >= STAGE_IDX.replied;
+};
+const latchContactReply = (prevContact, newStatus) => (newStatus === "closed" && contactHadReply(prevContact) ? { gotReply: true } : {});
 const statusColor = (s) =>
   s === "offer" ? C.green : s === "rejected" ? C.muted : s === "bad fit" ? C.red : s === "" ? C.muted : s === "outreach" ? C.blue : ["interview", "final round"].includes(s) ? C.amber : ["replied", "screening"].includes(s) ? C.blue : C.ink;
 const outreachKindColor = (k) => (k === "warm" ? C.amber : k === "cold" ? C.blue : C.muted);
@@ -660,6 +699,7 @@ function propagateConvergedStatus(applications, accounts, sourceApp, newStatus) 
       status: newStatus,
       contacted: !a.contacted ? sourceApp?.contacted || a.contacted : a.contacted,
       milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged,
+      ...latchReply(a, newStatus),
     };
   });
   /* linked account contacts follow too — including the source's own, so the
@@ -965,6 +1005,10 @@ function buildCycleSnapshot(s, g, cycleNumber) {
   const interviews = counted.filter((a) => reached(a, "interview")).length;
   const offers = counted.filter((a) => a.status === "offer" || (a.milestonesLogged || []).includes("offer")).length;
   const badFits = counted.filter((a) => isBadFit(a)).length;
+  /* the diagnostic split: a no after a real reply points at the conversation,
+     a no with total silence points at the resume/ATS/opening-message layer */
+  const closedWithReply = counted.filter((a) => isRepliedThenRejected(a)).length;
+  const closedNoReply = counted.filter((a) => isRejectedNoReply(a)).length;
   const highConfidence = counted.filter((a) => a.highConfidence).length;
   const topOfFunnel = totalApps + totalOutreach;
   const conversionRatePct = topOfFunnel > 0 ? +((offers / topOfFunnel) * 100).toFixed(1) : 0;
@@ -984,7 +1028,7 @@ function buildCycleSnapshot(s, g, cycleNumber) {
         aggressiveness: s.goal.aggressiveness,
         rampEnabled: !!s.goal.rampEnabled,
       },
-      funnel: { applications: totalApps, outreach: totalOutreach, replies, screens, interviews, offers, conversionRatePct, badFitCount: badFits, highConfidenceCount: highConfidence },
+      funnel: { applications: totalApps, outreach: totalOutreach, replies, screens, interviews, offers, conversionRatePct, badFitCount: badFits, highConfidenceCount: highConfidence, closedWithReply, closedNoReply },
       statusBreakdown: statusCounts,
       pipeline: apps.map((a) => ({
         company: a.company || null,
@@ -2096,6 +2140,9 @@ export default function FlightDeck() {
      whenever the underlying filter/search changes so you never land on an
      empty page after narrowing down a list */
   const [pipePage, setPipePage] = useState(0);
+  /* Due tab: whether the follow-ups queued behind today's capped batch are
+     expanded. Defaults collapsed so the tab opens as a doable list. */
+  const [showQueuedDue, setShowQueuedDue] = useState(false);
   useEffect(() => setPipePage(0), [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
   /* bulk selection for converting applications to accounts */
   const [selectMode, setSelectMode] = useState(false);
@@ -2519,6 +2566,12 @@ export default function FlightDeck() {
           `${r.week}: apps ${r.d.apps + r.legacy.apps}, outreach ${r.outreach}, replies ${r.d.replies + r.legacy.replies}, screens ${r.d.screens + r.legacy.screens}, interviews ${r.d.interviews + r.legacy.interviews}, offers ${r.d.offers + r.legacy.offers}`
       );
     const byStatus = APP_STATUSES.map((s) => `${statusLabel(s)}: ${apps.filter((a) => (a.status ?? "") === s).length}`).join(", ");
+    const replySplit = (() => {
+      const withReply = apps.filter((a) => !a.archivedAt && isRepliedThenRejected(a)).length;
+      const noReply = apps.filter((a) => !a.archivedAt && isRejectedNoReply(a)).length;
+      if (!withReply && !noReply) return "No closed entries yet.";
+      return `Closed outcomes: ${withReply} replied-then-rejected (a human engaged — top of funnel WORKED), ${noReply} closed with no reply ever (nothing got through). Whichever dominates names the layer to fix.`;
+    })();
     const emos = state.emotions
       .slice(0, 6)
       .map((x) => `${x.date} ${x.name || "?"} (${x.intensity || "?"}/10) claim:"${x.claim || ""}" action:"${x.action || "none"}"`);
@@ -2584,6 +2637,7 @@ export default function FlightDeck() {
       `Funnel totals (derived live from pipeline): apps ${totals.apps}, outreach ${totals.outreach}, replies ${totals.replies}, screens ${totals.screens}, interviews ${totals.interviews}, offers ${totals.offers}.`,
       `Outreach split (tags kept even after status advances): warm ${apps.filter((a) => a.outreachKind === "warm").length}, cold ${apps.filter((a) => a.outreachKind === "cold").length}, still-untagged-in-outreach ${apps.filter((a) => isOutreach(a) && !a.outreachKind).length}. Warm converts 4-10x better than cold.`,
       `Pipeline by status: ${byStatus}.`,
+      replySplit,
       `Follow-ups DUE today or overdue: ${dueList.length}${dueList.length ? " — " + dueList.slice(0, 6).map((a) => `${a.company || "unnamed"} (contacted ${a.contacted}, status ${a.status})`).join("; ") : ""}.`,
       goalLine,
       contentLine,
@@ -2600,6 +2654,7 @@ Non-negotiable playbook rules you must coach within:
 - The P95,000/month salary floor holds. NEVER suggest lowering it unless runway is under 3 months, and even then only as a written deliberate decision.
 - Weekly benchmarks: 8-10 tailored applications + 20-25 warm outreaches. Warm/referral channels convert 4-10x better than cold applications.
 - Funnel diagnosis: no replies = fix resume/portfolio layer; screens but no interviews = fix screening-call prep; interviews but no offers = fix interview stage.
+- Closed entries are split into "replied then rejected" vs "closed with no reply ever". This is the sharpest diagnostic available: a pile of no-reply closes means the resume/ATS/opening-message layer is the leak, while rejections that came AFTER a real reply mean the top of funnel is working and the leak is in the conversation. Use whichever dominates to name ONE specific fix. Never read "replied then rejected" as failure — it is evidence the outreach worked.
 - Follow-ups that are due should usually be today's first action items - name the specific companies.
 - Rejection at ~95% of cold applications is the statistical norm, not a verdict. Decisions come from tracker numbers, never from moods.
 - Emotions: each logged emotion should convert to exactly ONE small action. High intensity (8+) = body regulation first.
@@ -3031,6 +3086,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             status,
             contacted: wasBlank && status && !a.contacted ? today() : a.contacted,
             milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged,
+            /* preserve "a human actually answered" across the close */
+            ...latchReply(a, status),
           };
           return updatedSource;
         });
@@ -3378,7 +3435,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               if (a.id !== entry.id) return a;
               const m = computeMilestoneWins(a, data.status);
               if (m) addWins = m.wins;
-              return { ...a, ...data, milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged };
+              return { ...a, ...data, milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged, ...latchReply(a, data.status) };
             });
           } else {
             /* brand-new entry created directly at an advanced status (rare, but possible) */
@@ -4106,9 +4163,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       { key: "active", label: `Active (${apps.filter((a) => isOpenApp(a) && !a.archivedAt).length})` },
       { key: "highConfidence", label: `⭐ High confidence (${apps.filter((a) => a.highConfidence && !a.archivedAt).length})` },
       { key: "blank", label: `◻ Saved for later (${apps.filter((a) => isBlankStatus(a) && !a.archivedAt).length})` },
-      { key: "due", label: `⚑ Due (${dueList.length})` },
+      {
+        key: "due",
+        label: (() => {
+          const cap = state.settings?.followUpDailyCap ?? DEFAULT_FOLLOWUP_DAILY_CAP;
+          return cap > 0 && dueList.length > cap ? `⚑ Due (${cap} of ${dueList.length})` : `⚑ Due (${dueList.length})`;
+        })(),
+      },
       { key: "checkPost", label: `⚠ Check posting (${apps.filter((a) => postingNeedsCheck(a) && !a.archivedAt).length})` },
       { key: "badFit", label: `🚫 Bad fit (${apps.filter((a) => isBadFit(a) && !a.archivedAt).length})` },
+      { key: "repliedRejected", label: `✉ Replied, then no (${apps.filter((a) => isRepliedThenRejected(a) && !a.archivedAt).length})` },
+      { key: "noReply", label: `🔇 Closed, no reply (${apps.filter((a) => isRejectedNoReply(a) && !a.archivedAt).length})` },
       { key: "closed", label: `Closed (${apps.filter((a) => !isOpenApp(a) && !a.archivedAt).length})` },
       { key: "all", label: `All (${apps.filter((a) => !a.archivedAt).length})` },
       { key: "archived", label: `🗄 Archived (${apps.filter((a) => !!a.archivedAt).length})` },
@@ -4126,6 +4191,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? isOpenApp(a)
           : pipeFilter === "closed"
           ? !isOpenApp(a)
+          : pipeFilter === "repliedRejected"
+          ? isRepliedThenRejected(a)
+          : pipeFilter === "noReply"
+          ? isRejectedNoReply(a)
           : pipeFilter === "highConfidence"
           ? !!a.highConfidence
           : pipeFilter === "badFit"
@@ -4154,7 +4223,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             (postingCheckedOn(a) || "9999-12-31").localeCompare(postingCheckedOn(b) || "9999-12-31")
           : (b.contacted || "").localeCompare(a.contacted || "")
       );
-    const shownPage = shown.slice(pipePage * PAGE_SIZE, (pipePage + 1) * PAGE_SIZE);
+
+    /* ---- Due filter load smoothing ----
+       Same principle as the Dashboard card: the Due tab is a work queue, and a
+       21-row wall of red trains you to ignore it. The list is already sorted
+       most-overdue-first, so the first `cap` rows are genuinely the right ones
+       to do today. The rest stay one tap away rather than hidden — the work
+       isn't being deleted, just deferred out of today's ask. */
+    const dueCap = state.settings?.followUpDailyCap ?? DEFAULT_FOLLOWUP_DAILY_CAP;
+    const dueSplit = pipeFilter === "due" ? splitDueByCap(shown, dueCap) : { batch: shown, queued: [] };
+    const dueQueuedIds = new Set(dueSplit.queued.map((a) => a.id));
+    const visible = pipeFilter === "due" && dueSplit.queued.length > 0 && !showQueuedDue ? dueSplit.batch : shown;
+    const shownPage = visible.slice(pipePage * PAGE_SIZE, (pipePage + 1) * PAGE_SIZE);
 
     const totalContacts = (state.accounts || []).reduce((s, a) => s + (a.contacts || []).length, 0);
     const realApplicationsCount = apps.filter((a) => !a.fromAccountContact && !a.archivedAt).length;
@@ -4308,6 +4388,26 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         )}
 
+        {pipeFilter === "due" && dueSplit.queued.length > 0 && (
+          <div style={{ background: "rgba(248,113,113,0.07)", border: `1px solid ${C.red}`, borderRadius: 12, padding: "10px 14px", marginBottom: 10 }}>
+            <div style={{ fontSize: 13, color: C.ink, lineHeight: 1.5 }}>
+              <strong>{dueSplit.batch.length} for today</strong> · {dueSplit.queued.length} queued behind them
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 2 }}>
+              Sorted longest-waiting first, capped at your {dueCap}/day setting. Clear today's {dueSplit.batch.length} and the rest move up tomorrow.
+            </div>
+            <button
+              onClick={() => {
+                setShowQueuedDue((v) => !v);
+                setPipePage(0);
+              }}
+              style={{ marginTop: 8, background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 9, padding: "6px 11px", fontSize: 12, cursor: "pointer" }}
+            >
+              {showQueuedDue ? `Hide the ${dueSplit.queued.length} queued` : `Show all ${shown.length}`}
+            </button>
+          </div>
+        )}
+
         {isDesktop ? (
           <>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
@@ -4315,7 +4415,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 {filters.map((f) => (
                   <button
                     key={f.key}
-                    onClick={() => setPipeFilter(f.key)}
+                    onClick={() => {
+                      setPipeFilter(f.key);
+                      setShowQueuedDue(false);
+                      setPipePage(0);
+                    }}
                     style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${pipeFilter === f.key ? C.amber : C.panelEdge}`, background: pipeFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: pipeFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
                   >
                     {f.label}
@@ -4407,6 +4511,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           key={f.key}
                           onClick={() => {
                             setPipeFilter(f.key);
+                            setShowQueuedDue(false);
                             setPipeFilterPanelOpen(false);
                           }}
                           style={{
@@ -4513,8 +4618,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   const due = isDue(a);
                   const fus = normFollowUps(a);
                   const doneCount = fus.filter((x) => x.done).length;
+                  /* queued-behind-today rows are dimmed and lose the red wash:
+                     still fully editable, just not part of today's ask */
+                  const queued = dueQueuedIds.has(a.id);
                   return (
-                    <tr key={a.id} style={{ background: due ? "rgba(248,113,113,0.06)" : a.highConfidence ? "rgba(245,185,66,0.05)" : "transparent" }}>
+                    <tr key={a.id} style={{ opacity: queued ? 0.45 : 1, background: queued ? "transparent" : due ? "rgba(248,113,113,0.06)" : a.highConfidence ? "rgba(245,185,66,0.05)" : "transparent" }}>
                       <td style={{ ...td, textAlign: "center", position: "sticky", left: 0, zIndex: 2, background: C.panel }} onClick={(e) => e.stopPropagation()}>
                         {selectMode ? (
                           <input
@@ -4700,6 +4808,34 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                             </option>
                           ))}
                         </select>
+                        {!isOpenApp(a) && a.status !== "offer" && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              updateAppField(a.id, "gotReply", !a.gotReply);
+                            }}
+                            title={
+                              hadReply(a)
+                                ? "A human replied before this closed — click to correct"
+                                : "No reply ever came — click if they actually did reply"
+                            }
+                            style={{
+                              marginTop: 4,
+                              display: "block",
+                              background: hadReply(a) ? "rgba(96,165,250,0.12)" : "transparent",
+                              border: `1px solid ${hadReply(a) ? C.blue : C.panelEdge}`,
+                              borderRadius: 5,
+                              color: hadReply(a) ? C.blue : C.muted,
+                              fontFamily: mono,
+                              fontSize: 9,
+                              padding: "1px 5px",
+                              cursor: "pointer",
+                              letterSpacing: 0.4,
+                            }}
+                          >
+                            {hadReply(a) ? "✉ REPLIED" : "🔇 NO REPLY"}
+                          </button>
+                        )}
                         {a.status === "outreach" && (
                           <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
                             <select
@@ -4795,7 +4931,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </table>
           </div>
         )}
-        {shown.length > 0 && isDesktop && <Pagination page={pipePage} setPage={setPipePage} total={shown.length} />}
+        {visible.length > 0 && isDesktop && <Pagination page={pipePage} setPage={setPipePage} total={visible.length} />}
 
         {shown.length > 0 && !isDesktop && (
           <div
@@ -4824,8 +4960,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   const due = isDue(a);
                   const fus = normFollowUps(a);
                   const doneCount = fus.filter((x) => x.done).length;
+                  const queued = dueQueuedIds.has(a.id);
                   return (
-                    <tr key={a.id} onClick={() => setModal({ kind: "application", entry: a })} style={{ cursor: "pointer", background: due ? "rgba(248,113,113,0.06)" : "transparent" }}>
+                    <tr key={a.id} onClick={() => setModal({ kind: "application", entry: a })} style={{ cursor: "pointer", opacity: queued ? 0.45 : 1, background: queued ? "transparent" : due ? "rgba(248,113,113,0.06)" : "transparent" }}>
                       <td style={{ ...td, textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
                         {selectMode ? (
                           <input
@@ -4936,6 +5073,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         {a.status === "bad fit" && (a.badReasons || []).length > 0 && (
                           <div style={{ fontFamily: mono, fontSize: 9, color: C.red, marginTop: 4 }}>{(a.badReasons || []).join(", ")}</div>
                         )}
+                        {!isOpenApp(a) && a.status !== "offer" && (
+                          <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: 0.4, color: hadReply(a) ? C.blue : C.muted, marginTop: 4 }}>
+                            {hadReply(a) ? "✉ REPLIED" : "🔇 NO REPLY"}
+                          </div>
+                        )}
                       </td>
                       <td style={{ ...td, whiteSpace: "nowrap" }}>
                         <span style={{ fontFamily: mono, fontSize: 12, color: C.muted }}>{a.contacted || "—"}</span>
@@ -4974,7 +5116,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </table>
           </div>
         )}
-        {shown.length > 0 && !isDesktop && <Pagination page={pipePage} setPage={setPipePage} total={shown.length} />}
+        {visible.length > 0 && !isDesktop && <Pagination page={pipePage} setPage={setPipePage} total={visible.length} />}
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
           {isDesktop
             ? "Full spreadsheet — click any cell to edit, Enter or click away to save. 📎 attach handles screenshots; the follow-up column opens the schedule editor."
@@ -6572,6 +6714,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         outreachChannel: entry?.outreachChannel || "",
         badReasons: entry?.badReasons ? [...entry.badReasons] : [],
         highConfidence: entry?.highConfidence || false,
+        gotReply: entry?.gotReply || false,
         attempt: attemptOf(entry || {}),
         notes: entry?.notes || pre.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
@@ -7046,6 +7189,34 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   Saved for later — won't count in your funnel or need a contact date until you set a real status.
                 </div>
               )}
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <Label>Did they ever reply?</Label>
+              <button
+                onClick={() => setF((p) => ({ ...p, gotReply: !p.gotReply }))}
+                style={{
+                  width: "100%",
+                  boxSizing: "border-box",
+                  textAlign: "left",
+                  background: f.gotReply ? "rgba(96,165,250,0.1)" : "transparent",
+                  border: `1px solid ${f.gotReply ? C.blue : C.panelEdge}`,
+                  color: f.gotReply ? C.blue : C.muted,
+                  borderRadius: 10,
+                  padding: "9px 12px",
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                {f.gotReply ? "✉ Yes — a human replied" : "☐ No reply / silence"}
+              </button>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                {["rejected", "bad fit"].includes(f.status)
+                  ? f.gotReply
+                    ? "Replied then rejected — your resume got through and a person engaged. The leak is later, in the conversation."
+                    : "Rejected with no reply — nothing got through. That points at the resume/ATS/opening-message layer, not your interview skills."
+                  : "Auto-set when a reply-or-later stage gets closed, so a rejection never erases the fact that someone answered."}
+              </div>
             </div>
 
             <div style={{ marginBottom: 12 }}>
@@ -7654,9 +7825,11 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               const setContactStamped = (patch) => {
                 const willBeContacted = "status" in patch ? !!patch.status : !!c.status;
                 const needsDate = willBeContacted && !c.contacted;
-                if (!needsDate) return setContact(patch);
+                /* keep "they answered" alive when the contact gets closed */
+                const withReply = "status" in patch ? { ...patch, ...latchContactReply(c, patch.status) } : patch;
+                if (!needsDate) return setContact(withReply);
                 setContact({
-                  ...patch,
+                  ...withReply,
                   contacted: today(),
                   followUps: fus.length === 0 ? DEFAULT_FOLLOWUPS.map((d) => ({ days: d, done: false })) : fus,
                 });
@@ -7769,6 +7942,26 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       ))}
                     </div>
                   </div>
+
+                  <button
+                    onClick={() => setContact({ gotReply: !c.gotReply })}
+                    title="Records that a human answered, so closing this contact doesn't erase the fact"
+                    style={{
+                      width: "100%",
+                      boxSizing: "border-box",
+                      textAlign: "left",
+                      background: c.gotReply ? "rgba(96,165,250,0.1)" : "transparent",
+                      border: `1px solid ${c.gotReply ? C.blue : C.panelEdge}`,
+                      color: c.gotReply ? C.blue : C.muted,
+                      borderRadius: 8,
+                      padding: "7px 10px",
+                      fontSize: 12,
+                      cursor: "pointer",
+                      marginBottom: 6,
+                    }}
+                  >
+                    {c.gotReply ? "✉ They replied" : "☐ No reply yet"}
+                  </button>
 
                   <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                     <span style={{ fontSize: 11, color: C.muted, flexShrink: 0 }}>Contacted:</span>
