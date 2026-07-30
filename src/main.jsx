@@ -165,6 +165,12 @@ const ACCOUNT_STATUSES = ["", "closed", "bad fit"];
 const accountStatusLabel = (s) => (s === "closed" ? "closed" : s === "bad fit" ? "bad fit" : "active");
 const accountStatusColor = (s) => (s === "closed" ? C.muted : s === "bad fit" ? C.red : C.green);
 const isAccountOpen = (acc) => !acc.status;
+/* live = not archived. An account is UNTOUCHED when nobody inside it has been
+   reached yet — including accounts with no contacts at all, which are the ones
+   most easily forgotten: they look tracked but have no way in yet. */
+const liveContacts = (acc) => (acc?.contacts || []).filter((c) => !c.archivedAt && !c.tombstoned);
+const isAccountUntouched = (acc) => !liveContacts(acc).some((c) => isContactOutreached(c));
+const hasNoWayIn = (acc) => liveContacts(acc).length === 0;
 
 /* ---- syncing account-contact outreach into the real pipeline ----
    Outreaching a contact is real outreach — it should count everywhere an
@@ -5792,6 +5798,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const accFilters = [
       { key: "active", label: `Active (${accounts.filter(isAccountOpen).length})` },
       { key: "highConfidence", label: `⭐ High confidence (${accounts.filter((a) => a.highConfidence).length})` },
+      { key: "notContacted", label: `◻ Not contacted yet (${accounts.flatMap(liveContacts).filter(isContactBlankStatus).length})` },
+      { key: "untouched", label: `🕳 No one reached (${accounts.filter((a) => isAccountOpen(a) && isAccountUntouched(a)).length})` },
       { key: "outreachedContacts", label: `Outreached contacts (${accounts.filter((a) => (a.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)).length})` },
       { key: "dueContacts", label: `⚑ Due contacts (${accounts.filter((a) => (a.contacts || []).some((c) => isContactDue(c) && !c.archivedAt)).length})` },
       { key: "closed", label: `Closed (${accounts.filter((a) => a.status === "closed").length})` },
@@ -5804,6 +5812,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? isAccountOpen(acc)
           : accFilter === "highConfidence"
           ? !!acc.highConfidence
+          : accFilter === "notContacted"
+          ? liveContacts(acc).some(isContactBlankStatus)
+          : accFilter === "untouched"
+          ? isAccountOpen(acc) && isAccountUntouched(acc)
           : accFilter === "outreachedContacts"
           ? (acc.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)
           : accFilter === "dueContacts"
@@ -5837,13 +5849,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
-    const isContactFilterView = accFilter === "outreachedContacts" || accFilter === "dueContacts";
+    const isContactFilterView = accFilter === "outreachedContacts" || accFilter === "dueContacts" || accFilter === "notContacted";
 
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
       ? accounts
           .flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt).map((c) => ({ ...c, _company: acc.company || "Unnamed", _accountId: acc.id })))
-          .filter((c) => (accFilter === "outreachedContacts" ? isContactOutreached(c) : isContactDue(c)))
+          .filter((c) => (accFilter === "outreachedContacts" ? isContactOutreached(c) : accFilter === "notContacted" ? isContactBlankStatus(c) : isContactDue(c)))
           .filter((c) => {
             if (!accSearch.trim()) return true;
             const q = accSearch.trim().toLowerCase();
@@ -5944,7 +5956,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <>
             {flatContacts.length === 0 && (
               <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
-                {accFilter === "outreachedContacts" ? "No contacts outreached yet." : "No contacts due for follow-up."}
+                {accFilter === "outreachedContacts"
+                  ? "No contacts outreached yet."
+                  : accFilter === "notContacted"
+                  ? "Everyone on your accounts has been contacted. Add contacts to an account to build the queue back up."
+                  : "No contacts due for follow-up."}
               </div>
             )}
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -6087,8 +6103,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       </td>
                       <td style={{ ...td, minWidth: 190, cursor: "pointer" }} onClick={() => setModal({ kind: "account", entry: acc })}>
                         <div style={{ fontWeight: 700, fontSize: 13, color: contacts.length ? C.ink : C.muted }}>
-                          {contacts.length} contact{contacts.length === 1 ? "" : "s"}
+                          {contacts.length ? `${contacts.length} contact${contacts.length === 1 ? "" : "s"}` : "🕳 no contacts yet"}
                           {anyDue && <span style={{ color: C.red, marginLeft: 6 }}>⚑ due</span>}
+                          {(() => {
+                            /* the quietly-stuck case: contacts exist but none has been
+                               reached, so the account looks tracked while going nowhere */
+                            const untouched = contacts.filter(isContactBlankStatus).length;
+                            return untouched > 0 ? <span style={{ color: C.amber, marginLeft: 6, fontWeight: 400 }}>◻ {untouched} not contacted</span> : null;
+                          })()}
                         </div>
                         {contacts.map((c) => (
                           <div key={c.id} style={{ fontSize: 11, color: C.muted, marginTop: 3, display: "flex", alignItems: "center", gap: 4 }}>
@@ -6184,7 +6206,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <div style={{ fontWeight: 700, fontSize: 14 }}>{acc.company || "Unnamed"}</div>
                     </div>
                     <div style={{ fontFamily: mono, fontSize: 11, color: anyDue ? C.red : C.muted, flexShrink: 0 }}>
-                      {contacts.length} contact{contacts.length === 1 ? "" : "s"}{anyDue ? " ⚑" : ""}
+                      {contacts.length ? `${contacts.length} contact${contacts.length === 1 ? "" : "s"}` : "🕳 no contacts yet"}{anyDue ? " ⚑" : ""}
+                      {contacts.filter(isContactBlankStatus).length > 0 && (
+                        <span style={{ color: C.amber }}> · ◻ {contacts.filter(isContactBlankStatus).length} not contacted</span>
+                      )}
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 8, marginTop: 2, flexWrap: "wrap" }}>
