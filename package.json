@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "esbuild src/main.jsx --bundle --minify --jsx=automatic --outfile=dist/app.js && esbuild src/pool-mode.jsx --bundle --minify --jsx=automatic --outfile=dist/pool.js && cp index.html dist/index.html && cp pool.html dist/pool.html",
+    "build": "esbuild src/main.jsx --bundle --minify --jsx=automatic --outfile=dist/app.js && cp index.html dist/index.html",
     "dev": "netlify dev"
   },
   "dependencies": {

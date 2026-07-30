@@ -631,6 +631,35 @@ const poolCompanyWorked = (a) => !!(a?.status && a?.contacted);
 const poolCompanyDiscovered = (a) => !!(a?.researchedAt || (a?.hook || "").trim());
 const discoveryDateOf = (a) => a?.researchedAt || "";
 
+/* ---- pool readiness ----
+   Phase belongs to the CALENDAR, not to a company — today is a discovery day
+   or a reachout day and every pool member shares that. What varies per company
+   is how far along it is:
+
+     parked    → in the pool, no hook yet. Discovery hasn't reached it.
+     hooked    → researched, one line written. Sitting in the write queue.
+     contacted → has a real status and a contact date. GRADUATED: it now shows
+                 in the regular pipeline.
+
+   Graduating is not a move. The record never leaves the pool — `fromPool`
+   is permanent, because coverage measures progress against a fixed set. If
+   working a company removed it from the pool, "14 of 45 covered" would become
+   uncomputable as the pool drained. One record, two views. */
+const poolReadiness = (a) => (poolCompanyWorked(a) ? "contacted" : poolCompanyDiscovered(a) ? "hooked" : "parked");
+const POOL_READINESS_META = {
+  parked: { label: "PARKED", color: "muted", hint: "no hook yet" },
+  hooked: { label: "HOOKED", color: "amber", hint: "ready to write" },
+  contacted: { label: "GRADUATED", color: "green", hint: "now in the pipeline" },
+};
+/* The pool is OPEN for additions during discovery weeks and CLOSED during
+   reachout weeks — the cycle already encodes the whole open/closed rhythm, so
+   there's no separate closure date to keep in sync.
+
+   The lock is deliberately scoped to POOL additions only. Regular "track
+   application" stays completely free, because the discipline being enforced is
+   about outbound discovery — a referral, an inbound reply or a posting that
+   landed in your lap is not discovery, and blocking those would be wrong. */
+
 /* ============================================================
    CYCLE PHASES — discovery timeline vs reachout timeline
 
@@ -1774,6 +1803,11 @@ const DEFAULT_STATE = {
   lastCheckinMonth: null,
   lastDigestShownDate: null,
   archivedCsvRows: [],
+  /* names parked while the pool is closed (reachout weeks). Not pipeline
+     entries yet — they cost nothing and count nothing until a discovery week
+     pulls them in. This is the pressure valve: ideas keep arriving whether the
+     pool is open or not, and blocking them outright just makes you fight the app. */
+  poolBench: [],
   lastCsvPromptDate: null,
   lastContentScheduleCheckDate: null,
 };
@@ -1789,6 +1823,7 @@ function migrate(saved) {
   if (!Array.isArray(s.accounts)) s.accounts = [];
   if (!Array.isArray(s.content)) s.content = [];
   if (!Array.isArray(s.archivedCsvRows)) s.archivedCsvRows = [];
+  if (!Array.isArray(s.poolBench)) s.poolBench = [];
   if (!s.contentGoal || typeof s.contentGoal !== "object") s.contentGoal = { perWeek: 3 };
   if (typeof s.contentGoal.bufferTarget !== "number") s.contentGoal.bufferTarget = DEFAULT_CONTENT_BUFFER_TARGET;
   if (typeof s.contentGoal.ideaFloor !== "number") s.contentGoal.ideaFloor = DEFAULT_CONTENT_IDEA_FLOOR;
@@ -1869,6 +1904,7 @@ function mergeStates(localS, remoteS) {
     emotions: unionById(localS.emotions, remoteS.emotions),
     decisions: unionById(localS.decisions, remoteS.decisions),
     accomplishments: unionById(localS.accomplishments, remoteS.accomplishments),
+    poolBench: unionById(localS.poolBench, remoteS.poolBench),
     supportSessions: unionById(localS.supportSessions, remoteS.supportSessions),
     goal: remoteS.goal || localS.goal || null,
     cycleCount: Math.max(localS.cycleCount || 0, remoteS.cycleCount || 0),
@@ -2097,9 +2133,9 @@ function SwipeRow({ onDelete, onTap, showX, children }) {
 }
 
 /* ---------- shared pieces ---------- */
-function Label({ children }) {
+function Label({ children, style }) {
   return (
-    <div style={{ fontFamily: sans, fontSize: 10, letterSpacing: "0.18em", color: C.muted, textTransform: "uppercase", marginBottom: 4 }}>
+    <div style={{ fontFamily: sans, fontSize: 10, letterSpacing: "0.18em", color: C.muted, textTransform: "uppercase", marginBottom: 4, ...style }}>
       {children}
     </div>
   );
@@ -2338,7 +2374,7 @@ export default function FlightDeck() {
   const [patternsNarrativeLoading, setPatternsNarrativeLoading] = useState(false);
   const [toast, setToast] = useState("");
   const [syncStatus, setSyncStatus] = useState("local");
-  const [crmView, setCrmView] = useState("applications"); /* toggle inside the CRM tab: applications <-> accounts */
+  const [crmView, setCrmView] = useState("applications"); /* toggle inside the CRM tab: applications / accounts / pool */
   const [pipeFilter, setPipeFilter] = useState("active");
   const [pipeSearch, setPipeSearch] = useState("");
   const [accSearch, setAccSearch] = useState("");
@@ -3418,6 +3454,219 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     setMode(2);
     setCrmView("applications");
     setModal({ kind: "application", entry: app });
+  };
+
+  /* ---- pool actions ----
+     Adding to the pool is allowed during DISCOVERY weeks and intercepted to the
+     bench during REACHOUT weeks. The cycle encodes the whole open/closed rhythm,
+     so there's no separate closure date to drift out of sync. Scoped to the Pool
+     tab only — "+ Track application" stays free, because a referral or an inbound
+     posting isn't outbound discovery. */
+  const addToPool = (nameRaw, hook) => {
+    const name = (nameRaw || "").trim();
+    if (!name) return;
+    const key = normCompanyName(name);
+    const phase = cyclePhase(state.settings);
+    const already = apps.some((a) => isFromPool(a) && !a.archivedAt && normCompanyName(a.company) === key);
+    if (already) return flash("Already in the pool");
+    if ((state.poolBench || []).some((b) => normCompanyName(b.company) === key)) return flash("Already on the bench");
+    if (phase.phase !== "discovery") {
+      mutate((s) => ({ ...s, poolBench: [{ id: uid(), company: name, addedAt: today() }, ...(s.poolBench || [])] }), "🪑 Parked on the bench");
+      return;
+    }
+    mutate((s) => ({
+      ...s,
+      applications: [
+        {
+          id: uid(),
+          company: name,
+          role: "",
+          status: "", /* saved-for-later: a pool member costs nothing until written to */
+          contacted: "",
+          hook: (hook || "").trim(),
+          researchedAt: (hook || "").trim() ? today() : "",
+          fromPool: true,
+          poolName: `Cycle ${phase.cycleIndex + 1}`,
+          followUps: [],
+          milestonesLogged: [],
+        },
+        ...s.applications,
+      ],
+    }), "🎯 Added to pool");
+  };
+  /* pulls bench names into the pool — only meaningful once a discovery week
+     has come round, which is exactly when the cycle reopens */
+  const pullFromBench = (ids) => {
+    const phase = cyclePhase(state.settings);
+    if (phase.phase !== "discovery") return flash("Pool opens again in the next discovery week");
+    mutate((s) => {
+      const take = (s.poolBench || []).filter((b) => ids.includes(b.id));
+      if (!take.length) return s;
+      const existing = new Set(s.applications.filter((a) => isFromPool(a)).map((a) => normCompanyName(a.company)));
+      const newApps = take
+        .filter((b) => !existing.has(normCompanyName(b.company)))
+        .map((b) => ({
+          id: uid(),
+          company: b.company,
+          role: "",
+          status: "",
+          contacted: "",
+          hook: "",
+          researchedAt: "",
+          fromPool: true,
+          poolName: `Cycle ${phase.cycleIndex + 1}`,
+          followUps: [],
+          milestonesLogged: [],
+        }));
+      return { ...s, poolBench: (s.poolBench || []).filter((b) => !ids.includes(b.id)), applications: [...newApps, ...s.applications] };
+    }, "🎯 Pulled into the pool");
+  };
+  const removeFromBench = (id) => mutate((s) => ({ ...s, poolBench: (s.poolBench || []).filter((b) => b.id !== id) }), "Removed from bench");
+  /* writing the hook IS the discovery event — stamping researchedAt is what
+     makes it count toward discovery-week progress */
+  const setPoolHook = (id, hook) =>
+    mutate((s) => ({
+      ...s,
+      applications: s.applications.map((a) =>
+        a.id === id ? { ...a, hook, researchedAt: hook.trim() ? a.researchedAt || today() : "" } : a
+      ),
+    }));
+
+  /* ============================================================
+     POOL VIEW — the discovery half of the CRM.
+
+     Only appears when pool pacing is on. Shows the closed set of companies
+     you're working through, split by readiness rather than by phase (phase is
+     a property of today, shown once in the header). Graduated companies stay
+     counted here but are shown as a link into the pipeline, not as rows —
+     they're being worked over there now.
+     ============================================================ */
+  const renderPool = () => {
+    const pg = computePoolGoal(state, apps);
+    const phase = pg.phase;
+    const open = phase === "discovery";
+    const poolApps = apps.filter((a) => isFromPool(a) && !a.archivedAt);
+    const byReadiness = { parked: [], hooked: [], contacted: [] };
+    poolApps.forEach((a) => byReadiness[poolReadiness(a)].push(a));
+    const bench = state.poolBench || [];
+
+    const readinessBadge = (r) => {
+      const meta = POOL_READINESS_META[r];
+      const col = meta.color === "green" ? C.green : meta.color === "amber" ? C.amber : C.muted;
+      return (
+        <span style={{ fontFamily: mono, fontSize: 9, letterSpacing: 0.4, color: col, border: `1px solid ${col}`, borderRadius: 4, padding: "1px 5px", flexShrink: 0 }}>{meta.label}</span>
+      );
+    };
+
+    return (
+      <>
+        <div style={{ background: open ? "rgba(96,165,250,0.08)" : C.panel, border: `1px solid ${open ? C.blue : C.panelEdge}`, borderRadius: 14, padding: "13px 16px", marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <span style={{ fontSize: 14, fontWeight: 800, color: open ? C.blue : C.ink }}>
+              {open ? "🔍 Discovery week — pool is open" : "🔒 Reachout week — pool is closed"}
+            </span>
+            <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, border: `1px solid ${C.panelEdge}`, borderRadius: 20, padding: "3px 9px" }}>
+              WK {pg.weekInCycle + 1}/{pg.cycleWeeks}
+            </span>
+          </div>
+          <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55 }}>
+            {open
+              ? `Add and research companies now — ${pg.discoveredThisCycle}/${pg.discoveryTargetCycle} hooked this cycle. Reachout starts ${pg.reachoutStart}.`
+              : `Finding companies isn't this week's job. New names go to the bench and get pulled in when discovery reopens ${addDays(pg.cycleEnd, 1)}.`}
+          </div>
+          <div style={{ height: 8, background: C.bg, borderRadius: 4, marginTop: 10, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
+            <div style={{ height: "100%", width: `${pg.pct}%`, background: pg.pct === 100 ? C.green : C.blue, borderRadius: 4 }} />
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.muted, marginTop: 6 }}>
+            <span>
+              Coverage {pg.worked}/{pg.total} · {byReadiness.hooked.length} ready to write · {byReadiness.parked.length} need a hook
+            </span>
+            <span style={{ fontFamily: mono }}>{pg.remaining === 0 ? "covered" : `${pg.remaining} left`}</span>
+          </div>
+        </div>
+
+        <PoolAdd open={open} onAdd={addToPool} />
+
+        {byReadiness.parked.length > 0 && (
+          <>
+            <Label>Need a hook ({byReadiness.parked.length})</Label>
+            {byReadiness.parked.map((a) => (
+              <PoolRow key={a.id} app={a} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={() => setModal({ kind: "application", entry: a })} />
+            ))}
+          </>
+        )}
+
+        {byReadiness.hooked.length > 0 && (
+          <>
+            <Label style={{ marginTop: 14 }}>Ready to write ({byReadiness.hooked.length})</Label>
+            {byReadiness.hooked.map((a) => (
+              <PoolRow key={a.id} app={a} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={() => setModal({ kind: "application", entry: a })} />
+            ))}
+          </>
+        )}
+
+        {byReadiness.contacted.length > 0 && (
+          <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px", marginTop: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: C.green }}>✓ {byReadiness.contacted.length} graduated</div>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 2 }}>
+                  Contacted, so they're being worked in the pipeline now. Still counted here — coverage measures a fixed set.
+                </div>
+              </div>
+              <Btn
+                ghost
+                onClick={() => {
+                  setCrmView("applications");
+                  setPipeFilter("fromPool");
+                  setPipePage(0);
+                }}
+                style={{ padding: "7px 11px", fontSize: 12, flexShrink: 0 }}
+              >
+                View →
+              </Btn>
+            </div>
+          </div>
+        )}
+
+        {poolApps.length === 0 && (
+          <div style={{ color: C.muted, fontSize: 13, padding: "18px 4px", textAlign: "center", lineHeight: 1.6 }}>
+            The pool is empty. {open ? "Add the companies you'll work through this cycle — 40–50 in one or two sittings, then it closes." : "Discovery week has passed, so new names go to the bench."}
+          </div>
+        )}
+
+        <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px solid ${C.panelEdge}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <Label>🪑 Bench ({bench.length})</Label>
+            {bench.length > 0 && open && (
+              <Btn color={C.amber} onClick={() => pullFromBench(bench.slice(0, 5).map((b) => b.id))} style={{ padding: "6px 11px", fontSize: 12 }}>
+                Pull {Math.min(5, bench.length)} in
+              </Btn>
+            )}
+          </div>
+          {bench.length === 0 ? (
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55 }}>
+              Empty. When a company catches your eye during a reachout week, it lands here instead of breaking the pool — captured without acting on it.
+            </div>
+          ) : (
+            bench.map((b, i) => (
+              <div key={b.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.panel, border: `1px solid ${i < 5 && open ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 6 }}>
+                <div>
+                  <div style={{ fontSize: 14 }}>{b.company}</div>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>
+                    parked {b.addedAt}
+                    {i < 5 && open ? " · next in" : ""}
+                  </div>
+                </div>
+                <Btn ghost onClick={() => removeFromBench(b.id)} style={{ padding: "5px 9px", fontSize: 12 }}>
+                  ×
+                </Btn>
+              </div>
+            ))
+          )}
+        </div>
+      </>
+    );
   };
 
   /* bulk-converts selected standalone applications into accounts. Applications
@@ -4563,6 +4812,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             {[
               ["applications", `📋 Applications (${realApplicationsCount})`],
               ["accounts", `🏢 Accounts (${(state.accounts || []).length})`],
+              /* the Pool tab exists only while pool pacing is on — with the mode
+                 off there is no closed set to work through, so an empty tab
+                 would just be noise */
+              ...(state.settings?.goalMode === "pool" ? [["pool", `🎯 Pool (${apps.filter((a) => isFromPool(a) && !a.archivedAt).length})`]] : []),
             ].map(([k, l]) => (
               <button
                 key={k}
@@ -4637,7 +4890,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         </div>
 
-        {crmView === "accounts" ? (
+        {crmView === "pool" && state.settings?.goalMode === "pool" ? (
+          renderPool()
+        ) : crmView === "accounts" ? (
           renderAccounts()
         ) : (
           <>
@@ -9057,6 +9312,67 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
           </Btn>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* the pool's own add form. Closed weeks don't hide it — they relabel it, so
+   parking a name is one action rather than a dead end you have to work around */
+function PoolAdd({ open, onAdd }) {
+  const [company, setCompany] = useState("");
+  const [hook, setHook] = useState("");
+  const submit = () => {
+    if (!company.trim()) return;
+    onAdd(company, hook);
+    setCompany("");
+    setHook("");
+  };
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
+      <Label>{open ? "Add to pool" : "Park on the bench"}</Label>
+      <input value={company} onChange={(e) => setCompany(e.target.value)} placeholder="Company name" style={{ ...inputStyle, marginBottom: 6 }} onKeyDown={(e) => e.key === "Enter" && submit()} />
+      {open && (
+        <>
+          <input value={hook} onChange={(e) => setHook(e.target.value.slice(0, 120))} placeholder="Hook — one line, optional for now" style={inputStyle} onKeyDown={(e) => e.key === "Enter" && submit()} />
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>One recent post, one launch, one hire. Five minutes, not a dossier.</div>
+        </>
+      )}
+      <Btn onClick={submit} disabled={!company.trim()} style={{ width: "100%", marginTop: 8 }}>
+        {open ? "🎯 Add to pool" : "🪑 Park on bench"}
+      </Btn>
+    </div>
+  );
+}
+
+/* one pool member. The hook is editable inline because writing it IS the
+   discovery event — making that a modal trip would be friction on the exact
+   action the whole cycle is built around. */
+function PoolRow({ app, badge, onHook, onOpen }) {
+  const [draft, setDraft] = useState(app.hook || "");
+  const dirty = draft !== (app.hook || "");
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", marginBottom: 6 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6 }}>
+        <span onClick={onOpen} style={{ fontSize: 14, fontWeight: 700, cursor: "pointer", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {app.company || "Unnamed"}
+        </span>
+        {badge}
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value.slice(0, 120))}
+          placeholder="Hook — one line"
+          style={{ ...inputStyle, fontSize: 13, padding: "7px 10px" }}
+          onKeyDown={(e) => e.key === "Enter" && dirty && onHook(app.id, draft)}
+        />
+        {dirty && (
+          <Btn onClick={() => onHook(app.id, draft)} style={{ padding: "7px 11px", fontSize: 12, flexShrink: 0 }}>
+            Save
+          </Btn>
+        )}
+      </div>
+      {app.researchedAt && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>researched {app.researchedAt}</div>}
     </div>
   );
 }
