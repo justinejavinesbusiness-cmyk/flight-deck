@@ -491,6 +491,11 @@ function PoolMode() {
         notes: m.hook ? `Pool hook: ${m.hook}` : "",
         fromPool: true,
         poolName: pool.name,
+        /* the discovery half of the marriage: Flight Deck counts a company as
+           DISCOVERED from these two fields, so research done here shows up in
+           its discovery-week progress instead of looking like a blank week */
+        hook: m.hook || "",
+        researchedAt: m.hookedAt || (m.hook ? today() : ""),
         followUps: [],
         milestonesLogged: [],
       }));

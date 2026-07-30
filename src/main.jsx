@@ -620,27 +620,108 @@ const normCompanyName = (s) => (s || "").trim().toLowerCase();
    ============================================================ */
 const isFromPool = (a) => !!a?.fromPool;
 const DEFAULT_POOL_WEEKLY_WRITE = 8;
-/* a pool company counts as covered on the same terms the rest of the app uses
-   for "this was real activity": a genuine status plus a contact date */
+const DEFAULT_CYCLE_WEEKS = 6;
+const DEFAULT_DISCOVERY_WEEKS = 2;
+/* a pool company counts as REACHED on the same terms the rest of the app uses
+   for real activity: a genuine status plus a contact date */
 const poolCompanyWorked = (a) => !!(a?.status && a?.contacted);
+/* ...and DISCOVERED once research produced something usable. Either an explicit
+   research date or a hook line counts — Pool Mode pushes both, and a hook typed
+   directly in Flight Deck should count the same. */
+const poolCompanyDiscovered = (a) => !!(a?.researchedAt || (a?.hook || "").trim());
+const discoveryDateOf = (a) => a?.researchedAt || "";
 
-/* Coverage + pacing over the pool-tagged companies. Distinct by company, so
-   several entries for one company (multiple roles or contacts) count once —
-   coverage is about companies reached, not rows created. */
+/* ============================================================
+   CYCLE PHASES — discovery timeline vs reachout timeline
+
+   A cycle is N weeks (default 6) anchored to the pool's build/refresh date.
+   The first D weeks (default 2) are DISCOVERY: research companies, find
+   contacts, write one hook each. The rest is REACHOUT: write to what you
+   already loaded. Refreshing the pool restarts the cycle, so a new discovery
+   window arrives on its own.
+
+   Why the discovery target is DERIVED, not chosen: discovery week exists to
+   load the queue for the whole cycle. So the honest number is
+
+       weekly write budget × reachout weeks
+
+   At 8/week over 4 reachout weeks that's 32 companies to research — roughly
+   2.7 hours at five minutes each. Showing that arithmetic is half the point
+   of this mode: it makes the trade visible instead of theoretical, so the
+   numbers get set from evidence rather than optimism.
+   ============================================================ */
+function cyclePhase(settings) {
+  const cycleWeeks = Math.max(2, +settings?.cycleWeeks || DEFAULT_CYCLE_WEEKS);
+  const discoveryWeeks = Math.max(1, Math.min(cycleWeeks - 1, +settings?.discoveryWeeks || DEFAULT_DISCOVERY_WEEKS));
+  const reachoutWeeks = cycleWeeks - discoveryWeeks;
+  const anchor = settings?.cycleStart || iso(mondayOfToday());
+  /* align the anchor to a Monday so weeks-in-cycle never straddles a boundary */
+  const start0 = iso(mondayOf(new Date(anchor + "T00:00:00")));
+  const t = today();
+  const daysIn = Math.max(0, Math.floor((new Date(t + "T00:00:00") - new Date(start0 + "T00:00:00")) / 86400000));
+  const cycleIndex = Math.floor(daysIn / (cycleWeeks * 7));
+  const cycleStart = addDays(start0, cycleIndex * cycleWeeks * 7);
+  const weekInCycle = Math.floor((Math.floor((new Date(t + "T00:00:00") - new Date(cycleStart + "T00:00:00")) / 86400000)) / 7);
+  const phase = weekInCycle < discoveryWeeks ? "discovery" : "reachout";
+  return {
+    cycleWeeks,
+    discoveryWeeks,
+    reachoutWeeks,
+    cycleIndex,
+    cycleStart,
+    cycleEnd: addDays(cycleStart, cycleWeeks * 7 - 1),
+    discoveryEnd: addDays(cycleStart, discoveryWeeks * 7 - 1),
+    reachoutStart: addDays(cycleStart, discoveryWeeks * 7),
+    weekInCycle,
+    phase,
+  };
+}
+
+/* ---- switch-off rules ----
+   1. Past weeks keep the mode they were LIVED under. Switching modes appends a
+      segment rather than rewriting history, so a weekly review never claims you
+      missed a quota that didn't exist at the time.
+   2. Carry zeroes on switch. Debt in one currency ("12 applications behind")
+      must not silently convert into the other ("12 hooks behind"); they aren't
+      the same work. The reset date bounds every rollover walk.
+   3. Funnel metrics stay continuous — replies, screens, interviews and offers
+      are mode-agnostic and are never segmented. */
+const modeSegments = (settings) => (Array.isArray(settings?.modeHistory) ? settings.modeHistory : []);
+const modeOnDate = (settings, date) => {
+  const segs = modeSegments(settings)
+    .filter((s) => s?.startedAt && s.startedAt <= date)
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+  return segs.length ? segs[segs.length - 1].mode : "standard";
+};
+/* rollover walks must not reach back past the most recent mode switch */
+const carryFloor = (settings) => {
+  const segs = modeSegments(settings).sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+  return segs.length ? segs[segs.length - 1].startedAt : "";
+};
+
 function computePoolGoal(state, apps) {
-  /* NOTE the ?? rather than ||: a deliberate 0 means "no weekly pacing, just
-     show me coverage", and `0 || DEFAULT` would silently override that. */
+  /* NOTE the Number.isFinite check rather than ||: a deliberate 0 means "no
+     weekly pacing, just show me coverage", and `0 || DEFAULT` would override it. */
   const raw = state?.settings?.poolWeeklyWrite;
   const weeklyTarget = Math.max(0, Number.isFinite(+raw) ? +raw : DEFAULT_POOL_WEEKLY_WRITE);
+  const cyc = cyclePhase(state?.settings);
+  const floor = carryFloor(state?.settings);
+
+  /* distinct by company — coverage is about companies reached, not rows made */
   const byCompany = new Map();
   (apps || []).forEach((a) => {
     if (!isFromPool(a) || a.archivedAt || a.tombstoned) return;
     const key = normCompanyName(a.company);
     if (!key) return;
-    const cur = byCompany.get(key) || { company: a.company, worked: false, poolName: a.poolName || "", firstContact: "" };
+    const cur = byCompany.get(key) || { company: a.company, worked: false, discovered: false, poolName: a.poolName || "", firstContact: "", discoveredAt: "" };
     if (poolCompanyWorked(a)) {
       cur.worked = true;
       if (a.contacted && (!cur.firstContact || a.contacted < cur.firstContact)) cur.firstContact = a.contacted;
+    }
+    if (poolCompanyDiscovered(a)) {
+      cur.discovered = true;
+      const d = discoveryDateOf(a);
+      if (d && (!cur.discoveredAt || d < cur.discoveredAt)) cur.discoveredAt = d;
     }
     byCompany.set(key, cur);
   });
@@ -648,46 +729,77 @@ function computePoolGoal(state, apps) {
   const total = members.length;
   const worked = members.filter((m) => m.worked).length;
   const remaining = total - worked;
-  const mon = iso(mondayOfToday());
-  const writtenThisWeek = members.filter((m) => m.worked && m.firstContact && m.firstContact >= mon).length;
+  const discovered = members.filter((m) => m.discovered).length;
+  /* the queue reachout actually draws from: researched but not yet written to */
+  const readyToWrite = members.filter((m) => m.discovered && !m.worked).length;
 
-  /* today's number: the weekly budget spread across Mon–Sat (Sunday rests),
-     then the SAME daily carry the rest of the app uses — short days push onto
-     tomorrow, strong days relieve it. No week-to-week rollover here: a closed
-     pool already bounds the work, so stacking debt across weeks would just
-     re-create the infinite quota this mode exists to remove. */
-  const perDay = weeklyTarget > 0 ? Math.max(1, Math.ceil(weeklyTarget / 6)) : 0;
+  /* ---- discovery track ---- */
+  const discoveryTargetCycle = weeklyTarget * cyc.reachoutWeeks;
+  const discoveredThisCycle = members.filter((m) => m.discoveredAt && m.discoveredAt >= cyc.cycleStart).length;
+  const discoveryPerWeek = cyc.discoveryWeeks > 0 ? Math.ceil(discoveryTargetCycle / cyc.discoveryWeeks) : 0;
+  const discoveryShortfall = Math.max(0, discoveryTargetCycle - discoveredThisCycle);
+
+  /* ---- this week's target, whichever track is live ---- */
+  const mon = iso(mondayOfToday());
   const t = today();
+  const inDiscovery = cyc.phase === "discovery";
+  /* Rule A: never ask for outreach that isn't loaded. Cap at the real queue and
+     report the gap instead of sending you back to discovery mid-cycle. */
+  const weekTargetRaw = inDiscovery ? discoveryPerWeek : weeklyTarget;
+  const weekTarget = inDiscovery ? weekTargetRaw : Math.min(weekTargetRaw, readyToWrite + members.filter((m) => m.worked && m.firstContact >= mon).length);
+  const outOfHooks = !inDiscovery && weekTargetRaw > weekTarget;
+
+  const eventOn = (d) => (inDiscovery ? members.filter((m) => m.discoveredAt === d).length : members.filter((m) => m.worked && m.firstContact === d).length);
+  const doneThisWeek = inDiscovery
+    ? members.filter((m) => m.discoveredAt && m.discoveredAt >= mon).length
+    : members.filter((m) => m.worked && m.firstContact && m.firstContact >= mon).length;
+
+  /* daily walk inside the week only — Sunday rests, and the walk never reaches
+     back past a mode switch (switch-off rule 2) */
+  const perDay = weekTarget > 0 ? Math.max(1, Math.ceil(weekTarget / 6)) : 0;
   let dailyCarry = 0;
   let todaysTarget = 0;
   let carryIntoToday = 0;
   for (let i = 0; i < 7; i++) {
     const d = addDays(mon, i);
     if (d > t) break;
+    if (floor && d < floor) continue; /* pre-switch days contribute nothing */
     const dow = new Date(d + "T00:00:00").getDay();
     const base = dow === 0 ? 0 : perDay;
     const effective = Math.max(0, base + dailyCarry);
     if (d === t) {
-      todaysTarget = Math.min(effective, Math.max(0, remaining + members.filter((m) => m.worked && m.firstContact === t).length));
+      todaysTarget = effective;
       carryIntoToday = dailyCarry;
     }
-    const done = members.filter((m) => m.worked && m.firstContact === d).length;
-    dailyCarry = effective - done;
+    dailyCarry = effective - eventOn(d);
   }
-  const doneToday = members.filter((m) => m.worked && m.firstContact === t).length;
+  const doneToday = eventOn(t);
+
   return {
+    ...cyc,
     total,
     worked,
     remaining,
+    discovered,
+    readyToWrite,
     pct: total ? Math.round((worked / total) * 100) : 0,
     weeklyTarget,
-    writtenThisWeek,
+    discoveryTargetCycle,
+    discoveredThisCycle,
+    discoveryPerWeek,
+    discoveryShortfall,
+    inDiscovery,
+    outOfHooks,
+    weekTarget,
+    doneThisWeek,
     perDay,
     todaysTarget,
     carryIntoToday,
     doneToday,
     todayMet: doneToday >= todaysTarget,
     weeksToCover: weeklyTarget > 0 && remaining > 0 ? Math.ceil(remaining / weeklyTarget) : 0,
+    /* the arithmetic that makes the trade visible */
+    discoveryHoursEstimate: +((discoveryTargetCycle * 5) / 60).toFixed(1),
     poolName: members.find((m) => m.poolName)?.poolName || "",
     members,
   };
@@ -1701,6 +1813,12 @@ function migrate(saved) {
      over Pool Mode's closed company set. */
   if (s.settings.goalMode !== "pool") s.settings.goalMode = s.settings.goalMode === "pool" ? "pool" : s.settings.goalMode || "standard";
   if (typeof s.settings.poolWeeklyWrite !== "number") s.settings.poolWeeklyWrite = DEFAULT_POOL_WEEKLY_WRITE;
+  if (typeof s.settings.cycleWeeks !== "number") s.settings.cycleWeeks = DEFAULT_CYCLE_WEEKS;
+  if (typeof s.settings.discoveryWeeks !== "number") s.settings.discoveryWeeks = DEFAULT_DISCOVERY_WEEKS;
+  if (!s.settings.cycleStart) s.settings.cycleStart = iso(mondayOfToday());
+  /* switch-off rule 1: mode history is append-only so past weeks keep the mode
+     they were lived under. Seed it with whatever mode is current. */
+  if (!Array.isArray(s.settings.modeHistory)) s.settings.modeHistory = [{ startedAt: s.settings.cycleStart, mode: s.settings.goalMode || "standard" }];
   s.accounts = s.accounts.map((a) => ({ ...a, contacts: Array.isArray(a.contacts) ? a.contacts : [] }));
   /* one-time cleanup: a past bug dropped linkedApplicationId every time the
      account form reopened, causing outreach on a contact to spawn a fresh
@@ -3697,6 +3815,20 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             followUpDailyCap: Math.max(0, Math.min(99, +data.followUpDailyCap || 0)),
             goalMode: data.goalMode === "pool" ? "pool" : "standard",
             poolWeeklyWrite: Math.max(0, Math.min(99, +data.poolWeeklyWrite || 0)),
+            cycleWeeks: Math.max(2, Math.min(26, +data.cycleWeeks || DEFAULT_CYCLE_WEEKS)),
+            discoveryWeeks: Math.max(1, Math.min(Math.max(2, Math.min(26, +data.cycleWeeks || DEFAULT_CYCLE_WEEKS)) - 1, +data.discoveryWeeks || DEFAULT_DISCOVERY_WEEKS)),
+            cycleStart: data.cycleStart || s.settings?.cycleStart || iso(mondayOfToday()),
+            /* switch-off rules 1 + 2: on a real mode change, append a segment
+               dated TODAY. Past weeks keep their original mode, and because
+               every rollover walk stops at the newest segment start, the old
+               mode's carry can never leak into the new one's currency. */
+            modeHistory: (() => {
+              const nextMode = data.goalMode === "pool" ? "pool" : "standard";
+              const prev = Array.isArray(s.settings?.modeHistory) ? s.settings.modeHistory : [];
+              const currentMode = prev.length ? prev[prev.length - 1].mode : "standard";
+              if (nextMode === currentMode) return prev;
+              return [...prev, { startedAt: today(), mode: nextMode }];
+            })(),
           },
           contentGoal: {
             ...s.contentGoal,
@@ -3805,6 +3937,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const g = computeGoal(state.goal, apps);
     const poolMode = state.settings?.goalMode === "pool";
     const pg = poolMode ? computePoolGoal(state, apps) : null;
+    /* shown when pool pacing is OFF: keeps the timeline visible as context so
+       switching back doesn't mean rebuilding your configuration */
+    const advisoryPhase = !poolMode && state.settings?.cycleStart ? cyclePhase(state.settings) : null;
     const isRestDay = new Date(today() + "T00:00:00").getDay() === 0;
     return (
     <>
@@ -3820,53 +3955,58 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <div style={{ fontSize: 11, color: C.muted, marginTop: 12 }}>No quota today — Sundays are for rest, not the funnel.</div>
         </div>
       ) : poolMode && pg && pg.total > 0 ? (
-        /* ---- POOL PACING ----
-           Replaces the open-ended daily quota with coverage of a closed set.
-           The headline is "X of Y companies", because that is finite and can
-           actually be finished; the daily number underneath is just the
-           weekly write budget spread across Mon–Sat. */
+        /* ---- POOL PACING · phase-aware ----
+           Discovery weeks ask for research; reachout weeks ask for messages.
+           Follow-ups are deliberately untouched by either — they live in their
+           own queue and keep running straight through discovery week. */
         <div
           onClick={() => setMode(1)}
-          style={{ background: C.panel, border: `1px solid ${pg.pct === 100 ? C.green : pg.todayMet ? C.green : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14, cursor: "pointer" }}
+          style={{ background: C.panel, border: `1px solid ${pg.todayMet ? C.green : pg.inDiscovery ? C.blue : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14, cursor: "pointer" }}
         >
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <Label>🎯 Pool coverage{pg.poolName ? ` — ${pg.poolName}` : ""}</Label>
-            <span style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.green, border: `1px solid ${C.panelEdge}`, borderRadius: 20, padding: "3px 9px" }}>POOL PACE</span>
+            <Label>{pg.inDiscovery ? "🔍 Discovery week — research, don't send" : "✉️ Reachout week — write to your queue"}</Label>
+            <span style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: pg.inDiscovery ? C.blue : C.green, border: `1px solid ${C.panelEdge}`, borderRadius: 20, padding: "3px 9px" }}>
+              WK {pg.weekInCycle + 1}/{pg.cycleWeeks}
+            </span>
           </div>
           <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 6 }}>
-            <div style={{ fontFamily: mono, fontSize: 40, fontWeight: 800, color: pg.pct === 100 ? C.green : C.ink, lineHeight: 1.1 }}>
-              {pg.worked} / {pg.total}
+            <div style={{ fontFamily: mono, fontSize: 40, fontWeight: 800, color: pg.todayMet ? C.green : pg.inDiscovery ? C.blue : C.amber, lineHeight: 1.1 }}>
+              {pg.doneToday} / {pg.todaysTarget}
             </div>
             <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.4 }}>
-              companies worked
+              {pg.inDiscovery ? "companies to research today" : "companies to write today"}
               <br />
-              {pg.remaining === 0 ? "✓ pool covered — time to refresh" : `${pg.remaining} left · ~${pg.weeksToCover} wk${pg.weeksToCover === 1 ? "" : "s"} at ${pg.weeklyTarget}/wk`}
-            </div>
-          </div>
-          <div style={{ height: 8, background: C.bg, borderRadius: 4, marginTop: 10, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
-            <div style={{ height: "100%", width: `${pg.pct}%`, background: pg.pct === 100 ? C.green : C.blue, borderRadius: 4, transition: "width 0.3s ease" }} />
-          </div>
-          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.panelEdge}` }}>
-            <div>
-              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted }}>TODAY</div>
-              <div style={{ fontFamily: mono, fontSize: 18, fontWeight: 800, color: pg.todayMet ? C.green : C.amber }}>
-                {pg.doneToday} / {pg.todaysTarget}
-              </div>
-            </div>
-            <div style={{ textAlign: "right" }}>
-              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted }}>THIS WEEK</div>
-              <div style={{ fontFamily: mono, fontSize: 18, fontWeight: 800, color: pg.writtenThisWeek >= pg.weeklyTarget ? C.green : C.ink }}>
-                {pg.writtenThisWeek} / {pg.weeklyTarget}
-              </div>
+              {pg.doneThisWeek}/{pg.weekTarget} this week
             </div>
           </div>
           {pg.carryIntoToday !== 0 && (
-            <div style={{ fontSize: 11, color: pg.carryIntoToday > 0 ? C.red : C.green, marginTop: 8 }}>
-              {pg.carryIntoToday > 0 ? `⬆ +${pg.carryIntoToday} carried from yesterday` : `⬇ ${Math.abs(pg.carryIntoToday)} banked — lighter today`}
+            <div style={{ fontSize: 11, color: pg.carryIntoToday > 0 ? C.red : C.green, marginTop: 6 }}>
+              {pg.carryIntoToday > 0 ? `⬆ +${pg.carryIntoToday} carried from earlier this week` : `⬇ ${Math.abs(pg.carryIntoToday)} banked — lighter today`}
             </div>
           )}
-          <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.5 }}>
-            No week-to-week debt in this mode — a closed pool already bounds the work.
+
+          {pg.inDiscovery ? (
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.55 }}>
+              Loading the queue for {pg.reachoutWeeks} reachout weeks: {pg.discoveredThisCycle}/{pg.discoveryTargetCycle} researched this cycle (~{pg.discoveryHoursEstimate}h at 5 min
+              each). No outreach quota this week — but follow-ups still run, and anything you do send still logs.
+            </div>
+          ) : (
+            <div style={{ fontSize: 11, color: pg.outOfHooks ? C.amber : C.muted, marginTop: 8, lineHeight: 1.55 }}>
+              {pg.outOfHooks
+                ? `⚠ Out of hooks — only ${pg.readyToWrite} researched and unwritten, so today's ask is capped. Discovery under-delivered by ${pg.discoveryShortfall} this cycle; size the next one from that.`
+                : `${pg.readyToWrite} researched and ready to write. Next discovery week starts ${new Date(addDays(pg.cycleEnd, 1) + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" })}.`}
+            </div>
+          )}
+
+          <div style={{ height: 8, background: C.bg, borderRadius: 4, marginTop: 10, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
+            <div style={{ height: "100%", width: `${pg.pct}%`, background: pg.pct === 100 ? C.green : C.blue, borderRadius: 4, transition: "width 0.3s ease" }} />
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.muted, marginTop: 6 }}>
+            <span>
+              Pool coverage {pg.worked}/{pg.total}
+              {pg.poolName ? ` · ${pg.poolName}` : ""}
+            </span>
+            <span style={{ fontFamily: mono }}>{pg.remaining === 0 ? "covered" : `${pg.remaining} left`}</span>
           </div>
         </div>
       ) : state.goal && g ? (
@@ -3874,6 +4014,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           onClick={() => setMode(1)}
           style={{ background: C.panel, border: `1px solid ${g.todayMet ? C.green : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14, cursor: "pointer" }}
         >
+          {/* switch-off rule: the timelines survive the toggle but stop BINDING.
+              With pool pacing off the quota is your normal single number — the
+              phase is shown as context only, never as a second target. */}
+          {advisoryPhase && (
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 8, paddingBottom: 8, borderBottom: `1px solid ${C.panelEdge}`, lineHeight: 1.5 }}>
+              {advisoryPhase.phase === "discovery" ? "🔍" : "✉️"} Cycle week {advisoryPhase.weekInCycle + 1}/{advisoryPhase.cycleWeeks} —{" "}
+              {advisoryPhase.phase === "discovery" ? "a discovery stretch" : "a reachout stretch"} by your timeline. Not binding while pool pacing is off.
+            </div>
+          )}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <Label>🎯 Today's goal — applications + outreach</Label>
             <span style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: C.amber, border: `1px solid ${C.panelEdge}`, borderRadius: 20, padding: "3px 9px" }}>
@@ -6716,7 +6865,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolWeeklyWrite: state.settings?.poolWeeklyWrite, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -6898,6 +7047,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         followUpDailyCap: String(modal.followUpDailyCap ?? DEFAULT_FOLLOWUP_DAILY_CAP),
         goalMode: modal.goalMode === "pool" ? "pool" : "standard",
         poolWeeklyWrite: String(modal.poolWeeklyWrite ?? DEFAULT_POOL_WEEKLY_WRITE),
+        cycleWeeks: String(modal.cycleWeeks ?? DEFAULT_CYCLE_WEEKS),
+        discoveryWeeks: String(modal.discoveryWeeks ?? DEFAULT_DISCOVERY_WEEKS),
+        cycleStart: modal.cycleStart || "",
         contentBufferTarget: String(modal.contentBufferTarget ?? DEFAULT_CONTENT_BUFFER_TARGET),
         contentIdeaFloor: String(modal.contentIdeaFloor ?? DEFAULT_CONTENT_IDEA_FLOOR),
         timezoneOffset: entry?.timezoneOffset ?? 8,
@@ -7737,6 +7889,47 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   Pool pacing needs companies tagged 🎯 POOL. If none have been pushed over from Pool Mode yet, the standard goal card keeps showing.
                 </div>
               )}
+
+              <div style={{ marginTop: 16, paddingTop: 14, borderTop: `1px solid ${C.panelEdge}` }}>
+                <Label>Discovery + reachout timelines</Label>
+                <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+                  Each cycle opens with discovery weeks — research companies, find contacts, write one hook each — then spends the rest on reachout. Kept here even when pool
+                  pacing is off, where they show as context rather than binding the quota.
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Cycle length (weeks)</div>
+                    <input type="number" inputMode="numeric" value={f.cycleWeeks} onChange={(e) => set("cycleWeeks")(e.target.value)} style={{ ...inputStyle, width: "100%", fontFamily: mono, padding: "8px 10px", boxSizing: "border-box" }} />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Discovery weeks</div>
+                    <input type="number" inputMode="numeric" value={f.discoveryWeeks} onChange={(e) => set("discoveryWeeks")(e.target.value)} style={{ ...inputStyle, width: "100%", fontFamily: mono, padding: "8px 10px", boxSizing: "border-box" }} />
+                  </div>
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Cycle start (aligns to that week's Monday)</div>
+                <input type="date" value={f.cycleStart} onChange={(e) => set("cycleStart")(e.target.value)} style={{ ...inputStyle, fontFamily: mono, padding: "8px 10px", colorScheme: "dark", marginBottom: 8 }} />
+                {(() => {
+                  /* show the derived arithmetic live — this is the whole point:
+                     the discovery number isn't chosen, it's a consequence */
+                  const cw = Math.max(2, Math.min(26, +f.cycleWeeks || DEFAULT_CYCLE_WEEKS));
+                  const dw = Math.max(1, Math.min(cw - 1, +f.discoveryWeeks || DEFAULT_DISCOVERY_WEEKS));
+                  const ww = Math.max(0, +f.poolWeeklyWrite || 0);
+                  const target = ww * (cw - dw);
+                  const perWeek = Math.ceil(target / dw);
+                  const hrs = +((target * 5) / 60).toFixed(1);
+                  const hrsPerWeek = +(hrs / dw).toFixed(1);
+                  return (
+                    <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "9px 11px", fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+                      <span style={{ color: C.ink }}>
+                        {ww}/wk × {cw - dw} reachout weeks = {target} companies to research
+                      </span>
+                      <br />
+                      {perWeek}/week across {dw} discovery week{dw === 1 ? "" : "s"} · ~{hrsPerWeek}h/week at 5 min each
+                      {hrsPerWeek > 3 && <span style={{ color: C.amber }}> — that&apos;s most of a 3–5h week. Lower the weekly write or add a discovery week.</span>}
+                    </div>
+                  );
+                })()}
+              </div>
             </div>
 
             <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
