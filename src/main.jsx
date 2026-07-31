@@ -5018,6 +5018,37 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ))}
         </div>
 
+        {/* ---- CRM action bar ----
+            On mobile the two things you actually come here to do — log an
+            application, log an account — are pinned to the top so they stay
+            reachable while scrolling a long list, and everything secondary
+            collapses to an icon. Desktop keeps the roomier labelled row. */}
+        {!isDesktop && (
+          <div
+            style={{
+              position: "sticky",
+              /* clears the notch when installed as a PWA; 0 in a normal browser */
+              top: "env(safe-area-inset-top, 0px)",
+              zIndex: 20,
+              background: C.bg,
+              paddingTop: 8,
+              paddingBottom: 8,
+              marginBottom: 4,
+              borderBottom: `1px solid ${C.panelEdge}`,
+              display: "flex",
+              gap: 6,
+              alignItems: "center",
+            }}
+          >
+            <Btn onClick={() => setModal({ kind: "application", entry: null })} style={{ flex: 1, padding: "12px 8px", fontSize: 13, whiteSpace: "nowrap" }}>
+              + Application
+            </Btn>
+            <Btn color={C.amber} onClick={() => setModal({ kind: "account", entry: null })} style={{ flex: 1, padding: "12px 8px", fontSize: 13, whiteSpace: "nowrap" }}>
+              + Account
+            </Btn>
+          </div>
+        )}
+
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
           <div style={{ display: "flex", gap: 6 }}>
             {[
@@ -5038,20 +5069,48 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             ))}
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <Btn onClick={() => setModal({ kind: "application", entry: null })}>+ Track application</Btn>
-            <Btn ghost onClick={() => setModal({ kind: "parseJobPost", entry: null })}>🔗 Add from job post link</Btn>
-            <Btn
-              ghost
-              onClick={() => {
-                setModal({ kind: "account", entry: null });
-              }}
-            >
-              + Track account
-            </Btn>
+            {/* on mobile these live in the sticky bar above instead */}
+            {isDesktop && <Btn onClick={() => setModal({ kind: "application", entry: null })}>+ Track application</Btn>}
+            {isDesktop && (
+              <Btn color={C.amber} onClick={() => setModal({ kind: "account", entry: null })}>
+                + Track account
+              </Btn>
+            )}
+            {isDesktop && (
+              <Btn ghost onClick={() => setModal({ kind: "parseJobPost", entry: null })}>
+                🔗 Parse job post
+              </Btn>
+            )}
+            {!isDesktop && (
+              <button
+                onClick={() => setModal({ kind: "parseJobPost", entry: null })}
+                title="Parse a job post link"
+                aria-label="Parse a job post link"
+                style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, borderRadius: 10, width: 38, height: 38, cursor: "pointer", fontSize: 14, color: C.muted, flexShrink: 0 }}
+              >
+                🔗
+              </button>
+            )}
+            {!isDesktop && (
+              <button
+                onClick={() => setHousekeepingOpen(true)}
+                title="CRM Housekeeping"
+                aria-label="CRM Housekeeping"
+                style={{ position: "relative", background: "transparent", border: `1px solid ${C.panelEdge}`, borderRadius: 10, width: 38, height: 38, cursor: "pointer", fontSize: 14, color: C.muted, flexShrink: 0 }}
+              >
+                🧹
+                {housekeepingProposals.length > 0 && (
+                  <span style={{ position: "absolute", top: -4, right: -4, minWidth: 16, height: 16, borderRadius: 8, background: C.red, color: "#2b0b0b", fontFamily: mono, fontSize: 9, fontWeight: 800, lineHeight: "16px", padding: "0 4px" }}>
+                    {housekeepingProposals.length}
+                  </span>
+                )}
+              </button>
+            )}
             <button
               onClick={() => setHousekeepingOpen(true)}
               title="CRM Housekeeping"
               style={{
+                display: isDesktop ? "block" : "none",
                 position: "relative",
                 background: "transparent",
                 border: `1px solid ${C.panelEdge}`,
@@ -5094,8 +5153,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   setSelectMode((m) => !m);
                   setSelectedAppIds(new Set());
                 }}
+                style={isDesktop ? undefined : { padding: "8px 12px", fontSize: 12 }}
               >
-                {selectMode ? "Cancel select" : "☑ Select"}
+                {selectMode ? (isDesktop ? "Cancel select" : "✕") : isDesktop ? "☑ Select" : "☑"}
               </Btn>
             )}
           </div>
@@ -6178,7 +6238,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         {shownAccounts.length === 0 && (
           <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
             {accounts.length === 0
-              ? "No accounts tracked yet. Use + Track account to build a company-level relationship record — multiple contacts, one place."
+              ? "No accounts tracked yet. Use the + Account button to build a company-level relationship record — multiple contacts, one place."
               : "Nothing matches this search/filter."}
           </div>
         )}
