@@ -5026,26 +5026,44 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         {!isDesktop && (
           <div
             style={{
-              position: "sticky",
-              /* clears the notch when installed as a PWA; 0 in a normal browser */
-              top: "env(safe-area-inset-top, 0px)",
-              zIndex: 20,
-              background: C.bg,
-              paddingTop: 8,
-              paddingBottom: 8,
-              marginBottom: 4,
-              borderBottom: `1px solid ${C.panelEdge}`,
+              /* floats just above the bottom tab bar (~49px + safe area), so
+                 both primary actions stay under your thumb no matter how far
+                 down the list you've scrolled. Below the nav's z-index so the
+                 two can never fight. */
+              position: "fixed",
+              left: 0,
+              right: 0,
+              bottom: "calc(env(safe-area-inset-bottom, 0px) + 56px)",
+              zIndex: 30,
               display: "flex",
-              gap: 6,
-              alignItems: "center",
+              justifyContent: "center",
+              pointerEvents: "none",
             }}
           >
-            <Btn onClick={() => setModal({ kind: "application", entry: null })} style={{ flex: 1, padding: "12px 8px", fontSize: 13, whiteSpace: "nowrap" }}>
-              + Application
-            </Btn>
-            <Btn color={C.amber} onClick={() => setModal({ kind: "account", entry: null })} style={{ flex: 1, padding: "12px 8px", fontSize: 13, whiteSpace: "nowrap" }}>
-              + Account
-            </Btn>
+            <div
+              style={{
+                width: "100%",
+                maxWidth: 560,
+                margin: "0 16px",
+                display: "flex",
+                gap: 8,
+                pointerEvents: "auto",
+                background: "rgba(14,20,32,0.92)",
+                backdropFilter: "blur(10px)",
+                border: `1px solid ${C.panelEdge}`,
+                borderRadius: 14,
+                padding: 6,
+                boxSizing: "border-box",
+                boxShadow: "0 6px 20px rgba(0,0,0,0.45)",
+              }}
+            >
+              <Btn onClick={() => setModal({ kind: "application", entry: null })} style={{ flex: 1, padding: "12px 8px", fontSize: 13, whiteSpace: "nowrap" }}>
+                + Application
+              </Btn>
+              <Btn color={C.amber} onClick={() => setModal({ kind: "account", entry: null })} style={{ flex: 1, padding: "12px 8px", fontSize: 13, whiteSpace: "nowrap" }}>
+                + Account
+              </Btn>
+            </div>
           </div>
         )}
 
@@ -7479,7 +7497,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         </div>
 
         {/* footer */}
-        <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center", marginTop: 16, paddingBottom: isDesktop ? 0 : 74 }}>
+        <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center", marginTop: 16, paddingBottom: isDesktop ? 0 : MODES[mode] === "PIPELINE" ? 142 : 74 }}>
           <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.15em", color: syncStatus === "synced" ? C.green : syncStatus === "saving" ? C.amber : C.muted }}>
             {syncStatus === "synced" ? "● SYNCED" : syncStatus === "saving" ? "◌ SAVING" : "○ LOCAL ONLY"}
           </div>
@@ -7538,7 +7556,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
       {/* toast */}
       {toast && (
-        <div style={{ position: "fixed", bottom: `calc(env(safe-area-inset-bottom, 0px) + ${isDesktop ? 24 : 84}px)`, left: "50%", transform: "translateX(-50%)", background: C.panelEdge, color: C.ink, fontSize: 13, fontWeight: 600, padding: "8px 18px", borderRadius: 20, zIndex: 60 }}>
+        <div style={{ position: "fixed", bottom: `calc(env(safe-area-inset-bottom, 0px) + ${isDesktop ? 24 : MODES[mode] === "PIPELINE" ? 132 : 84}px)`, left: "50%", transform: "translateX(-50%)", background: C.panelEdge, color: C.ink, fontSize: 13, fontWeight: 600, padding: "8px 18px", borderRadius: 20, zIndex: 60 }}>
           {toast}
         </div>
       )}
