@@ -1095,12 +1095,40 @@ function computeDailyRollout(goal, apps, fullQuota, uptoDayIndex) {
 }
 
 /* pure: derive everything about a goal from the goal record + the pipeline */
-function computeGoal(goal, apps) {
+/* ---- pausing the standard goal ----
+   While pool pacing is on, days lived under it are PAUSED for the standard
+   goal: they contribute no daily target, consume no rollover carry, and push
+   the deadline out by one day each. Nothing is rewritten — `state.goal` is
+   untouched and the pause is derived from modeHistory at read time, so
+   switching back resumes exactly where you left off instead of dumping weeks
+   of accrued debt on you.
+
+   Work done during a pause still counts toward total progress. You don't lose
+   credit for applications you sent; only the PACING is suspended. */
+const isPausedDay = (settings, date) => !!settings && modeOnDate(settings, date) === "pool";
+const countPausedDays = (settings, from, to) => {
+  if (!settings || !from || !to) return 0;
+  let n = 0;
+  for (let d = from; d <= to; d = addDays(d, 1)) if (isPausedDay(settings, d)) n++;
+  return n;
+};
+
+function computeGoal(goal, apps, st) {
   if (!goal || !goal.target || !goal.days) return null;
+  /* Pausing only applies when pool pacing is ACTUALLY driving — mode set to
+     pool AND the pool has members. With the mode on but the pool empty, the
+     dashboard falls back to this goal, so it must keep owing a real number
+     rather than reading 0 because it thinks it's suspended. */
+  const settings = st?.settings ? (poolMembers(st, apps).length > 0 ? st.settings : null) : null;
   const preset = aggressivenessOf(goal);
   const fullQuota = Math.max(1, Math.ceil((goal.target / goal.days) * preset.quotaMultiplier));
-  const deadline = addDays(goal.startDate, goal.days - 1);
   const t = today();
+  /* the deadline slides by however many days were spent paused, so a pool
+     stretch costs you calendar time rather than silently eating your runway */
+  const rawDeadline = addDays(goal.startDate, goal.days - 1);
+  const pausedSoFar = countPausedDays(settings, goal.startDate, t < rawDeadline ? t : rawDeadline);
+  const deadline = addDays(rawDeadline, pausedSoFar);
+  const paused = isPausedDay(settings, t);
   const elapsedCalendarDays = Math.min(goal.days, Math.max(0, Math.floor((new Date(t) - new Date(goal.startDate)) / 86400000) + 1));
 
   /* expected-by-now = sum of each day's scheduled target so far (ramp-aware), skipping Sundays */
@@ -1109,6 +1137,7 @@ function computeGoal(goal, apps) {
     const d = new Date(goal.startDate + "T00:00:00");
     d.setDate(d.getDate() + (i - 1));
     if (d.getDay() === 0) continue;
+    if (isPausedDay(settings, iso(d))) continue; /* paused: no target was owed */
     expectedByNow += dailyTargetForDay(goal, i, fullQuota);
   }
 
@@ -1149,10 +1178,14 @@ function computeGoal(goal, apps) {
     const wStart = iso(mondayOf(d));
     if (!weekBuckets.has(wStart)) weekBuckets.set(wStart, { weekStart: wStart, label: weekLabel(mondayOf(d)), days: [] });
     const isSunday = d.getDay() === 0;
+    const dIso = iso(d);
+    const dPaused = isPausedDay(settings, dIso);
     weekBuckets.get(wStart).days.push({
-      date: iso(d),
+      date: dIso,
       dow: d.getDay(), /* 0=Sun … 6=Sat */
-      base: isSunday ? 0 : dailyTargetForDay(goal, dayCounter, fullQuota),
+      paused: dPaused,
+      /* a paused day owes nothing, exactly like a Sunday */
+      base: isSunday || dPaused ? 0 : dailyTargetForDay(goal, dayCounter, fullQuota),
     });
   }
 
@@ -1174,16 +1207,20 @@ function computeGoal(goal, apps) {
     const actual = counted.filter((a) => a.contacted && a.contacted >= goal.startDate && weekStartOfDate(a.contacted) === w.weekStart && isGoalActivity(a)).length;
     const weekEnd = addDays(w.weekStart, 5); /* Saturday — week isn't "over" until this has passed */
     const concluded = weekEnd < t;
-    if (concluded) {
+    const allPaused = w.days.every((d) => d.paused || d.dow === 0);
+    if (concluded && !allPaused) {
       /* net handed to next week = fair share + what came in − what got done;
          computed from baseSum+carryIn (not the clamped target) so an oversized
          rollover's un-absorbed remainder rides along and the total reconciles */
       rollIn = baseSum + carryIn - actual;
+    } else if (concluded && allPaused) {
+      /* a week spent entirely in pool mode passes its carry straight through
+         untouched — it owed nothing, so it can neither build nor clear debt */
     } else {
       stoppedCarrying = true;
     }
     const days = w.days.map((d, i) => ({ ...d, target: dayTargets[i] }));
-    return { label: w.label, weekStart: w.weekStart, workingDays, baseSum, target, actual, carryIn, days };
+    return { label: w.label, weekStart: w.weekStart, workingDays, baseSum, target, actual, carryIn, days, paused: allPaused };
   });
 
   const thisWeekStart = iso(mondayOf(new Date(t + "T00:00:00")));
@@ -1201,6 +1238,15 @@ function computeGoal(goal, apps) {
     let carryBeforeToday = 0;
     for (const d of wk.days) {
       if (d.date > t) break; /* future day this week — daily carry not known yet */
+      if (d.paused) {
+        /* suspended: owes nothing and consumes no carry, so the goal picks up
+           mid-stride on the day you switch back */
+        if (d.date === t) {
+          todaysEffective = 0;
+          carryBeforeToday = dailyCarry;
+        }
+        continue;
+      }
       const planned = d.target; /* already includes this week's spread weekly rollover */
       const effective = d.dow === 0 ? 0 : Math.max(0, planned + dailyCarry); /* Sunday = rest */
       if (d.date === t) {
@@ -1229,6 +1275,9 @@ function computeGoal(goal, apps) {
     carryIntoToday,
     actualToday,
     todayMet,
+    paused, /* today is being lived under pool pacing — standard goal suspended */
+    pausedDays: pausedSoFar,
+    rawDeadline,
     stillRamping,
     rampDaysLeft: stillRamping ? Math.max(0, preset.rampDays - elapsedCalendarDays) : 0,
     aggressiveness: preset,
@@ -1533,6 +1582,34 @@ const daysSince = (isoDate) => {
 };
 
 const HOUSEKEEPING_STALE_DAYS = 30;
+
+/* ---- auto-archive ----
+   An application still sitting at a PRE-REPLY stage 30 days after its last real
+   activity has told you what it's going to tell you. Rather than inventing a
+   "ghosted" status for it, it just gets filed: archived, CSV-backed, out of the
+   funnel — exactly the treatment a closed application gets.
+
+   Deliberately limited to stages before anyone answered:
+     · outreach / applied / followed up  → auto-filed. Silence is the outcome.
+     · replied and beyond                → NEVER auto-filed. A conversation that
+       went quiet deserves a human decision, so those keep going to the
+       housekeeping tray for you to judge.
+     · blank status                      → NEVER auto-filed. That's the
+       saved-for-later shelf; parking something there is intentional.
+   Account-linked entries are skipped too — those are managed via their contact. */
+const AUTO_ARCHIVE_STATUSES = ["outreach", "applied", "followed up"];
+function computeAutoArchivable(state, apps) {
+  if (state?.settings?.autoArchiveStale === false) return [];
+  const days = Math.max(1, +state?.settings?.autoArchiveDays || HOUSEKEEPING_STALE_DAYS);
+  const cutoff = addDays(today(), -days);
+  return (apps || []).filter((a) => {
+    if (a.archivedAt || a.tombstoned || a.fromAccountContact) return false;
+    if (!AUTO_ARCHIVE_STATUSES.includes(a.status)) return false;
+    if (hadReply(a)) return false; /* a reply happened at some point — human call */
+    const last = lastActivityDate(a);
+    return !!last && last <= cutoff;
+  });
+}
 const HOUSEKEEPING_TOMBSTONE_DAYS = 30;
 function computeHousekeepingProposals(state, apps) {
   const cutoff = addDays(today(), -HOUSEKEEPING_STALE_DAYS);
@@ -1545,6 +1622,9 @@ function computeHousekeepingProposals(state, apps) {
        entry followed up on recently is being actively worked, not rotting */
     const last = lastActivityDate(a);
     if (!last || last > cutoff) return;
+    /* auto-archive handles pre-reply silence on its own; this tray is for the
+       entries that need a human call — ones where somebody actually answered */
+    if (state?.settings?.autoArchiveStale !== false && AUTO_ARCHIVE_STATUSES.includes(a.status) && !hadReply(a)) return;
     const days = daysSince(last);
     const viaFollowUp = last !== a.contacted;
     proposals.push({
@@ -1900,6 +1980,8 @@ function migrate(saved) {
      on one day used to make all 20 follow-ups come due on the same later day —
      a wall of red that trains you to ignore the flag entirely. 0 = no cap. */
   if (typeof s.settings.followUpDailyCap !== "number") s.settings.followUpDailyCap = DEFAULT_FOLLOWUP_DAILY_CAP;
+  if (typeof s.settings.autoArchiveStale !== "boolean") s.settings.autoArchiveStale = true;
+  if (typeof s.settings.autoArchiveDays !== "number") s.settings.autoArchiveDays = HOUSEKEEPING_STALE_DAYS;
   /* "standard" = the original N-over-N-days quota. "pool" = coverage pacing
      over Pool Mode's closed company set. */
   if (s.settings.goalMode !== "pool") s.settings.goalMode = s.settings.goalMode === "pool" ? "pool" : s.settings.goalMode || "standard";
@@ -2793,7 +2875,7 @@ export default function FlightDeck() {
      2.5% step. */
   useEffect(() => {
     if (!state.goal) return;
-    const g = computeGoal(state.goal, apps);
+    const g = computeGoal(state.goal, apps, state);
     if (!g) return;
     const already = state.goal.milestonesCelebrated || [];
     let newMilestones = already;
@@ -2832,7 +2914,7 @@ export default function FlightDeck() {
         let nextCycleCount = s.cycleCount || 0;
         if (shouldSnapshotCycle && !s.goal.cycleCompleted) {
           nextCycleCount = (s.cycleCount || 0) + 1;
-          const gFinal = computeGoal(s.goal, s.applications);
+          const gFinal = computeGoal(s.goal, s.applications, s);
           const cycleEntry = buildCycleSnapshot(s, gFinal, nextCycleCount);
           nextAccomplishments = [cycleEntry, ...nextAccomplishments];
           nextGoal = { ...nextGoal, cycleCompleted: true };
@@ -2894,7 +2976,7 @@ export default function FlightDeck() {
       });
     const goalLine = (() => {
       if (!state.goal) return "No goal currently set.";
-      const g = computeGoal(state.goal, apps);
+      const g = computeGoal(state.goal, apps, state);
       if (!g) return "No goal currently set.";
       const rampNote = state.goal.rampEnabled
         ? g.stillRamping
@@ -3221,7 +3303,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     if (!loaded || digestChecked.current) return;
     digestChecked.current = true;
     if (state.lastDigestShownDate === today()) return;
-    const g = state.goal ? computeGoal(state.goal, apps) : null;
+    const g = state.goal ? computeGoal(state.goal, apps, state) : null;
     const patterns = computeSynthesis(state, apps, zone);
     if (totalDueCount === 0 && !g && patterns.length === 0) return; /* nothing worth a digest today */
     setDigestOpen(true);
@@ -3293,6 +3375,33 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     setCsvPromptOpen(false);
     mutate((s) => ({ ...s, lastCsvPromptDate: today() }));
   };
+
+  /* ---- daily auto-archive sweep ----
+     Runs once per day after load. Files stale pre-reply applications the same
+     way a closed one is filed: CSV row written first, archivedAt stamped,
+     `autoArchived` flagged so the archive view can show WHY it left and offer
+     a one-click restore. Never touches anything that got a reply. */
+  const autoArchiveChecked = useRef(false);
+  useEffect(() => {
+    if (!loaded || autoArchiveChecked.current) return;
+    autoArchiveChecked.current = true;
+    if (state.lastAutoArchiveDate === today()) return;
+    const stale = computeAutoArchivable(state, apps);
+    if (!stale.length) {
+      mutate((s) => ({ ...s, lastAutoArchiveDate: today() }));
+      return;
+    }
+    const ids = new Set(stale.map((a) => a.id));
+    const days = Math.max(1, +state.settings?.autoArchiveDays || HOUSEKEEPING_STALE_DAYS);
+    mutate((s) => ({
+      ...s,
+      lastAutoArchiveDate: today(),
+      archivedCsvRows: [...stale.map((a) => csvRowFromApplication(a)), ...(s.archivedCsvRows || [])],
+      applications: s.applications.map((a) => (ids.has(a.id) ? { ...a, archivedAt: today(), autoArchived: true } : a)),
+    }));
+    setTimeout(() => flash(`🗄 Filed ${stale.length} application${stale.length === 1 ? "" : "s"} with no answer in ${days}+ days — see the Archived filter to restore`), 600);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
 
   const clearAudioFields = (id) =>
     mutate(
@@ -3889,6 +3998,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      30 more untouched days — see applyTombstones. Before that ever happens,
      a full-detail snapshot is captured into the CSV backup below, so nothing
      is really lost even once the record itself gets stripped down. */
+  /* restores an archived entry. Auto-filing without an undo would be a trap —
+     a rule that files things for you must be reversible in one click. */
+  const unarchiveApplication = (id) =>
+    mutate((s) => ({ ...s, applications: s.applications.map((x) => (x.id === id ? { ...x, archivedAt: null, autoArchived: false } : x)) }), "Restored to the pipeline");
+
   const archiveApplication = (id) =>
     mutate((s) => {
       const a = s.applications.find((x) => x.id === id);
@@ -4157,6 +4271,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               .slice(0, 10) || DEFAULT_FOLLOWUPS,
             timezoneOffset: typeof data.timezoneOffset === "number" ? data.timezoneOffset : 8,
             followUpDailyCap: Math.max(0, Math.min(99, +data.followUpDailyCap || 0)),
+            autoArchiveStale: data.autoArchiveStale !== false,
+            autoArchiveDays: Math.max(7, Math.min(365, +data.autoArchiveDays || HOUSEKEEPING_STALE_DAYS)),
             goalMode: data.goalMode === "pool" ? "pool" : "standard",
             poolWeeklyWrite: Math.max(0, Math.min(99, +data.poolWeeklyWrite || 0)),
             cycleWeeks: Math.max(2, Math.min(26, +data.cycleWeeks || DEFAULT_CYCLE_WEEKS)),
@@ -4278,7 +4394,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   /* ============ SECTION RENDERERS ============ */
 
   const renderDashboard = () => {
-    const g = computeGoal(state.goal, apps);
+    const g = computeGoal(state.goal, apps, state);
     const poolMode = state.settings?.goalMode === "pool";
     const pg = poolMode ? computePoolGoal(state, apps) : null;
     /* shown when pool pacing is OFF: keeps the timeline visible as context so
@@ -5304,6 +5420,22 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       </td>
                       <td style={{ ...td, minWidth: 130 }}>
                         {cellInput(a, "role", { ph: "Role applied for" })}
+                        {a.archivedAt && pipeFilter === "archived" && (
+                          <div style={{ marginTop: 3 }}>
+                            {a.autoArchived && (
+                              <div style={{ fontFamily: mono, fontSize: 9, color: C.muted, letterSpacing: 0.4, marginBottom: 2 }}>🗄 NO ANSWER · FILED {a.archivedAt}</div>
+                            )}
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                unarchiveApplication(a.id);
+                              }}
+                              style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, borderRadius: 5, color: C.blue, fontFamily: mono, fontSize: 9, padding: "1px 5px", cursor: "pointer", letterSpacing: 0.4 }}
+                            >
+                              ↩ RESTORE
+                            </button>
+                          </div>
+                        )}
                         {isFromPool(a) && (
                           <div
                             title={`Came from ${a.poolName || "a pool build"} in Pool Mode`}
@@ -5644,6 +5776,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 150 }}>
                         {a.company || "Unnamed"}
                         {a.role && <div style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}>{a.role}</div>}
+                        {a.archivedAt && pipeFilter === "archived" && (
+                          <span
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              unarchiveApplication(a.id);
+                            }}
+                            style={{ display: "inline-block", marginTop: 3, marginRight: 4, border: `1px solid ${C.panelEdge}`, borderRadius: 5, color: C.blue, fontFamily: mono, fontSize: 9, fontWeight: 400, padding: "1px 5px", letterSpacing: 0.4 }}
+                          >
+                            ↩ RESTORE{a.autoArchived ? " · no answer" : ""}
+                          </span>
+                        )}
                         {isFromPool(a) && (
                           <span style={{ display: "inline-block", marginTop: 3, marginRight: 4, background: "rgba(74,222,128,0.12)", border: `1px solid ${C.green}`, borderRadius: 5, color: C.green, fontFamily: mono, fontSize: 9, fontWeight: 400, padding: "1px 5px", letterSpacing: 0.4 }}>
                             🎯 POOL
@@ -6733,9 +6876,115 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   );
 
   const renderGoal = () => {
-    const g = computeGoal(state.goal, apps);
+    const g = computeGoal(state.goal, apps, state);
+    const poolActive = state.settings?.goalMode === "pool";
+    const pg = poolActive ? computePoolGoal(state, apps) : null;
     return (
       <>
+        {/* ---- pool plan ----
+            Shown above the standard goal, never instead of it. The standard
+            goal stays below, intact and editable — switching modes changes
+            which plan is DRIVING, not which one exists. */}
+        {poolActive && pg && (
+          <div style={{ background: C.panel, border: `1px solid ${pg.inDiscovery ? C.blue : C.green}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <Label>🎯 Pool plan — driving your numbers</Label>
+              <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, border: `1px solid ${C.panelEdge}`, borderRadius: 20, padding: "3px 9px" }}>
+                WK {pg.weekInCycle + 1}/{pg.cycleWeeks}
+              </span>
+            </div>
+
+            {pg.total === 0 ? (
+              <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
+                No companies in the pool yet, so your standard goal below is still running the show. Add companies in the CRM's Pool tab and this takes over.
+              </div>
+            ) : (
+              <>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 10 }}>
+                  <div style={{ fontFamily: mono, fontSize: 32, fontWeight: 800, color: pg.todayMet ? C.green : pg.inDiscovery ? C.blue : C.amber, lineHeight: 1.1 }}>
+                    {pg.doneToday} / {pg.todaysTarget}
+                  </div>
+                  <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.4 }}>
+                    {pg.inDiscovery ? "to research today" : "to write today"}
+                    <br />
+                    {pg.doneThisWeek}/{pg.weekTarget} this week
+                  </div>
+                </div>
+
+                {/* the cycle laid out week by week — makes the rhythm legible
+                    instead of something you have to infer from a date */}
+                <div style={{ display: "flex", gap: 3, marginBottom: 6 }}>
+                  {Array.from({ length: pg.cycleWeeks }).map((_, i) => {
+                    const isDisc = i < pg.discoveryWeeks;
+                    const isNow = i === pg.weekInCycle;
+                    return (
+                      <div
+                        key={i}
+                        title={`Week ${i + 1} — ${isDisc ? "discovery" : "reachout"}`}
+                        style={{
+                          flex: 1,
+                          height: 22,
+                          borderRadius: 4,
+                          background: isDisc ? "rgba(96,165,250,0.25)" : "rgba(74,222,128,0.18)",
+                          border: `1px solid ${isNow ? C.ink : "transparent"}`,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          fontFamily: mono,
+                          fontSize: 9,
+                          color: isNow ? C.ink : C.muted,
+                          fontWeight: isNow ? 800 : 400,
+                        }}
+                      >
+                        {isDisc ? "🔍" : "✉"}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.55, marginBottom: 10 }}>
+                  {pg.discoveryWeeks} discovery {pg.discoveryWeeks === 1 ? "week" : "weeks"} then {pg.reachoutWeeks} reachout — cycle {pg.cycleIndex + 1}, started {pg.cycleStart}.
+                  Discovery loads {pg.discoveryTargetCycle} companies ({pg.discoveryPerWeek}/wk, ~{pg.discoveryHoursEstimate}h total); reachout writes {pg.weeklyTarget}/wk.
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 10, borderTop: `1px solid ${C.panelEdge}`, fontSize: 12 }}>
+                  <span style={{ color: C.muted }}>
+                    Coverage <strong style={{ color: C.ink }}>{pg.worked}/{pg.total}</strong> · {pg.readyToWrite} ready to write
+                  </span>
+                  <span style={{ fontFamily: mono, color: C.muted }}>{pg.remaining === 0 ? "covered" : `${pg.remaining} left`}</span>
+                </div>
+                {pg.outOfHooks && (
+                  <div style={{ fontSize: 11, color: C.amber, marginTop: 8, lineHeight: 1.5 }}>
+                    ⚠ Out of hooks — today's ask is capped at what's actually researched. Discovery under-delivered by {pg.discoveryShortfall} this cycle.
+                  </div>
+                )}
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.5 }}>
+                  No week-to-week debt in this mode — a closed pool already bounds the work.
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* the standard goal, preserved. Nothing about it is deleted or
+            rewritten while pool pacing runs — it's suspended, and its deadline
+            slides by however long the pause lasts. */}
+        {poolActive && state.goal && g && (
+          <div style={{ background: "rgba(135,152,176,0.06)", border: `1px dashed ${C.panelEdge}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.muted, marginBottom: 4 }}>⏸ Standard goal — paused, not lost</div>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.6 }}>
+              {state.goal.target} over {state.goal.days} days is untouched and still {g.pctComplete}% complete ({g.actualTotal}/{state.goal.target}). It owes you nothing while
+              pool pacing runs — no daily quota, no rollover debt building up.
+              {g.pausedDays > 0 && (
+                <>
+                  {" "}
+                  Paused {g.pausedDays} day{g.pausedDays === 1 ? "" : "s"} so far, so the deadline has moved from {g.rawDeadline} to <strong>{g.deadline}</strong>.
+                </>
+              )}{" "}
+              Switch back in Settings and it resumes mid-stride.
+            </div>
+          </div>
+        )}
+
         {!state.goal && (
           <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 20, textAlign: "center" }}>
             <div style={{ fontSize: 32, marginBottom: 8 }}>🎯</div>
@@ -6820,11 +7069,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               {g.weeks.map((w) => {
                 const wOnPace = w.actual >= w.target || w.weekStart > today();
                 return (
-                  <div key={w.label} style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 14px" }}>
+                  <div key={w.label} style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 14px", opacity: w.paused ? 0.55 : 1 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <div style={{ fontWeight: 700, fontSize: 13 }}>{w.label}</div>
-                      <div style={{ fontFamily: mono, fontSize: 11, color: wOnPace ? C.green : C.amber }}>
-                        {w.actual} / {w.target}
+                      <div style={{ fontWeight: 700, fontSize: 13 }}>
+                        {w.label}
+                        {w.paused && <span style={{ fontFamily: mono, fontSize: 9, color: C.muted, marginLeft: 6, letterSpacing: 0.4 }}>⏸ POOL</span>}
+                      </div>
+                      <div style={{ fontFamily: mono, fontSize: 11, color: w.paused ? C.muted : wOnPace ? C.green : C.amber }}>
+                        {w.paused ? `${w.actual} logged · no quota` : `${w.actual} / ${w.target}`}
                       </div>
                     </div>
                     {w.carryIn !== 0 && (
@@ -7234,7 +7486,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -7317,7 +7569,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         <MorningDigestModal
           onClose={dismissDigest}
           dueCount={totalDueCount}
-          goalInfo={state.goal ? computeGoal(state.goal, apps) : null}
+          goalInfo={state.goal ? computeGoal(state.goal, apps, state) : null}
           topPattern={computeSynthesis(state, apps, zone)[0] || null}
         />
       )}
@@ -7414,6 +7666,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         day: entry?.day ?? 1,
         followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String),
         followUpDailyCap: String(modal.followUpDailyCap ?? DEFAULT_FOLLOWUP_DAILY_CAP),
+        autoArchiveStale: modal.autoArchiveStale !== false,
+        autoArchiveDays: String(modal.autoArchiveDays ?? HOUSEKEEPING_STALE_DAYS),
         goalMode: modal.goalMode === "pool" ? "pool" : "standard",
         poolWeeklyWrite: String(modal.poolWeeklyWrite ?? DEFAULT_POOL_WEEKLY_WRITE),
         cycleWeeks: String(modal.cycleWeeks ?? DEFAULT_CYCLE_WEEKS),
@@ -8213,6 +8467,42 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               onChange={(e) => set("followUpDailyCap")(e.target.value)}
               style={{ ...inputStyle, width: 90, fontFamily: mono, padding: "8px 10px", marginBottom: 16 }}
             />
+
+            <Label>🗄 File applications that never got an answer</Label>
+            <button
+              onClick={() => set("autoArchiveStale")(!f.autoArchiveStale)}
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                textAlign: "left",
+                background: f.autoArchiveStale ? "rgba(74,222,128,0.09)" : "transparent",
+                border: `1px solid ${f.autoArchiveStale ? C.green : C.panelEdge}`,
+                color: f.autoArchiveStale ? C.green : C.muted,
+                borderRadius: 10,
+                padding: "9px 12px",
+                fontSize: 13,
+                cursor: "pointer",
+                marginBottom: 8,
+              }}
+            >
+              {f.autoArchiveStale ? "◉ Auto-file them" : "○ Leave them in the pipeline"}
+            </button>
+            {f.autoArchiveStale && (
+              <>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Days of silence before filing</div>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  value={f.autoArchiveDays}
+                  onChange={(e) => set("autoArchiveDays")(e.target.value)}
+                  style={{ ...inputStyle, width: 90, fontFamily: mono, padding: "8px 10px" }}
+                />
+              </>
+            )}
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginTop: 8, marginBottom: 16 }}>
+              Applications still at outreach, applied or followed up with no reply get archived and written to the CSV backup, exactly like a closed one. Anything that got a
+              reply is never auto-filed — that goes to the housekeeping tray for you to decide. Restore any of them from the Archived filter.
+            </div>
 
             <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
               <Label>🎯 Goal model</Label>
