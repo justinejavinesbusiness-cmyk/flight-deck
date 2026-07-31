@@ -5086,8 +5086,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               </button>
             ))}
           </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {/* on mobile these live in the sticky bar above instead */}
+          {/* on mobile this claims its own full-width line so the inline search
+              has room to stretch beside the icons */}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", ...(isDesktop ? {} : { flex: "1 1 100%" }) }}>
+            {/* on mobile these live in the floating bar at the bottom instead */}
             {isDesktop && <Btn onClick={() => setModal({ kind: "application", entry: null })}>+ Track application</Btn>}
             {isDesktop && (
               <Btn color={C.amber} onClick={() => setModal({ kind: "account", entry: null })}>
@@ -5098,6 +5100,28 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               <Btn ghost onClick={() => setModal({ kind: "parseJobPost", entry: null })}>
                 🔗 Parse job post
               </Btn>
+            )}
+            {/* search rides in the same row as the icons on mobile — the CRM
+                is mostly a lookup surface, so it earns its place up here
+                without costing a whole extra row */}
+            {!isDesktop && crmView === "applications" && (
+              <div style={{ position: "relative", flex: 1, minWidth: 110 }}>
+                <input
+                  value={pipeSearch}
+                  onChange={(e) => setPipeSearch(e.target.value)}
+                  placeholder="🔎 Search…"
+                  style={{ ...inputStyle, padding: "9px 26px 9px 10px", fontSize: 13, width: "100%", boxSizing: "border-box" }}
+                />
+                {pipeSearch && (
+                  <button
+                    onClick={() => setPipeSearch("")}
+                    aria-label="Clear search"
+                    style={{ position: "absolute", right: 4, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", color: C.muted, fontSize: 15, cursor: "pointer", padding: "2px 5px", lineHeight: 1 }}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
             )}
             {!isDesktop && (
               <button
@@ -5185,19 +5209,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           renderAccounts()
         ) : (
           <>
-        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-          <input
-            value={pipeSearch}
-            onChange={(e) => setPipeSearch(e.target.value)}
-            placeholder="🔎 Search company, contact, email, notes…"
-            style={{ ...inputStyle, flex: 1 }}
-          />
-          {pipeSearch && (
-            <Btn ghost onClick={() => setPipeSearch("")} style={{ padding: "10px 14px" }}>
-              Clear
-            </Btn>
-          )}
-        </div>
+        {/* on mobile the search sits inline with the icon row above, so it
+            isn't rendered again here — one less full-width row to scroll past */}
+        {isDesktop && (
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <input
+              value={pipeSearch}
+              onChange={(e) => setPipeSearch(e.target.value)}
+              placeholder="🔎 Search company, contact, email, notes…"
+              style={{ ...inputStyle, flex: 1 }}
+            />
+            {pipeSearch && (
+              <Btn ghost onClick={() => setPipeSearch("")} style={{ padding: "10px 14px" }}>
+                Clear
+              </Btn>
+            )}
+          </div>
+        )}
 
         {selectMode && (
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, background: C.panel, border: `1px solid ${C.amber}`, borderRadius: 10, padding: "10px 14px", marginBottom: 10, flexWrap: "wrap" }}>
@@ -5332,7 +5360,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 cursor: "pointer",
               }}
             >
-              🔍 {filters.find((f) => f.key === pipeFilter)?.label || "Filter"}
+              ⚡ {filters.find((f) => f.key === pipeFilter)?.label || "Filter"}
               {(pipeSourceFilter || pipeStatusFilter) && <span style={{ fontFamily: mono, fontSize: 9 }}>+more</span>}
             </button>
 
