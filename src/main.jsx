@@ -490,11 +490,26 @@ const isOpenApp = (a) => !["offer", "rejected", "bad fit"].includes(a.status);
    counted even if the application is later marked rejected or bad fit.
    Falls back to the current status for stages outside the milestone list
    (or older data saved before milestonesLogged existed). */
-const reached = (a, stage) => {
-  if (stage === "replied" && a?.gotReply) return true; /* explicitly recorded reply outranks status position */
-  if ((a.milestonesLogged || []).includes(stage)) return true;
-  return a.status !== "rejected" && a.status !== "bad fit" && (STAGE_IDX[a.status] ?? 0) >= STAGE_IDX[stage];
+/* ---- furthest stage ever reached ----
+   `status` is only where an entry sits NOW. Closing it sets rejected/bad fit,
+   which carry no stage of their own, so the status alone can't tell you the
+   application got to interview before it died. The furthest stage is therefore
+   the max of: where it sits now, every milestone logged on the way, and an
+   explicitly recorded reply.
+
+   Reading it as a single index also makes the funnel MONOTONIC: if interview
+   was reached then screening and replied were too, by definition. Counting
+   them independently produced impossible funnels (1 interview, 0 screens). */
+const furthestStageIdx = (a) => {
+  let idx = STAGE_IDX[a?.status] ?? -2;
+  (a?.milestonesLogged || []).forEach((sName) => {
+    const i = STAGE_IDX[sName];
+    if (typeof i === "number" && i > idx) idx = i;
+  });
+  if (a?.gotReply && STAGE_IDX.replied > idx) idx = STAGE_IDX.replied;
+  return idx;
 };
+const reached = (a, stage) => furthestStageIdx(a) >= (STAGE_IDX[stage] ?? 0);
 
 /* ---- "they replied, then rejected me" ----
    Status is a single position, so moving an entry to "rejected" or "bad fit"
@@ -511,7 +526,7 @@ const reached = (a, stage) => {
    `gotReply` records that fact independently of status, so it survives any
    later status change. Works identically on applications and account contacts,
    since both carry the same field. */
-const hadReply = (a) => !!(a?.gotReply || (a?.milestonesLogged || []).includes("replied") || (a?.status !== "rejected" && a?.status !== "bad fit" && (STAGE_IDX[a?.status] ?? 0) >= STAGE_IDX.replied));
+const hadReply = (a) => furthestStageIdx(a) >= STAGE_IDX.replied;
 /* the interesting case worth its own filter and badge: a real answer that
    still ended in a no */
 const isRepliedThenRejected = (a) => !isOpenApp(a) && a?.status !== "offer" && hadReply(a);
@@ -521,8 +536,25 @@ const isRejectedNoReply = (a) => !isOpenApp(a) && a?.status !== "offer" && !hadR
    that already implied a reply, latch gotReply so the fact isn't silently lost
    the moment the status moves on. Never un-sets it — clearing a mis-set reply
    is a deliberate manual action, not a side effect of editing something else. */
-const latchReply = (prevEntry, newStatus) =>
-  (newStatus === "rejected" || newStatus === "bad fit") && hadReply(prevEntry) ? { gotReply: true } : {};
+/* ---- latch history on close ----
+   Closing an entry collapses its stage to rejected/bad fit, which would erase
+   how far it actually got. So at the moment of closing we write down the
+   milestones its prior stage already implied — an entry sitting at "interview"
+   banks replied + screening + interview on the way out, even if it was created
+   at that stage and never stepped forward through the app.
+
+   Never removes anything: a correction is a deliberate act, not a side effect. */
+const latchOnClose = (prevEntry, newStatus) => {
+  if (newStatus !== "rejected" && newStatus !== "bad fit") return {};
+  const idx = furthestStageIdx(prevEntry);
+  const already = prevEntry?.milestonesLogged || [];
+  const implied = MILESTONE_STAGES.filter((st) => STAGE_IDX[st] <= idx);
+  const merged = Array.from(new Set([...already, ...implied]));
+  const out = {};
+  if (merged.length > already.length) out.milestonesLogged = merged;
+  if (hadReply(prevEntry)) out.gotReply = true;
+  return out;
+};
 /* contact-side equivalents. Contacts use a coarser 5-stage vocabulary, so we
    translate to the application scale before judging — "discovery call" and
    "ongoing" both sit past a reply, and "closed" is the collapse that would
@@ -951,14 +983,29 @@ function collapseCountedEntries(apps) {
     const key = opportunityKey(a);
     if (!key) return;
     const cur = rep.get(key);
-    rep.set(key, cur ? earlierEntry(a, cur) : a);
+    if (!cur) return void rep.set(key, a);
+    /* The earliest entry stays the one that COUNTS, so the count sits in the
+       week the work actually started. But its siblings' history is ABSORBED
+       rather than dropped — otherwise an older, emptier row could silently
+       discard the sibling that recorded the interview, and the funnel would
+       lose a stage that genuinely happened. */
+    const base = earlierEntry(a, cur);
+    const other = base === a ? cur : a;
+    rep.set(key, {
+      ...base,
+      milestonesLogged: Array.from(new Set([...(base.milestonesLogged || []), ...(other.milestonesLogged || [])])),
+      gotReply: !!(base.gotReply || other.gotReply),
+    });
   });
   if (!rep.size) return apps || [];
-  const keptIds = new Set(Array.from(rep.values()).map((a) => a.id));
-  return (apps || []).filter((a) => {
-    if (!isConvergedStatus(a?.status)) return true;
-    return opportunityKey(a) ? keptIds.has(a.id) : true;
-  });
+  const mergedById = new Map();
+  rep.forEach((v) => mergedById.set(v.id, v));
+  return (apps || [])
+    .map((a) => {
+      if (!isConvergedStatus(a?.status) || !opportunityKey(a)) return a;
+      return mergedById.get(a.id) || null; /* absorbed into its group's representative */
+    })
+    .filter(Boolean);
 }
 
 /* pure: when one entry is moved to a converged stage, every other entry for
@@ -988,7 +1035,7 @@ function propagateConvergedStatus(applications, accounts, sourceApp, newStatus) 
       status: newStatus,
       contacted: !a.contacted ? sourceApp?.contacted || a.contacted : a.contacted,
       milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged,
-      ...latchReply(a, newStatus),
+      ...latchOnClose(a, newStatus),
     };
   });
   /* linked account contacts follow too — including the source's own, so the
@@ -3502,7 +3549,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             contacted: wasBlank && status && !a.contacted ? today() : a.contacted,
             milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged,
             /* preserve "a human actually answered" across the close */
-            ...latchReply(a, status),
+            ...latchOnClose(a, status),
           };
           return updatedSource;
         });
@@ -4107,7 +4154,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               if (a.id !== entry.id) return a;
               const m = computeMilestoneWins(a, data.status);
               if (m) addWins = m.wins;
-              return { ...a, ...data, milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged, ...latchReply(a, data.status) };
+              /* the modal's "how far did this get?" control is authoritative —
+                 it's the only way to correct an entry closed without stepping
+                 through the stages. Forward-transition milestones and the
+                 close-latch are then applied on top of the corrected value. */
+              const formMs = Array.isArray(data.milestonesLogged) ? data.milestonesLogged : a.milestonesLogged || [];
+              const baseMs = Array.from(new Set([...(m ? m.milestonesLogged : []), ...formMs]));
+              const latched = latchOnClose({ ...a, milestonesLogged: baseMs, gotReply: data.gotReply }, data.status);
+              return { ...a, ...data, milestonesLogged: latched.milestonesLogged || baseMs, ...(latched.gotReply ? { gotReply: true } : {}) };
             });
           } else {
             /* brand-new entry created directly at an advanced status (rare, but possible) */
@@ -5017,6 +5071,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </div>
           ))}
         </div>
+        {/* the other half of the same caption: this row is the WORKING view, so
+            it hides archived. Naming the gap here means neither number can
+            quietly look wrong when they disagree. */}
+        {(() => {
+          const archivedCount = apps.filter((a) => a.archivedAt).length;
+          if (!archivedCount) return null;
+          return (
+            <div style={{ fontSize: 11, color: C.muted, marginTop: -8, marginBottom: 12, lineHeight: 1.5 }}>
+              Excludes {archivedCount} archived {archivedCount === 1 ? "entry" : "entries"} — still counted in your funnel and goal, which is why those read higher.
+            </div>
+          );
+        })()}
 
         {/* ---- CRM action bar ----
             On mobile the two things you actually come here to do — log an
@@ -6937,8 +7003,27 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         ))}
       </div>
-      <div style={{ fontSize: 11, color: C.muted, margin: "-6px 0 12px" }}>
-        Fully automatic from the Pipeline — set an entry's status to "outreach" to count it there instead of Apps.
+      <div style={{ fontSize: 11, color: C.muted, margin: "-6px 0 12px", lineHeight: 1.55 }}>
+        Fully automatic from the Pipeline — set an entry's status to &ldquo;outreach&rdquo; to count it there instead of Apps.
+        {(() => {
+          /* The funnel deliberately INCLUDES archived entries while the pipeline
+             filters and header cards exclude them, so the two disagree. That's
+             correct — you really did send those applications, and dropping them
+             would shrink the denominator while keeping the replies, quietly
+             inflating your reply rate as more work gets filed. Saying so beats
+             leaving you to discover the gap. */
+          const archivedCount = apps.filter((a) => a.archivedAt).length;
+          if (!archivedCount) return null;
+          return (
+            <>
+              {" "}
+              <span style={{ color: C.amber }}>
+                Includes {archivedCount} archived {archivedCount === 1 ? "entry" : "entries"}
+              </span>{" "}
+              — you sent them, so they stay in the denominator. Pipeline counts and filters exclude archived, so those numbers will read lower.
+            </>
+          );
+        })()}
       </div>
 
       {/* conversion: application/outreach -> closed deal. Synced account-contact
@@ -7155,6 +7240,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   {g.pastDeadline ? "DEADLINE PASSED" : g.onPace ? "● ON PACE" : `○ BEHIND (${g.carryIntoToday} short, after rollover)`}
                 </span>
               </div>
+              {/* same reasoning as the funnel: archived work still counts here,
+                  because you did it. Progress that vanished when an entry was
+                  filed would be a worse lie than a number that needs a caption. */}
+              {(() => {
+                const archivedCount = apps.filter((a) => a.archivedAt && !isBlankStatus(a)).length;
+                if (!archivedCount) return null;
+                return (
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>
+                    Counts {archivedCount} archived {archivedCount === 1 ? "entry" : "entries"} — filing an application doesn&apos;t undo the work of sending it.
+                  </div>
+                );
+              })()}
 
               <div style={{ display: "flex", justifyContent: "space-between", marginTop: 12, paddingTop: 12, borderTop: `1px solid ${C.panelEdge}` }}>
                 <div>
@@ -7757,6 +7854,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         badReasons: entry?.badReasons ? [...entry.badReasons] : [],
         highConfidence: entry?.highConfidence || false,
         gotReply: entry?.gotReply || false,
+        milestonesLogged: entry?.milestonesLogged ? [...entry.milestonesLogged] : [],
         attempt: attemptOf(entry || {}),
         notes: entry?.notes || pre.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
@@ -8247,6 +8345,50 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 </div>
               )}
             </div>
+
+            {["rejected", "bad fit"].includes(f.status) && (
+              <div style={{ marginBottom: 12 }}>
+                <Label>How far did this get?</Label>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {[
+                    ["", "No reply"],
+                    ...MILESTONE_STAGES.filter((st) => st !== "offer").map((st) => [st, MILESTONE_LABEL[st]]),
+                  ].map(([key, label]) => {
+                    const cur = MILESTONE_STAGES.filter((st) => (f.milestonesLogged || []).includes(st)).pop() || "";
+                    const on = cur === key;
+                    return (
+                      <button
+                        key={key || "none"}
+                        onClick={() =>
+                          setF((p) => ({
+                            ...p,
+                            /* picking a stage implies every stage before it */
+                            milestonesLogged: key ? MILESTONE_STAGES.filter((st) => STAGE_IDX[st] <= STAGE_IDX[key]) : [],
+                          }))
+                        }
+                        style={{
+                          fontFamily: sans,
+                          fontSize: 12,
+                          fontWeight: 700,
+                          padding: "7px 11px",
+                          borderRadius: 20,
+                          border: `1px solid ${on ? C.blue : C.panelEdge}`,
+                          background: on ? "rgba(96,165,250,0.12)" : "transparent",
+                          color: on ? C.blue : C.muted,
+                          cursor: "pointer",
+                        }}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                  Closing an entry hides how far it actually got, so this is what keeps it in your funnel. An interview that ended in a rejection is still an interview —
+                  it counts, and it's the strongest evidence your applications are landing.
+                </div>
+              </div>
+            )}
 
             <div style={{ marginBottom: 12 }}>
               <Label>Did they ever reply?</Label>
