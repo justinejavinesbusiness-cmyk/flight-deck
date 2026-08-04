@@ -3749,18 +3749,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     }
     mutate((s) => ({ ...s, applications: [blankPoolApplication(name, { hook: h, researchedAt: h ? today() : "", poolName }), ...s.applications] }), "🎯 Added to pool");
   };
-  /* escape hatch from the fast path: opens the full Application or Account
-     modal prefilled, for targets that deserve the whole record up front */
-  const openFullPoolForm = (nameRaw, hook, kind) => {
-    const name = (nameRaw || "").trim();
-    if (!name) return;
+  /* opens the standard Application or Account form, pre-tagged as a pool
+     member. Going straight to the real form means a pool record is created by
+     exactly the same code path as any other — no parallel half-record that
+     drifts out of sync with the standard one. */
+  const openPoolForm = (kind) => {
     const phase = cyclePhase(state.settings);
     if (phase.phase !== "discovery") return flash("Pool is closed — park it on the bench instead");
-    const h = (hook || "").trim();
     setModal({
       kind: kind === "account" ? "account" : "application",
       entry: null,
-      prefill: { company: name, hook: h, researchedAt: h ? today() : "", fromPool: true, poolName: `Cycle ${phase.cycleIndex + 1}` },
+      prefill: { fromPool: true, poolName: `Cycle ${phase.cycleIndex + 1}` },
     });
   };
   /* pulls bench names into the pool — only meaningful once a discovery week
@@ -3882,7 +3881,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
           <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55 }}>
             {open
-              ? `Add and research companies now — ${pg.discoveredThisCycle}/${pg.discoveryTargetCycle} hooked this cycle. Reachout starts ${pg.reachoutStart}.`
+              ? `${pg.discoveredThisCycle} of ${pg.discoveryTargetCycle} hooked this cycle — writing the hook is what counts as discovery, not adding the name. Reachout starts ${pg.reachoutStart}.`
               : `Finding companies isn't this week's job. New names go to the bench and get pulled in when discovery reopens ${addDays(pg.cycleEnd, 1)}.`}
           </div>
           <div style={{ height: 8, background: C.bg, borderRadius: 4, marginTop: 10, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
@@ -3890,13 +3889,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.muted, marginTop: 6 }}>
             <span>
-              Coverage {pg.worked}/{pg.total} · {byReadiness.hooked.length} ready to write · {byReadiness.parked.length} need a hook
+              <strong style={{ color: C.ink }}>{pg.total} in the pool</strong> · {pg.worked} contacted · {byReadiness.hooked.length} ready to write · {byReadiness.parked.length} need a hook
             </span>
-            <span style={{ fontFamily: mono }}>{pg.remaining === 0 ? "covered" : `${pg.remaining} left`}</span>
+            <span style={{ fontFamily: mono }}>{pg.remaining === 0 ? "all contacted" : `${pg.remaining} to contact`}</span>
           </div>
         </div>
 
-        <PoolAdd open={open} onAdd={addToPool} onOpenFull={openFullPoolForm} />
+        <PoolAdd
+          open={open}
+          onAddApplication={() => openPoolForm("application")}
+          onAddAccount={() => openPoolForm("account")}
+          onPark={(n) => addToPool(n, "", "application")}
+        />
 
         {byReadiness.parked.length > 0 && (
           <>
@@ -10138,73 +10142,71 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
 
    Closed weeks don't hide the form, they relabel it — parking a name should be
    one action, not a dead end you have to work around. */
-function PoolAdd({ open, onAdd, onOpenFull }) {
-  const [kind, setKind] = useState("application");
-  const [company, setCompany] = useState("");
-  const [hook, setHook] = useState("");
-  const reset = () => {
-    setCompany("");
-    setHook("");
+/* The pool's add control.
+
+   Tapping a type goes straight to that record's full modal, prefilled as a
+   pool member — no second "more fields" step, and no half-populated record
+   that behaves differently from one made through + Track application.
+   Hooks aren't asked for here because every row below has an inline hook
+   field: adding the name and researching it are separate acts, and the
+   cycle already separates them.
+
+   During reachout weeks the pool is closed, so the control becomes a bench
+   parking slip instead of disappearing — capturing a name shouldn't require
+   fighting the app. */
+function PoolAdd({ open, onAddApplication, onAddAccount, onPark }) {
+  const [name, setName] = useState("");
+  const park = () => {
+    if (!name.trim()) return;
+    onPark(name.trim());
+    setName("");
   };
-  const submit = () => {
-    if (!company.trim()) return;
-    onAdd(company, hook, kind);
-    reset();
-  };
-  const full = () => {
-    if (!company.trim()) return;
-    onOpenFull(company, hook, kind);
-    reset();
-  };
+  if (!open)
+    return (
+      <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
+        <Label>Park on the bench</Label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Company name" style={inputStyle} onKeyDown={(e) => e.key === "Enter" && park()} />
+          <Btn color={C.amber} onClick={park} disabled={!name.trim()} style={{ flexShrink: 0 }}>
+            Park
+          </Btn>
+        </div>
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>
+          Pool is closed this week, so this waits on the bench until discovery reopens — that's intended, not a rejection.
+        </div>
+      </div>
+    );
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 }}>
-      <Label>{open ? "Add to pool" : "Park on the bench"}</Label>
-      {open && (
-        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-          {[
-            ["application", "📋 Application", "chasing one role"],
-            ["account", "🏢 Account", "several contacts"],
-          ].map(([k, label, sub]) => (
-            <button
-              key={k}
-              onClick={() => setKind(k)}
-              style={{
-                flex: 1,
-                textAlign: "left",
-                fontFamily: sans,
-                fontSize: 12,
-                fontWeight: 700,
-                padding: "8px 10px",
-                borderRadius: 10,
-                cursor: "pointer",
-                border: `1px solid ${kind === k ? C.amber : C.panelEdge}`,
-                background: kind === k ? "rgba(245,185,66,0.1)" : "transparent",
-                color: kind === k ? C.amber : C.muted,
-              }}
-            >
-              {label}
-              <div style={{ fontSize: 10, fontWeight: 400, color: C.muted, marginTop: 2 }}>{sub}</div>
-            </button>
-          ))}
-        </div>
-      )}
-      <input value={company} onChange={(e) => setCompany(e.target.value)} placeholder="Company name" style={{ ...inputStyle, marginBottom: 6 }} onKeyDown={(e) => e.key === "Enter" && submit()} />
-      {open && (
-        <>
-          <input value={hook} onChange={(e) => setHook(e.target.value.slice(0, 120))} placeholder="Hook — one line, optional for now" style={inputStyle} onKeyDown={(e) => e.key === "Enter" && submit()} />
-          <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>One recent post, one launch, one hire. Five minutes, not a dossier.</div>
-        </>
-      )}
-      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-        <Btn onClick={submit} disabled={!company.trim()} style={{ flex: 2 }}>
-          {open ? `🎯 Add as ${kind}` : "🪑 Park on bench"}
-        </Btn>
-        {open && (
-          <Btn ghost onClick={full} disabled={!company.trim()} style={{ flex: 1 }}>
-            More fields…
-          </Btn>
-        )}
+      <Label>Add to pool</Label>
+      <div style={{ display: "flex", gap: 8 }}>
+        {[
+          ["📋", "Application", "chasing one role", onAddApplication],
+          ["🏢", "Account", "several contacts", onAddAccount],
+        ].map(([icon, label, sub, fn]) => (
+          <button
+            key={label}
+            onClick={fn}
+            style={{
+              flex: 1,
+              textAlign: "left",
+              fontFamily: sans,
+              fontSize: 13,
+              fontWeight: 700,
+              padding: "11px 12px",
+              borderRadius: 10,
+              cursor: "pointer",
+              border: `1px solid ${C.panelEdge}`,
+              background: "transparent",
+              color: C.ink,
+            }}
+          >
+            {icon} {label}
+            <div style={{ fontSize: 11, fontWeight: 400, color: C.muted, marginTop: 2 }}>{sub}</div>
+          </button>
+        ))}
       </div>
+      <div style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>Opens the full form. Add the hook afterwards on the row — five minutes, not a dossier.</div>
     </div>
   );
 }
