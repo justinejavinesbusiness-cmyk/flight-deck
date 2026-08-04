@@ -3674,6 +3674,59 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      so there's no separate closure date to drift out of sync. Scoped to the Pool
      tab only — "+ Track application" stays free, because a referral or an inbound
      posting isn't outbound discovery. */
+  /* Pool-created records must be indistinguishable from ones made through
+     "+ Track application" / "+ Track account" — same fields, same defaults.
+     The follow-up schedule matters most: a pool entry created with an empty
+     followUps array would graduate into the pipeline and then NEVER appear in
+     the due queue, because normFollowUps treats [] as "no schedule". Blank
+     status keeps it out of the queue until it's really contacted anyway. */
+  const blankPoolApplication = (company, extra) => ({
+    id: uid(),
+    company,
+    role: "",
+    website: "",
+    source: "",
+    jobBoardName: "",
+    postLink: "",
+    postVerified: "",
+    postShot: "",
+    screenshotLink: "",
+    salary: "",
+    contact: "",
+    email: "",
+    contactLinkedin: "",
+    contactPhone: "",
+    contacted: "",
+    followUps: (state.settings?.followUpDefaults || DEFAULT_FOLLOWUPS).map((d) => ({ days: d, done: false, doneAt: "" })),
+    status: "",
+    outreachKind: "",
+    outreachChannel: "",
+    badReasons: [],
+    highConfidence: false,
+    gotReply: false,
+    milestonesLogged: [],
+    notes: "",
+    custom: [],
+    touchpoints: [],
+    fromPool: true,
+    ...extra,
+  });
+  const blankPoolAccount = (company, extra) => ({
+    id: uid(),
+    company,
+    website: "",
+    industry: "",
+    headcount: "",
+    status: "",
+    highConfidence: false,
+    badReasons: [],
+    notes: "",
+    /* one empty contact row, exactly like the standard account form starts with */
+    contacts: [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], linkedApplicationId: null }],
+    fromPool: true,
+    ...extra,
+  });
+
   const addToPool = (nameRaw, hook, kind) => {
     const name = (nameRaw || "").trim();
     if (!name) return;
@@ -3691,34 +3744,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const h = (hook || "").trim();
     const poolName = `Cycle ${phase.cycleIndex + 1}`;
     if (kind === "account") {
-      mutate((s) => ({
-        ...s,
-        accounts: [
-          { id: uid(), company: name, website: "", industry: "", headcount: "", status: "", notes: "", hook: h, researchedAt: h ? today() : "", fromPool: true, poolName, contacts: [] },
-          ...s.accounts,
-        ],
-      }), "🎯 Added to pool as an account");
+      mutate((s) => ({ ...s, accounts: [blankPoolAccount(name, { hook: h, researchedAt: h ? today() : "", poolName }), ...s.accounts] }), "🎯 Added to pool as an account");
       return;
     }
-    mutate((s) => ({
-      ...s,
-      applications: [
-        {
-          id: uid(),
-          company: name,
-          role: "",
-          status: "", /* saved-for-later: a pool member costs nothing until written to */
-          contacted: "",
-          hook: h,
-          researchedAt: h ? today() : "",
-          fromPool: true,
-          poolName,
-          followUps: [],
-          milestonesLogged: [],
-        },
-        ...s.applications,
-      ],
-    }), "🎯 Added to pool");
+    mutate((s) => ({ ...s, applications: [blankPoolApplication(name, { hook: h, researchedAt: h ? today() : "", poolName }), ...s.applications] }), "🎯 Added to pool");
   };
   /* escape hatch from the fast path: opens the full Application or Account
      modal prefilled, for targets that deserve the whole record up front */
@@ -3749,12 +3778,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       const fresh = take.filter((b) => !existing.has(normCompanyName(b.company)));
       const poolName = `Cycle ${phase.cycleIndex + 1}`;
       /* the bench remembers which shape you meant when you parked it */
-      const newApps = fresh
-        .filter((b) => (b.kind || "application") !== "account")
-        .map((b) => ({ id: uid(), company: b.company, role: "", status: "", contacted: "", hook: "", researchedAt: "", fromPool: true, poolName, followUps: [], milestonesLogged: [] }));
-      const newAccts = fresh
-        .filter((b) => (b.kind || "application") === "account")
-        .map((b) => ({ id: uid(), company: b.company, website: "", industry: "", headcount: "", status: "", notes: "", hook: "", researchedAt: "", fromPool: true, poolName, contacts: [] }));
+      const newApps = fresh.filter((b) => (b.kind || "application") !== "account").map((b) => blankPoolApplication(b.company, { hook: "", researchedAt: "", poolName }));
+      const newAccts = fresh.filter((b) => (b.kind || "application") === "account").map((b) => blankPoolAccount(b.company, { hook: "", researchedAt: "", poolName }));
       return {
         ...s,
         poolBench: (s.poolBench || []).filter((b) => !ids.includes(b.id)),
@@ -3782,6 +3807,44 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      counted here but are shown as a link into the pipeline, not as rows —
      they're being worked over there now.
      ============================================================ */
+  /* tags an EXISTING account or application as a pool member, so companies
+     you were already tracking can join the closed set instead of having to be
+     re-typed. Untagging leaves the record completely intact — it just stops
+     counting toward coverage. */
+  const togglePoolMembership = (kind, id) => {
+    const phase = cyclePhase(state.settings);
+    mutate((s) => {
+      const stamp = (r) =>
+        r.fromPool
+          ? { ...r, fromPool: false, poolName: "" }
+          : { ...r, fromPool: true, poolName: r.poolName || `Cycle ${phase.cycleIndex + 1}` };
+      return kind === "account"
+        ? { ...s, accounts: (s.accounts || []).map((a) => (a.id === id ? stamp(a) : a)) }
+        : { ...s, applications: s.applications.map((a) => (a.id === id ? stamp(a) : a)) };
+    }, "Pool membership updated");
+  };
+
+  /* removes a member from the pool. A lead that was never worked exists only
+     because of the pool, so it's deleted outright; anything with real history
+     is merely untagged, because deleting recorded work would be the wrong
+     kind of tidy. */
+  const removePoolMember = (member) => {
+    const ref = member.refs[0];
+    if (!ref) return;
+    const e = ref.entry;
+    const untouched = ref.kind === "account" ? !(e.contacts || []).some((c) => c.status || c.contacted) && !e.notes : !e.status && !e.contacted && !e.notes;
+    if (!untouched) {
+      togglePoolMembership(ref.kind, ref.id);
+      return flash("Removed from pool — the record is kept");
+    }
+    mutate((s) =>
+      ref.kind === "account"
+        ? { ...s, accounts: (s.accounts || []).filter((a) => a.id !== ref.id) }
+        : { ...s, applications: s.applications.filter((a) => a.id !== ref.id) },
+      "Removed from pool"
+    );
+  };
+
   /* opens whichever record backs this member — application or account */
   const openPoolMember = (m) => {
     const ref = m.refs[0];
@@ -3839,7 +3902,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <>
             <Label>Need a hook ({byReadiness.parked.length})</Label>
             {byReadiness.parked.map((m) => (
-              <PoolRow key={m.key} member={m} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={openPoolMember} />
+              <PoolRow key={m.key} member={m} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} />
             ))}
           </>
         )}
@@ -3848,7 +3911,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <>
             <Label style={{ marginTop: 14 }}>Ready to write ({byReadiness.hooked.length})</Label>
             {byReadiness.hooked.map((m) => (
-              <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} />
+              <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} />
             ))}
           </>
         )}
@@ -7689,7 +7752,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -7855,6 +7918,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         highConfidence: entry?.highConfidence || false,
         gotReply: entry?.gotReply || false,
         milestonesLogged: entry?.milestonesLogged ? [...entry.milestonesLogged] : [],
+        fromPool: entry?.fromPool ?? pre.fromPool ?? false,
+        poolName: entry?.poolName ?? pre.poolName ?? "",
+        hook: entry?.hook ?? pre.hook ?? "",
+        researchedAt: entry?.researchedAt ?? pre.researchedAt ?? "",
         attempt: attemptOf(entry || {}),
         notes: entry?.notes || pre.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
@@ -8417,6 +8484,45 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   : "Auto-set when a reply-or-later stage gets closed, so a rejection never erases the fact that someone answered."}
               </div>
             </div>
+
+            {modal.goalMode === "pool" && (
+              <div style={{ marginBottom: 12 }}>
+                <Label>Pool membership</Label>
+                <button
+                  onClick={() => setF((p) => ({ ...p, fromPool: !p.fromPool, poolName: !p.fromPool ? p.poolName || modal.poolCycleName || "" : "" }))}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    textAlign: "left",
+                    background: f.fromPool ? "rgba(74,222,128,0.09)" : "transparent",
+                    border: `1px solid ${f.fromPool ? C.green : C.panelEdge}`,
+                    color: f.fromPool ? C.green : C.muted,
+                    borderRadius: 10,
+                    padding: "9px 12px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                  }}
+                >
+                  {f.fromPool ? `🎯 In the pool${f.poolName ? ` · ${f.poolName}` : ""}` : "☐ Not in the pool"}
+                </button>
+                {f.fromPool && (
+                  <input
+                    value={f.hook}
+                    onChange={(e) => {
+                      const v = e.target.value.slice(0, 120);
+                      setF((p) => ({ ...p, hook: v, researchedAt: v.trim() ? p.researchedAt || today() : "" }));
+                    }}
+                    placeholder="Hook — one line"
+                    style={{ ...inputStyle, marginTop: 6 }}
+                  />
+                )}
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                  {f.fromPool
+                    ? "Writing the hook is the discovery event — it counts toward this cycle's discovery target."
+                    : "Adds this company to the closed set you're working through. Removing it leaves the record untouched."}
+                </div>
+              </div>
+            )}
 
             <div style={{ marginBottom: 12 }}>
               <Label>Reapplication?</Label>
@@ -9096,6 +9202,31 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             <Field label="Website" value={f.website} onChange={set("website")} placeholder="https://acme.com" />
             <Field label="Industry" value={f.industry} onChange={set("industry")} placeholder="e.g. Fintech, SaaS" />
             <Field label="Headcount" value={f.headcount} onChange={set("headcount")} placeholder="e.g. 50-200, 500+" />
+            {modal.goalMode === "pool" && (
+              <div style={{ marginBottom: 12 }}>
+                <Label>Pool membership</Label>
+                <button
+                  onClick={() => setF((p) => ({ ...p, fromPool: !p.fromPool, poolName: !p.fromPool ? p.poolName || modal.poolCycleName || "" : "" }))}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    textAlign: "left",
+                    background: f.fromPool ? "rgba(74,222,128,0.09)" : "transparent",
+                    border: `1px solid ${f.fromPool ? C.green : C.panelEdge}`,
+                    color: f.fromPool ? C.green : C.muted,
+                    borderRadius: 10,
+                    padding: "9px 12px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                  }}
+                >
+                  {f.fromPool ? `🎯 In the pool${f.poolName ? ` · ${f.poolName}` : ""}` : "☐ Not in the pool"}
+                </button>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                  Adds this company to the closed set you're working through, so it counts toward coverage. Removing it leaves the record untouched.
+                </div>
+              </div>
+            )}
             {f.fromPool && (
               <div style={{ marginBottom: 12 }}>
                 <Label>🎯 Pool hook — one line</Label>
@@ -10081,7 +10212,7 @@ function PoolAdd({ open, onAdd, onOpenFull }) {
 /* one pool member. The hook is editable inline because writing it IS the
    discovery event — making that a modal trip would be friction on the exact
    action the whole cycle is built around. */
-function PoolRow({ member, badge, onHook, onOpen }) {
+function PoolRow({ member, badge, onHook, onOpen, onRemove }) {
   const [draft, setDraft] = useState(member.hook || "");
   const dirty = draft !== (member.hook || "");
   const ref = member.refs[0];
@@ -10097,7 +10228,19 @@ function PoolRow({ member, badge, onHook, onOpen }) {
           {member.company || "Unnamed"}
           {contactCount > 0 && <span style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}> · {contactCount} contact{contactCount === 1 ? "" : "s"}</span>}
         </span>
-        {badge}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+          {badge}
+          {onRemove && (
+            <button
+              onClick={() => onRemove(member)}
+              title="Remove from the pool"
+              aria-label="Remove from the pool"
+              style={{ background: "transparent", border: "none", color: C.muted, fontSize: 17, lineHeight: 1, cursor: "pointer", padding: "0 2px" }}
+            >
+              ×
+            </button>
+          )}
+        </div>
       </div>
       <div style={{ display: "flex", gap: 6 }}>
         <input
