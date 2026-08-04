@@ -703,6 +703,7 @@ function poolMembers(state, apps) {
       worked: cur.worked || m.worked,
       discovered: cur.discovered || m.discovered,
       firstContact: [cur.firstContact, m.firstContact].filter(Boolean).sort()[0] || "",
+      addedAt: [cur.addedAt, m.addedAt].filter(Boolean).sort()[0] || "",
       discoveredAt: [cur.discoveredAt, m.discoveredAt].filter(Boolean).sort()[0] || "",
       refs: [...cur.refs, ...m.refs],
     });
@@ -721,6 +722,7 @@ function poolMembers(state, apps) {
       discovered: poolCompanyDiscovered(a),
       firstContact: poolCompanyWorked(a) ? a.contacted : "",
       discoveredAt: discoveryDateOf(a),
+      addedAt: a.poolAddedAt || "",
       refs: [{ kind: "application", id: a.id, entry: a }],
     });
   });
@@ -741,6 +743,7 @@ function poolMembers(state, apps) {
       discovered: !!(acc.researchedAt || (acc.hook || "").trim()),
       firstContact,
       discoveredAt: acc.researchedAt || "",
+      addedAt: acc.poolAddedAt || "",
       refs: [{ kind: "account", id: acc.id, entry: acc }],
     });
   });
@@ -850,11 +853,29 @@ function computePoolGoal(state, apps) {
   /* the queue reachout actually draws from: researched but not yet written to */
   const readyToWrite = members.filter((m) => m.discovered && !m.worked).length;
 
-  /* ---- discovery track ---- */
+  /* ---- discovery track ----
+     Discovery is genuinely TWO jobs, and collapsing them into one number made
+     the app claim you'd done nothing after an afternoon of list-building:
+
+       BUILD — find the companies and get them into the pool. Real work, and
+               the first thing the philosophy asks for ("40–50, two sittings").
+       HOOK  — spend five minutes on each and write one line. This is what
+               makes a company writable, so it's what actually loads the
+               reachout queue.
+
+     They're counted separately and the daily ask follows whichever is the
+     live bottleneck: build until the pool is stocked, then hook. Both are
+     discovery, neither is double-counted. */
   const discoveryTargetCycle = weeklyTarget * cyc.reachoutWeeks;
   const discoveredThisCycle = members.filter((m) => m.discoveredAt && m.discoveredAt >= cyc.cycleStart).length;
   const discoveryPerWeek = cyc.discoveryWeeks > 0 ? Math.ceil(discoveryTargetCycle / cyc.discoveryWeeks) : 0;
   const discoveryShortfall = Math.max(0, discoveryTargetCycle - discoveredThisCycle);
+  const poolSize = total;
+  const buildRemaining = Math.max(0, discoveryTargetCycle - poolSize);
+  const needHook = members.filter((m) => !m.discovered).length;
+  /* build first, hook second — but once the pool is stocked there's nothing
+     left to build, so the ask flips automatically */
+  const discoveryMode = buildRemaining > 0 ? "build" : "hook";
 
   /* ---- this week's target, whichever track is live ---- */
   const mon = iso(mondayOfToday());
@@ -866,9 +887,16 @@ function computePoolGoal(state, apps) {
   const weekTarget = inDiscovery ? weekTargetRaw : Math.min(weekTargetRaw, readyToWrite + members.filter((m) => m.worked && m.firstContact >= mon).length);
   const outOfHooks = !inDiscovery && weekTargetRaw > weekTarget;
 
-  const eventOn = (d) => (inDiscovery ? members.filter((m) => m.discoveredAt === d).length : members.filter((m) => m.worked && m.firstContact === d).length);
+  const eventOn = (d) =>
+    inDiscovery
+      ? discoveryMode === "build"
+        ? members.filter((m) => m.addedAt === d).length
+        : members.filter((m) => m.discoveredAt === d).length
+      : members.filter((m) => m.worked && m.firstContact === d).length;
   const doneThisWeek = inDiscovery
-    ? members.filter((m) => m.discoveredAt && m.discoveredAt >= mon).length
+    ? discoveryMode === "build"
+      ? members.filter((m) => m.addedAt && m.addedAt >= mon).length
+      : members.filter((m) => m.discoveredAt && m.discoveredAt >= mon).length
     : members.filter((m) => m.worked && m.firstContact && m.firstContact >= mon).length;
 
   /* daily walk inside the week only — Sunday rests, and the walk never reaches
@@ -906,6 +934,10 @@ function computePoolGoal(state, apps) {
     discoveryPerWeek,
     discoveryShortfall,
     inDiscovery,
+    discoveryMode,
+    poolSize,
+    buildRemaining,
+    needHook,
     outOfHooks,
     weekTarget,
     doneThisWeek,
@@ -2007,6 +2039,13 @@ function migrate(saved) {
   if (!Array.isArray(s.content)) s.content = [];
   if (!Array.isArray(s.archivedCsvRows)) s.archivedCsvRows = [];
   if (!Array.isArray(s.poolBench)) s.poolBench = [];
+  /* one-time backfill: pool members created before add-dates were tracked have
+     no poolAddedAt, so their build work would read as zero. Stamped once, on
+     first load after upgrading — a pool without the date is one that was built
+     before this existed, and the alternative is silently discarding real work. */
+  const stampPool = (r) => (r && r.fromPool && !r.poolAddedAt ? { ...r, poolAddedAt: today() } : r);
+  s.applications = s.applications.map(stampPool);
+  s.accounts = (s.accounts || []).map(stampPool);
   if (!s.contentGoal || typeof s.contentGoal !== "object") s.contentGoal = { perWeek: 3 };
   if (typeof s.contentGoal.bufferTarget !== "number") s.contentGoal.bufferTarget = DEFAULT_CONTENT_BUFFER_TARGET;
   if (typeof s.contentGoal.ideaFloor !== "number") s.contentGoal.ideaFloor = DEFAULT_CONTENT_IDEA_FLOOR;
@@ -3709,6 +3748,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     custom: [],
     touchpoints: [],
     fromPool: true,
+    poolAddedAt: today(),
     ...extra,
   });
   const blankPoolAccount = (company, extra) => ({
@@ -3724,6 +3764,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     /* one empty contact row, exactly like the standard account form starts with */
     contacts: [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], linkedApplicationId: null }],
     fromPool: true,
+    poolAddedAt: today(),
     ...extra,
   });
 
@@ -3816,7 +3857,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       const stamp = (r) =>
         r.fromPool
           ? { ...r, fromPool: false, poolName: "" }
-          : { ...r, fromPool: true, poolName: r.poolName || `Cycle ${phase.cycleIndex + 1}` };
+          : { ...r, fromPool: true, poolName: r.poolName || `Cycle ${phase.cycleIndex + 1}`, poolAddedAt: r.poolAddedAt || today() };
       return kind === "account"
         ? { ...s, accounts: (s.accounts || []).map((a) => (a.id === id ? stamp(a) : a)) }
         : { ...s, applications: s.applications.map((a) => (a.id === id ? stamp(a) : a)) };
@@ -3881,7 +3922,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
           <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55 }}>
             {open
-              ? `${pg.discoveredThisCycle} of ${pg.discoveryTargetCycle} hooked this cycle — writing the hook is what counts as discovery, not adding the name. Reachout starts ${pg.reachoutStart}.`
+              ? pg.discoveryMode === "build"
+                ? `Build the pool first: ${pg.poolSize} of ${pg.discoveryTargetCycle} in, ${pg.buildRemaining} to go. Then write one hook each. Reachout starts ${pg.reachoutStart}.`
+                : `Pool built. Now the hooks: ${pg.discoveredThisCycle} of ${pg.discoveryTargetCycle} written, ${pg.needHook} to go. Reachout starts ${pg.reachoutStart}.`
               : `Finding companies isn't this week's job. New names go to the bench and get pulled in when discovery reopens ${addDays(pg.cycleEnd, 1)}.`}
           </div>
           <div style={{ height: 8, background: C.bg, borderRadius: 4, marginTop: 10, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
@@ -4545,7 +4588,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           style={{ background: C.panel, border: `1px solid ${pg.todayMet ? C.green : pg.inDiscovery ? C.blue : C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14, cursor: "pointer" }}
         >
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <Label>{pg.inDiscovery ? "🔍 Discovery week — research, don't send" : "✉️ Reachout week — write to your queue"}</Label>
+            <Label>
+              {pg.inDiscovery ? (pg.discoveryMode === "build" ? "🔍 Discovery week — build the pool" : "🔍 Discovery week — hook them, don't send") : "✉️ Reachout week — write to your queue"}
+            </Label>
             <span style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.08em", color: pg.inDiscovery ? C.blue : C.green, border: `1px solid ${C.panelEdge}`, borderRadius: 20, padding: "3px 9px" }}>
               WK {pg.weekInCycle + 1}/{pg.cycleWeeks}
             </span>
@@ -4555,7 +4600,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               {pg.doneToday} / {pg.todaysTarget}
             </div>
             <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.4 }}>
-              {pg.inDiscovery ? "companies to research today" : "companies to write today"}
+              {pg.inDiscovery ? (pg.discoveryMode === "build" ? "companies to add today" : "companies to hook today") : "companies to write today"}
               <br />
               {pg.doneThisWeek}/{pg.weekTarget} this week
             </div>
@@ -4568,8 +4613,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
           {pg.inDiscovery ? (
             <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.55 }}>
-              Loading the queue for {pg.reachoutWeeks} reachout weeks: {pg.discoveredThisCycle}/{pg.discoveryTargetCycle} researched this cycle (~{pg.discoveryHoursEstimate}h at 5 min
-              each). No outreach quota this week — but follow-ups still run, and anything you do send still logs.
+              {pg.discoveryMode === "build"
+                ? `Pool: ${pg.poolSize}/${pg.discoveryTargetCycle} companies in — ${pg.buildRemaining} more to find, then hook them one by one. `
+                : `Pool built (${pg.poolSize}). Hooks: ${pg.discoveredThisCycle}/${pg.discoveryTargetCycle} written, ${pg.needHook} to go (~5 min each). `}
+              No outreach quota this week — but follow-ups still run, and anything you do send still logs.
             </div>
           ) : (
             <div style={{ fontSize: 11, color: pg.outOfHooks ? C.amber : C.muted, marginTop: 8, lineHeight: 1.55 }}>
@@ -4584,10 +4631,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.muted, marginTop: 6 }}>
             <span>
-              Pool coverage {pg.worked}/{pg.total}
+              {pg.total} in pool · {pg.worked} contacted
               {pg.poolName ? ` · ${pg.poolName}` : ""}
             </span>
-            <span style={{ fontFamily: mono }}>{pg.remaining === 0 ? "covered" : `${pg.remaining} left`}</span>
+            <span style={{ fontFamily: mono }}>{pg.remaining === 0 ? "all contacted" : `${pg.remaining} to contact`}</span>
           </div>
         </div>
       ) : state.goal && g ? (
@@ -7163,7 +7210,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                     {pg.doneToday} / {pg.todaysTarget}
                   </div>
                   <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.4 }}>
-                    {pg.inDiscovery ? "to research today" : "to write today"}
+                    {pg.inDiscovery ? (pg.discoveryMode === "build" ? "to add today" : "to hook today") : "to write today"}
                     <br />
                     {pg.doneThisWeek}/{pg.weekTarget} this week
                   </div>
@@ -7201,12 +7248,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </div>
                 <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.55, marginBottom: 10 }}>
                   {pg.discoveryWeeks} discovery {pg.discoveryWeeks === 1 ? "week" : "weeks"} then {pg.reachoutWeeks} reachout — cycle {pg.cycleIndex + 1}, started {pg.cycleStart}.
-                  Discovery loads {pg.discoveryTargetCycle} companies ({pg.discoveryPerWeek}/wk, ~{pg.discoveryHoursEstimate}h total); reachout writes {pg.weeklyTarget}/wk.
+                  Discovery is two jobs: build the pool to {pg.discoveryTargetCycle} ({pg.poolSize} in so far), then write a hook for each (~{pg.discoveryHoursEstimate}h total).
+                  Reachout then writes {pg.weeklyTarget}/wk.
                 </div>
 
                 <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 10, borderTop: `1px solid ${C.panelEdge}`, fontSize: 12 }}>
                   <span style={{ color: C.muted }}>
-                    Coverage <strong style={{ color: C.ink }}>{pg.worked}/{pg.total}</strong> · {pg.readyToWrite} ready to write
+                    <strong style={{ color: C.ink }}>{pg.total} in pool</strong> · {pg.worked} contacted · {pg.readyToWrite} ready to write
                   </span>
                   <span style={{ fontFamily: mono, color: C.muted }}>{pg.remaining === 0 ? "covered" : `${pg.remaining} left`}</span>
                 </div>
