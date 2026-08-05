@@ -375,7 +375,11 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
     return { ...c, linkedApplicationId: newId };
   });
 
-  return { contacts: updatedContacts, applications: apps };
+  /* report what was dropped so the caller can tombstone it — a removal that
+     isn't recorded gets undone by the next sync merge */
+  const keptIds = new Set(apps.map((a) => a.id));
+  const removedIds = applications.filter((a) => !keptIds.has(a.id)).map((a) => a.id);
+  return { contacts: updatedContacts, applications: apps, removedIds };
 }
 
 /* ---- content management model ---- */
@@ -2023,6 +2027,15 @@ const DEFAULT_STATE = {
      pulls them in. This is the pressure valve: ideas keep arriving whether the
      pool is open or not, and blocking them outright just makes you fight the app. */
   poolBench: [],
+  /* ---- deletion tombstones ----
+     Sync merges the local and remote copies with a UNION, which can only ever
+     ADD records — it has no way to express "this one is gone". So a delete was
+     undone by the very next pull: the record still existed remotely (or in a
+     save that hadn't landed yet) and the union handed it straight back.
+     Recording the id of anything deleted is what makes removal survive a merge.
+     Covers applications, accounts, content and individual contacts, since all
+     of them carry unique ids. */
+  deletedIds: [],
   lastCsvPromptDate: null,
   lastContentScheduleCheckDate: null,
 };
@@ -2039,6 +2052,11 @@ function migrate(saved) {
   if (!Array.isArray(s.content)) s.content = [];
   if (!Array.isArray(s.archivedCsvRows)) s.archivedCsvRows = [];
   if (!Array.isArray(s.poolBench)) s.poolBench = [];
+  if (!Array.isArray(s.deletedIds)) s.deletedIds = [];
+  /* tombstones only need to outlive the window in which a stale copy could
+     still resurface; 180 days is far beyond that, and pruning keeps the
+     synced payload from growing forever */
+  s.deletedIds = s.deletedIds.filter((d) => d && d.id && (!d.at || d.at > addDays(today(), -180)));
   /* one-time backfill: pool members created before add-dates were tracked have
      no poolAddedAt, so their build work would read as zero. Stamped once, on
      first load after upgrading — a pool without the date is one that was built
@@ -2067,6 +2085,11 @@ function migrate(saved) {
      a wall of red that trains you to ignore the flag entirely. 0 = no cap. */
   if (typeof s.settings.followUpDailyCap !== "number") s.settings.followUpDailyCap = DEFAULT_FOLLOWUP_DAILY_CAP;
   if (typeof s.settings.autoArchiveStale !== "boolean") s.settings.autoArchiveStale = true;
+  if (!s.settings.aiProvider) s.settings.aiProvider = "builtin";
+  if (typeof s.settings.aiModel !== "string") s.settings.aiModel = "";
+  if (typeof s.settings.aiBaseUrl !== "string") s.settings.aiBaseUrl = "";
+  /* who you are, in one paragraph — without this the drafts are generic */
+  if (typeof s.settings.aiPitch !== "string") s.settings.aiPitch = "";
   if (typeof s.settings.autoArchiveDays !== "number") s.settings.autoArchiveDays = HOUSEKEEPING_STALE_DAYS;
   /* "standard" = the original N-over-N-days quota. "pool" = coverage pacing
      over Pool Mode's closed company set. */
@@ -2118,18 +2141,30 @@ function unionById(localArr = [], remoteArr = []) {
 function mergeStates(localS, remoteS) {
   if (!remoteS) return localS;
   if (!localS) return remoteS;
+  /* a deletion recorded on EITHER side wins over the other side still holding
+     the record — otherwise the union quietly resurrects it */
+  const tombs = [...(localS.deletedIds || []), ...(remoteS.deletedIds || [])];
+  const gone = new Set(tombs.map((d) => d && d.id).filter(Boolean));
+  const alive = (arr) => (arr || []).filter((x) => x && !gone.has(x.id));
+  const dedupeTombs = Array.from(new Map(tombs.filter((d) => d && d.id).map((d) => [d.id, d])).values());
   return {
     ...remoteS,
-    applications: unionById(localS.applications, remoteS.applications),
-    accounts: unionById(localS.accounts, remoteS.accounts),
-    content: unionById(localS.content, remoteS.content),
+    deletedIds: dedupeTombs,
+    applications: alive(unionById(localS.applications, remoteS.applications)),
+    /* contacts live inside accounts, so a deleted contact rides back in on its
+       parent account unless it's stripped here too */
+    accounts: alive(unionById(localS.accounts, remoteS.accounts)).map((acc) => ({
+      ...acc,
+      contacts: (acc.contacts || []).filter((c) => c && !gone.has(c.id)),
+    })),
+    content: alive(unionById(localS.content, remoteS.content)),
     contentGoal: remoteS.contentGoal || localS.contentGoal || { perWeek: 3 },
-    funnel: unionById(localS.funnel, remoteS.funnel),
-    emotions: unionById(localS.emotions, remoteS.emotions),
-    decisions: unionById(localS.decisions, remoteS.decisions),
-    accomplishments: unionById(localS.accomplishments, remoteS.accomplishments),
-    poolBench: unionById(localS.poolBench, remoteS.poolBench),
-    supportSessions: unionById(localS.supportSessions, remoteS.supportSessions),
+    funnel: alive(unionById(localS.funnel, remoteS.funnel)),
+    emotions: alive(unionById(localS.emotions, remoteS.emotions)),
+    decisions: alive(unionById(localS.decisions, remoteS.decisions)),
+    accomplishments: alive(unionById(localS.accomplishments, remoteS.accomplishments)),
+    poolBench: alive(unionById(localS.poolBench, remoteS.poolBench)),
+    supportSessions: alive(unionById(localS.supportSessions, remoteS.supportSessions)),
     goal: remoteS.goal || localS.goal || null,
     cycleCount: Math.max(localS.cycleCount || 0, remoteS.cycleCount || 0),
     runway: remoteS.runway || localS.runway,
@@ -2272,6 +2307,121 @@ const shotPublicUrl = (path) => `${SUPA_URL}/storage/v1/object/public/job-posts/
 async function uploadShot(path, file) {
   await edgeUpload("job-posts", path, file, file.type || "image/png");
 }
+
+/* ============================================================
+   AI OUTREACH DRAFTING
+
+   The hook is one line about the company. Turning it into a first message is
+   the slowest part of a reachout session, so this drafts from it.
+
+   KEY STORAGE — read before changing:
+   Your settings object is synced to Supabase and merged across devices. An API
+   key placed there would be stored in plaintext in a shared record. So the key
+   lives ONLY in this browser's localStorage under `fd-ai-key`, is never put in
+   state, and never leaves the device except in the call to the provider you
+   chose. The trade-off is real and worth knowing: it doesn't follow you to
+   another device, and anyone with access to this browser profile can read it.
+   The built-in option avoids the question entirely by keeping the key on the
+   server, and is the right default for most people.
+   ============================================================ */
+const AI_KEY_LS = "fd-ai-key";
+const readAiKey = () => {
+  try {
+    return localStorage.getItem(AI_KEY_LS) || "";
+  } catch (e) {
+    return "";
+  }
+};
+const writeAiKey = (v) => {
+  try {
+    if (v) localStorage.setItem(AI_KEY_LS, v);
+    else localStorage.removeItem(AI_KEY_LS);
+  } catch (e) {}
+};
+const AI_PROVIDERS = {
+  builtin: { label: "Built-in", sub: "No key needed — uses Flight Deck's own endpoint", needsKey: false, defaultModel: "" },
+  anthropic: { label: "Anthropic", sub: "Your own Claude API key", needsKey: true, defaultModel: "claude-sonnet-4-5" },
+  openai: { label: "OpenAI", sub: "Your own OpenAI API key", needsKey: true, defaultModel: "gpt-4o-mini" },
+  custom: { label: "Custom", sub: "Any OpenAI-compatible endpoint (OpenRouter, Groq, local…)", needsKey: true, defaultModel: "" },
+};
+
+/* one call, four backends, plain text out. Throws with a readable message so
+   the UI can show what actually went wrong instead of a spinner that stops. */
+async function callAI({ provider, model, baseUrl, key, system, user }) {
+  const prov = provider || "builtin";
+  if (prov === "builtin") {
+    const res = await fetch("/api/coach", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: `${system}\n\n${user}` }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    return (data.content || [])
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n")
+      .trim();
+  }
+  if (!key) throw new Error("No API key saved — add one in Settings.");
+
+  if (prov === "anthropic") {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        /* required for calls made straight from a browser */
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({ model: model || AI_PROVIDERS.anthropic.defaultModel, max_tokens: 700, system, messages: [{ role: "user", content: user }] }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || `Anthropic error ${res.status}`);
+    return (data.content || [])
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n")
+      .trim();
+  }
+
+  /* openai and custom share the chat-completions shape */
+  const url = (prov === "custom" ? (baseUrl || "").replace(/\/$/, "") : "https://api.openai.com/v1") + "/chat/completions";
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model: model || AI_PROVIDERS.openai.defaultModel,
+      max_tokens: 700,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error?.message || `Provider error ${res.status}`);
+  return (data.choices?.[0]?.message?.content || "").trim();
+}
+
+/* The prompt deliberately forbids the padding that makes cold outreach read as
+   template — no "hope this finds you well", no flattery preamble. The hook is
+   the opening line because that's the whole point of having researched it. */
+const OUTREACH_SYSTEM = `You draft short, specific outreach emails for a freelance/in-house graphic designer approaching companies about work.
+
+Hard rules:
+- Open with the specific hook you're given. Never open with "I came across your company" or similar.
+- 90-130 words in the body. Shorter is better than longer.
+- No "I hope this finds you well", no flattery preamble, no buzzwords.
+- One clear, low-friction ask at the end (a short call, or a reply if there's a fit).
+- Sound like a person writing one email, not a campaign.
+- If the hook is thin, say less rather than inventing detail. Never fabricate facts about the company, its funding, its people, or its work.
+
+Return EXACTLY this shape and nothing else:
+Subject: <subject line>
+
+<email body>`;
 
 /* ---------- supabase rpc ---------- */
 async function rpc(fn, args, timeoutMs = 6000) {
@@ -3828,7 +3978,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       };
     }, "🎯 Pulled into the pool");
   };
-  const removeFromBench = (id) => mutate((s) => ({ ...s, poolBench: (s.poolBench || []).filter((b) => b.id !== id) }), "Removed from bench");
+  const removeFromBench = (id) => mutate((s) => ({ ...s, poolBench: (s.poolBench || []).filter((b) => b.id !== id), deletedIds: tombstones(s, [id]) }), "Removed from bench");
   /* writing the hook IS the discovery event — stamping researchedAt is what
      makes it count toward discovery-week progress */
   const setPoolHook = (id, hook, kind) =>
@@ -3879,10 +4029,60 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     }
     mutate((s) =>
       ref.kind === "account"
-        ? { ...s, accounts: (s.accounts || []).filter((a) => a.id !== ref.id) }
-        : { ...s, applications: s.applications.filter((a) => a.id !== ref.id) },
+        ? { ...s, accounts: (s.accounts || []).filter((a) => a.id !== ref.id), deletedIds: tombstones(s, [ref.id, ...((e.contacts || []).map((c) => c.id))]) }
+        : { ...s, applications: s.applications.filter((a) => a.id !== ref.id), deletedIds: tombstones(s, [ref.id]) },
       "Removed from pool"
     );
+  };
+
+  /* ---- outreach drafting ----
+     Runs on ONE pool member at a time, from its hook. Deliberately not a bulk
+     "draft all" button: forty near-identical AI emails is exactly the campaign
+     the hook exists to avoid, and the drafts are meant to be edited before
+     sending. The result is saved on the record so reopening doesn't re-bill
+     the API for the same thing. */
+  const [draftModal, setDraftModal] = useState(null); /* { member, text, loading, error } */
+  const draftOutreach = async (member, opts = {}) => {
+    const ref = member.refs[0];
+    if (!ref) return;
+    const hook = (member.hook || "").trim();
+    if (!hook) return flash("Write the hook first — that's what the draft opens with");
+    const existing = ref.entry?.outreachDraft;
+    if (existing && !opts.regenerate) return setDraftModal({ member, text: existing, loading: false, error: "" });
+
+    setDraftModal({ member, text: "", loading: true, error: "" });
+    const e = ref.entry;
+    const contacts = ref.kind === "account" ? (e.contacts || []).filter((c) => !c.archivedAt) : [];
+    const who = contacts.length ? contacts.map((c) => `${c.name || "unnamed"}${c.position ? ` (${c.position})` : ""}`).join(", ") : "";
+    const lines = [
+      `Company: ${member.company}`,
+      `Hook (the specific thing you researched): ${hook}`,
+      ref.kind === "application" && e.role ? `Role being applied for: ${e.role}` : "",
+      who ? `Contact(s) at the company: ${who}` : "",
+      e.industry ? `Industry: ${e.industry}` : "",
+      e.notes ? `Other notes: ${String(e.notes).slice(0, 400)}` : "",
+      "",
+      `About the sender: ${state.settings?.aiPitch || "A graphic designer looking for in-house or contract work. No positioning paragraph was provided, so keep claims about the sender minimal and generic rather than inventing specifics."}`,
+    ].filter(Boolean);
+
+    try {
+      const text = await callAI({
+        provider: state.settings?.aiProvider,
+        model: state.settings?.aiModel,
+        baseUrl: state.settings?.aiBaseUrl,
+        key: readAiKey(),
+        system: OUTREACH_SYSTEM,
+        user: lines.join("\n"),
+      });
+      setDraftModal({ member, text, loading: false, error: "" });
+      mutate((st) =>
+        ref.kind === "account"
+          ? { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
+          : { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
+      );
+    } catch (err) {
+      setDraftModal({ member, text: "", loading: false, error: err?.message || "Draft failed" });
+    }
   };
 
   /* opens whichever record backs this member — application or account */
@@ -3949,7 +4149,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <>
             <Label>Need a hook ({byReadiness.parked.length})</Label>
             {byReadiness.parked.map((m) => (
-              <PoolRow key={m.key} member={m} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} />
+              <PoolRow key={m.key} member={m} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} />
             ))}
           </>
         )}
@@ -3958,7 +4158,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <>
             <Label style={{ marginTop: 14 }}>Ready to write ({byReadiness.hooked.length})</Label>
             {byReadiness.hooked.map((m) => (
-              <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} />
+              <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} />
             ))}
           </>
         )}
@@ -4041,17 +4241,19 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     mutate((s) => {
       let applications = s.applications.slice();
       const accounts = [];
+      const convertedIds = [];
       ids.forEach((id) => {
         const app = applications.find((a) => a.id === id);
         if (!app || app.fromAccountContact) return; /* already account-linked — nothing to convert */
         applications = applications.filter((a) => a.id !== id);
+        convertedIds.push(id); /* the original row is gone — record it */
         const newAccount = convertApplicationToAccount(app);
         const synced = syncContactsToApplications(newAccount.company, newAccount.website, [], newAccount.contacts, applications);
         applications = synced.applications;
         accounts.push({ ...newAccount, contacts: synced.contacts });
         convertedCount++;
       });
-      return { ...s, applications, accounts: [...accounts, ...s.accounts] };
+      return { ...s, applications, accounts: [...accounts, ...s.accounts], deletedIds: tombstones(s, convertedIds) };
     }, "Converted to Accounts");
     return convertedCount;
   };
@@ -4069,13 +4271,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const { pendingApp, duplicateApp } = duplicateSuggestion;
     mutate((s) => {
       const applications = s.applications.filter((a) => a.id !== duplicateApp.id);
+      const mergedAwayId = duplicateApp.id; /* folded into an account — must not come back */
       const mergedAccounts = mergeApplicationIntoAccount(duplicateApp, pendingApp, s.accounts);
       const q = normCompanyName(duplicateApp.company);
       const affectedAccount = mergedAccounts.find((acc) => normCompanyName(acc.company) === q);
       const oldAccountContacts = s.accounts.find((acc) => normCompanyName(acc.company) === q)?.contacts || [];
       const synced = syncContactsToApplications(affectedAccount.company, affectedAccount.website, oldAccountContacts, affectedAccount.contacts, applications);
       const accounts = mergedAccounts.map((acc) => (acc.id === affectedAccount.id ? { ...acc, contacts: synced.contacts } : acc));
-      return { ...s, applications: synced.applications, accounts };
+      return { ...s, applications: synced.applications, accounts, deletedIds: tombstones(s, [mergedAwayId, ...(synced.removedIds || [])]) };
     }, "Merged into Account");
     setDuplicateSuggestion(null);
     flash("🏢 Merged into Account");
@@ -4195,6 +4398,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       note: a.fromAccountContact ? "This came from an account contact — deleting it will also reset that contact back to \"not contacted yet\" (status, date, and follow-ups cleared)." : null,
     });
   const askDeleteAccount = (acc) => setConfirmDelete({ kind: "account", id: acc.id, label: acc.company || "this account" });
+  /* records ids as deleted so the removal survives the next sync merge */
+  const tombstones = (s, ids) => [...ids.filter(Boolean).map((id) => ({ id, at: today() })), ...(s.deletedIds || [])];
+
   const executeConfirmedDelete = () => {
     if (!confirmDelete) return;
     const { kind, id, label } = confirmDelete;
@@ -4213,7 +4419,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               }))
             : s.accounts;
         if (deletedApp && deletedApp.postShot) edgeDelete("job-posts", deletedApp.postShot).catch(() => {});
-        return { ...s, applications: s.applications.filter((x) => x.id !== id), accounts };
+        return { ...s, applications: s.applications.filter((x) => x.id !== id), accounts, deletedIds: tombstones(s, [id]) };
       }, `Deleted ${label}`);
     } else if (kind === "account") {
       mutate((s) => {
@@ -4228,6 +4434,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ...s,
           accounts: s.accounts.filter((x) => x.id !== id),
           applications: linkedIds.size ? s.applications.filter((a) => !linkedIds.has(a.id)) : s.applications,
+          /* the account, every linked application, and every contact inside it */
+          deletedIds: tombstones(s, [id, ...linkedIds, ...(acc?.contacts || []).map((c) => c.id)]),
         };
       }, `Deleted ${label}`);
     }
@@ -4310,7 +4518,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       mutate((s) => {
         const oldContacts = entry?.contacts || [];
         const oldAppsById = new Map(s.applications.map((a) => [a.id, a]));
-        const { contacts: newContacts, applications: syncedApps } = syncContactsToApplications(data.company, data.website, oldContacts, data.contacts || [], s.applications);
+        const { contacts: newContacts, applications: syncedApps, removedIds: syncRemoved } = syncContactsToApplications(data.company, data.website, oldContacts, data.contacts || [], s.applications);
+        /* contacts removed from the account in this save */
+        const keptContactIds = new Set((data.contacts || []).map((c) => c.id));
+        const removedContactIds = (oldContacts || []).filter((c) => !keptContactIds.has(c.id)).map((c) => c.id);
 
         /* any application present before sync but gone after (a contact was removed
            from the account) may have had a screenshot attached — clean it up so it
@@ -4362,6 +4573,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ...s,
           accounts,
           applications: propagatedApps,
+          deletedIds: syncRemoved.length || removedContactIds.length ? tombstones(s, [...syncRemoved, ...removedContactIds]) : s.deletedIds,
           accomplishments: addWins.length ? [...addWins, ...s.accomplishments] : s.accomplishments,
           archivedCsvRows: newCsvRows.length ? [...s.archivedCsvRows, ...newCsvRows] : s.archivedCsvRows,
         };
@@ -4423,6 +4635,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         "Runway recalculated — check-in recorded"
       );
     } else if (kind === "checkinDay") {
+      /* the key is deliberately kept OUT of the synced state object */
+      if (typeof data.aiKey === "string") writeAiKey(data.aiKey.trim());
       mutate(
         (s) => ({
           ...s,
@@ -4435,6 +4649,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               .slice(0, 10) || DEFAULT_FOLLOWUPS,
             timezoneOffset: typeof data.timezoneOffset === "number" ? data.timezoneOffset : 8,
             followUpDailyCap: Math.max(0, Math.min(99, +data.followUpDailyCap || 0)),
+            aiProvider: data.aiProvider || "builtin",
+            aiModel: data.aiModel || "",
+            aiBaseUrl: data.aiBaseUrl || "",
+            aiPitch: data.aiPitch || "",
             autoArchiveStale: data.autoArchiveStale !== false,
             autoArchiveDays: Math.max(7, Math.min(365, +data.autoArchiveDays || HOUSEKEEPING_STALE_DAYS)),
             goalMode: data.goalMode === "pool" ? "pool" : "standard",
@@ -7804,7 +8022,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -7918,6 +8136,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           onClose={resolveDuplicateAsSeparate}
         />
       )}
+      {draftModal && (
+        <DraftModal
+          member={draftModal.member}
+          text={draftModal.text}
+          loading={draftModal.loading}
+          error={draftModal.error}
+          onClose={() => setDraftModal(null)}
+          onRegenerate={() => draftOutreach(draftModal.member, { regenerate: true })}
+        />
+      )}
       {reapplySuggestion && (
         <ReapplySuggestionModal
           pendingApp={reapplySuggestion.pendingApp}
@@ -7989,6 +8217,11 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         day: entry?.day ?? 1,
         followUpDefaults: (modal.followUpDefaults || DEFAULT_FOLLOWUPS).map(String),
         followUpDailyCap: String(modal.followUpDailyCap ?? DEFAULT_FOLLOWUP_DAILY_CAP),
+        aiProvider: modal.aiProvider || "builtin",
+        aiModel: modal.aiModel || "",
+        aiBaseUrl: modal.aiBaseUrl || "",
+        aiPitch: modal.aiPitch || "",
+        aiKey: readAiKey(),
         autoArchiveStale: modal.autoArchiveStale !== false,
         autoArchiveDays: String(modal.autoArchiveDays ?? HOUSEKEEPING_STALE_DAYS),
         goalMode: modal.goalMode === "pool" ? "pool" : "standard",
@@ -8873,6 +9106,74 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               onChange={(e) => set("followUpDailyCap")(e.target.value)}
               style={{ ...inputStyle, width: 90, fontFamily: mono, padding: "8px 10px", marginBottom: 16 }}
             />
+
+            <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <Label>🤖 AI provider — outreach drafting</Label>
+              <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+                Drafts a first email from a pool company&apos;s hook. Built-in needs no key. Choosing your own provider keeps the key in this browser only — it is never
+                synced, so it won&apos;t follow you to another device, and anyone using this browser profile can read it.
+              </div>
+              {Object.entries(AI_PROVIDERS).map(([key, prov]) => (
+                <button
+                  key={key}
+                  onClick={() => set("aiProvider")(key)}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    textAlign: "left",
+                    background: f.aiProvider === key ? "rgba(96,165,250,0.1)" : "transparent",
+                    border: `1px solid ${f.aiProvider === key ? C.blue : C.panelEdge}`,
+                    color: f.aiProvider === key ? C.blue : C.muted,
+                    borderRadius: 10,
+                    padding: "9px 12px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                    marginBottom: 6,
+                  }}
+                >
+                  {f.aiProvider === key ? "◉" : "○"} {prov.label}
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{prov.sub}</div>
+                </button>
+              ))}
+
+              {AI_PROVIDERS[f.aiProvider]?.needsKey && (
+                <>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 6 }}>API key (stored in this browser only)</div>
+                  <input
+                    type="password"
+                    value={f.aiKey}
+                    onChange={(e) => set("aiKey")(e.target.value)}
+                    placeholder={f.aiProvider === "anthropic" ? "sk-ant-…" : "sk-…"}
+                    style={{ ...inputStyle, fontFamily: mono, fontSize: 12 }}
+                    autoComplete="off"
+                  />
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 8 }}>Model</div>
+                  <input
+                    value={f.aiModel}
+                    onChange={(e) => set("aiModel")(e.target.value)}
+                    placeholder={AI_PROVIDERS[f.aiProvider]?.defaultModel || "model name"}
+                    style={{ ...inputStyle, fontFamily: mono, fontSize: 12 }}
+                  />
+                  {f.aiProvider === "custom" && (
+                    <>
+                      <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 8 }}>Base URL (OpenAI-compatible, without /chat/completions)</div>
+                      <input value={f.aiBaseUrl} onChange={(e) => set("aiBaseUrl")(e.target.value)} placeholder="https://openrouter.ai/api/v1" style={{ ...inputStyle, fontFamily: mono, fontSize: 12 }} />
+                    </>
+                  )}
+                </>
+              )}
+
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 10 }}>Your positioning — one paragraph</div>
+              <textarea
+                value={f.aiPitch}
+                onChange={(e) => set("aiPitch")(e.target.value)}
+                placeholder="e.g. Graphic designer, 6 years in SaaS and fintech brand + product design. Remote from the Philippines, working with AU/US teams. Strong on design systems and shipping fast with small teams."
+                style={{ ...inputStyle, minHeight: 78, resize: "vertical", fontSize: 13, marginBottom: 16 }}
+              />
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: -10, marginBottom: 16 }}>
+                Without this the drafts are generic. It never leaves your device except in the drafting request itself.
+              </div>
+            </div>
 
             <Label>🗄 File applications that never got an answer</Label>
             <button
@@ -10202,6 +10503,75 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    During reachout weeks the pool is closed, so the control becomes a bench
    parking slip instead of disappearing — capturing a name shouldn't require
    fighting the app. */
+function DraftModal({ member, text, loading, error, onClose, onRegenerate }) {
+  const [copied, setCopied] = useState(false);
+  const [edited, setEdited] = useState(text || "");
+  useEffect(() => setEdited(text || ""), [text]);
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 55, padding: 16 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 480, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 18, boxSizing: "border-box", maxHeight: "88vh", overflowY: "auto" }}
+      >
+        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 4 }}>✍ Draft — {member.company}</div>
+        <div style={{ fontSize: 12, color: C.amber, lineHeight: 1.45, marginBottom: 12 }}>{member.hook}</div>
+
+        {loading && <div style={{ color: C.muted, fontSize: 13, padding: "18px 0", textAlign: "center" }}>Drafting…</div>}
+        {error && (
+          <div style={{ background: "rgba(248,113,113,0.08)", border: `1px solid ${C.red}`, borderRadius: 10, padding: "10px 12px", fontSize: 12, color: C.red, lineHeight: 1.5, marginBottom: 12 }}>
+            {error}
+          </div>
+        )}
+
+        {!loading && !error && (
+          <>
+            <textarea
+              value={edited}
+              onChange={(e) => setEdited(e.target.value)}
+              style={{ ...inputStyle, minHeight: 260, resize: "vertical", fontSize: 13, lineHeight: 1.6, fontFamily: sans }}
+            />
+            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, margin: "6px 0 12px" }}>
+              A draft, not a send. Check every factual claim about the company before it goes out — a wrong detail in the first line is worse than no first line.
+            </div>
+          </>
+        )}
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn ghost onClick={onClose} style={{ flex: 1 }}>
+            Close
+          </Btn>
+          {!loading && (
+            <Btn ghost onClick={onRegenerate} style={{ flex: 1 }}>
+              ↻ Redraft
+            </Btn>
+          )}
+          {!loading && !error && (
+            <Btn
+              onClick={() => {
+                (navigator.clipboard?.writeText(edited) || Promise.reject()).then(
+                  () => {
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 1600);
+                  },
+                  () => {}
+                );
+              }}
+              style={{ flex: 1 }}
+            >
+              {copied ? "✓ Copied" : "Copy"}
+            </Btn>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PoolAdd({ open, onAddApplication, onAddAccount, onPark }) {
   const [name, setName] = useState("");
   const park = () => {
@@ -10262,7 +10632,7 @@ function PoolAdd({ open, onAddApplication, onAddAccount, onPark }) {
 /* one pool member. The hook is editable inline because writing it IS the
    discovery event — making that a modal trip would be friction on the exact
    action the whole cycle is built around. */
-function PoolRow({ member, badge, onHook, onOpen, onRemove }) {
+function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft }) {
   const [draft, setDraft] = useState(member.hook || "");
   const dirty = draft !== (member.hook || "");
   const ref = member.refs[0];
@@ -10303,6 +10673,17 @@ function PoolRow({ member, badge, onHook, onOpen, onRemove }) {
         {dirty && (
           <Btn onClick={save} style={{ padding: "7px 11px", fontSize: 12, flexShrink: 0 }}>
             Save
+          </Btn>
+        )}
+        {/* drafting only makes sense once there's a hook to open with */}
+        {!dirty && onDraft && (member.hook || "").trim() && (
+          <Btn
+            ghost
+            onClick={() => onDraft(member)}
+            title={ref?.entry?.outreachDraft ? "View the saved draft" : "Draft an email from this hook"}
+            style={{ padding: "7px 10px", fontSize: 12, flexShrink: 0, color: ref?.entry?.outreachDraft ? C.blue : C.muted, borderColor: ref?.entry?.outreachDraft ? C.blue : C.panelEdge }}
+          >
+            {ref?.entry?.outreachDraft ? "✍ Draft ✓" : "✍ Draft"}
           </Btn>
         )}
       </div>
