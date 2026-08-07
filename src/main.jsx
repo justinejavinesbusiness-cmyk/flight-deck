@@ -2091,6 +2091,7 @@ function migrate(saved) {
   /* who you are, in one paragraph — without this the drafts are generic */
   if (typeof s.settings.aiPitch !== "string") s.settings.aiPitch = "";
   if (typeof s.settings.aiWebSearch !== "boolean") s.settings.aiWebSearch = true;
+  if (typeof s.settings.aiMaxTokens !== "number") s.settings.aiMaxTokens = AI_MAX_TOKENS_DEFAULT;
   s.settings.draftSections = normDraftSections(s.settings.draftSections);
   if (typeof s.settings.autoArchiveDays !== "number") s.settings.autoArchiveDays = HOUSEKEEPING_STALE_DAYS;
   /* "standard" = the original N-over-N-days quota. "pool" = coverage pacing
@@ -2371,8 +2372,10 @@ function stripReasoning(raw) {
    max_tokens is generous because reasoning models spend most of their budget
    thinking before they write anything; a tight cap produced responses that
    were ONLY scratchpad, with the email never reaching the page. */
-const AI_MAX_TOKENS = 3000;
-async function callAI({ provider, model, baseUrl, key, system, user, webSearch }) {
+const AI_MAX_TOKENS_DEFAULT = 4000;
+const clampTokens = (n) => Math.max(500, Math.min(16000, +n || AI_MAX_TOKENS_DEFAULT));
+async function callAI({ provider, model, baseUrl, key, system, user, webSearch, maxTokens }) {
+  const cap = clampTokens(maxTokens);
   const prov = provider || "builtin";
   if (prov === "builtin") {
     const res = await fetch("/api/coach", {
@@ -2415,12 +2418,15 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch }
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data?.error?.message || `Anthropic error ${res.status}`);
-    return stripReasoning(
+    const aText = stripReasoning(
       (data.content || [])
         .filter((b) => b.type === "text")
         .map((b) => b.text)
         .join("\n")
     );
+    if (!aText && data.stop_reason === "max_tokens") throw new Error(`Hit the ${cap}-token limit before writing anything. Raise it in Settings, or use a non-reasoning model.`);
+    if (!aText) throw new Error("The model returned nothing usable. Try Redraft, or a different model.");
+    return aText;
   }
 
   /* openai and custom share the chat-completions shape */
@@ -2430,7 +2436,7 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch }
     headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
     body: JSON.stringify({
       model: model || AI_PROVIDERS.openai.defaultModel,
-      max_tokens: AI_MAX_TOKENS,
+      max_tokens: cap,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -2444,7 +2450,7 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch }
   const text = stripReasoning(data.choices?.[0]?.message?.content || "");
   if (!text) {
     const reason = data.choices?.[0]?.finish_reason;
-    if (reason === "length") throw new Error("The model used its whole budget thinking and never wrote the email. Try a non-reasoning model, or a smaller one.");
+    if (reason === "length") throw new Error(`Hit the ${cap}-token limit before writing anything. Raise it in Settings, or use a non-reasoning model.`);
     throw new Error("The model returned nothing usable. Try Redraft, or a different model.");
   }
   return text;
@@ -2568,6 +2574,10 @@ function assembleDraft(raw, secs) {
   let m;
   while ((m = re.exec(raw || ""))) got[m[1]] = m[2].trim();
   const pick = (id) => (secs[id].mode === "fixed" ? secs[id].text.trim() : got[id] || "");
+  /* Which AI-mode sections came back empty. Without this the fixed sections
+     assemble into something that LOOKS like a finished email — the exact
+     failure that made a missing subject and opening look like a normal draft. */
+  const missing = DRAFT_SECTION_DEFS.filter((d) => secs[d.id].mode === "ai" && !pick(d.id)).map((d) => d.label);
   const subject = pick("subject");
   const body = DRAFT_SECTION_DEFS.filter((d) => d.id !== "subject")
     .map((d) => pick(d.id))
@@ -2575,8 +2585,8 @@ function assembleDraft(raw, secs) {
     .join("\n\n");
   /* if the model ignored the markers entirely, fall back to its raw text so a
      usable draft still reaches the screen rather than an empty box */
-  if (!subject && !body) return (raw || "").trim();
-  return `${subject ? `Subject: ${subject}\n\n` : ""}${body}`;
+  if (!subject && !body) return { text: (raw || "").trim(), missing };
+  return { text: `${subject ? `Subject: ${subject}\n\n` : ""}${body}`, missing };
 }
 
 /* ---------- supabase rpc ---------- */
@@ -4202,20 +4212,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      sending. The result is saved on the record so reopening doesn't re-bill
      the API for the same thing. */
   const [draftModal, setDraftModal] = useState(null); /* { member, text, loading, error } */
-  const draftOutreach = async (member, opts = {}) => {
+  const [bulkDraft, setBulkDraft] = useState(null); /* { total, done, current, errors, running } */
+  const bulkStop = useRef(false);
+
+  /* One generator, used by both the single ✍ button and the bulk run, so a
+     bulk draft is never a lower-grade version of a manual one. */
+  const generateDraft = async (member) => {
     const ref = member.refs[0];
-    if (!ref) return;
     const hook = (member.hook || "").trim();
-    if (!hook) return flash("Write the hook first, or type \u201cgeneric\u201d to let the AI handle it");
     const generic = isGenericHook(hook);
-    /* only Anthropic can actually search from here; anything else asked to
-       "research" would be guessing out loud */
     const canSearch = state.settings?.aiProvider === "anthropic" && state.settings?.aiWebSearch !== false;
     const secs = normDraftSections(state.settings?.draftSections);
-    const existing = ref.entry?.outreachDraft;
-    if (existing && !opts.regenerate) return setDraftModal({ member, text: existing, loading: false, error: "" });
-
-    setDraftModal({ member, text: "", loading: true, error: "" });
     const e = ref.entry;
     const contacts = ref.kind === "account" ? (e.contacts || []).filter((c) => !c.archivedAt) : [];
     const who = contacts.length ? contacts.map((c) => `${c.name || "unnamed"}${c.position ? ` (${c.position})` : ""}`).join(", ") : "";
@@ -4229,31 +4236,73 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       "",
       `About the sender: ${state.settings?.aiPitch || "A graphic designer looking for in-house or contract work. No positioning paragraph was provided, so keep claims about the sender minimal and generic rather than inventing specifics."}`,
     ].filter(Boolean);
+    const raw = await callAI({
+      provider: state.settings?.aiProvider,
+      model: state.settings?.aiModel,
+      baseUrl: state.settings?.aiBaseUrl,
+      key: readAiKey(),
+      system: `${generic ? (canSearch ? OUTREACH_SYSTEM_GENERIC_SEARCH : OUTREACH_SYSTEM_GENERIC_NOSEARCH) : OUTREACH_SYSTEM}\n\n=== SECTIONS ===\n${buildSectionInstructions(secs)}`,
+      user: lines.join("\n"),
+      webSearch: generic && canSearch,
+      maxTokens: state.settings?.aiMaxTokens,
+    });
+    const m = raw.match(/^\s*Hook:\s*(.+)$/im);
+    const foundHook = m && !/^none found$/i.test(m[1].trim()) ? m[1].trim() : "";
+    const { text, missing } = assembleDraft(raw.replace(/^\s*Hook:.*$/im, "").trim(), secs);
+    return { text, missing, foundHook, generic, searched: generic && canSearch };
+  };
 
+  const saveDraftToRecord = (ref, text) =>
+    mutate((st) =>
+      ref.kind === "account"
+        ? { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
+        : { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
+    );
+
+  /* ---- bulk drafting ----
+     Sequential on purpose. Parallel requests trip provider rate limits, and
+     more importantly a queue you can WATCH is a queue you can stop when the
+     first two come back wrong — which is the actual failure mode of drafting
+     forty emails at once. Skips anything already drafted so a re-run costs
+     nothing, and never touches a company without a hook. */
+  const runBulkDraft = async (members) => {
+    const queue = members.filter((m) => (m.hook || "").trim() && !m.refs[0]?.entry?.outreachDraft);
+    if (!queue.length) return flash("Everything hooked already has a draft");
+    bulkStop.current = false;
+    setBulkDraft({ total: queue.length, done: 0, current: queue[0].company, errors: [], running: true });
+    const errors = [];
+    for (let i = 0; i < queue.length; i++) {
+      if (bulkStop.current) break;
+      const member = queue[i];
+      setBulkDraft((b) => ({ ...b, done: i, current: member.company }));
+      try {
+        const { text, missing } = await generateDraft(member);
+        if (missing.length) errors.push(`${member.company}: missing ${missing.join(", ")}`);
+        saveDraftToRecord(member.refs[0], text);
+      } catch (err) {
+        errors.push(`${member.company}: ${err?.message || "failed"}`);
+      }
+      /* a breath between calls keeps provider rate limits happy */
+      if (i < queue.length - 1 && !bulkStop.current) await new Promise((r) => setTimeout(r, 700));
+    }
+    setBulkDraft((b) => ({ ...b, done: b ? b.total : 0, current: "", errors, running: false, stopped: bulkStop.current }));
+  };
+
+  const draftOutreach = async (member, opts = {}) => {
+    const ref = member.refs[0];
+    if (!ref) return;
+    const hook = (member.hook || "").trim();
+    if (!hook) return flash("Write the hook first, or type \u201cgeneric\u201d to let the AI handle it");
+    const existing = ref.entry?.outreachDraft;
+    if (existing && !opts.regenerate) return setDraftModal({ member, text: existing, loading: false, error: "" });
+
+    setDraftModal({ member, text: "", loading: true, error: "" });
     try {
-      const raw = await callAI({
-        provider: state.settings?.aiProvider,
-        model: state.settings?.aiModel,
-        baseUrl: state.settings?.aiBaseUrl,
-        key: readAiKey(),
-        system: `${generic ? (canSearch ? OUTREACH_SYSTEM_GENERIC_SEARCH : OUTREACH_SYSTEM_GENERIC_NOSEARCH) : OUTREACH_SYSTEM}\n\n=== SECTIONS ===\n${buildSectionInstructions(secs)}`,
-        user: lines.join("\n"),
-        webSearch: generic && canSearch,
-      });
-      /* in searched-generic mode the model reports the hook it found on the
-         first line, so it can be saved back rather than lost in the email */
-      const m = raw.match(/^\s*Hook:\s*(.+)$/im);
-      const foundHook = m && !/^none found$/i.test(m[1].trim()) ? m[1].trim() : "";
-      /* fixed sections are spliced in here, not written by the model */
-      const text = assembleDraft(raw.replace(/^\s*Hook:.*$/im, "").trim(), secs);
-      setDraftModal({ member, text, loading: false, error: "", foundHook, searched: generic && canSearch, generic });
-      mutate((st) =>
-        ref.kind === "account"
-          ? { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
-          : { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
-      );
+      const { text, missing, foundHook, generic, searched } = await generateDraft(member);
+      setDraftModal({ member, text, loading: false, error: "", foundHook, searched, generic, missing });
+      saveDraftToRecord(ref, text);
     } catch (err) {
-      setDraftModal({ member, text: "", loading: false, error: err?.message || "Draft failed", generic });
+      setDraftModal({ member, text: "", loading: false, error: err?.message || "Draft failed", generic: isGenericHook(hook) });
     }
   };
 
@@ -4367,16 +4416,68 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </div>
           ))}
 
-        {view === "hooked" &&
-          (byReadiness.hooked.length ? (
+        {view === "hooked" && (() => {
+          const undrafted = byReadiness.hooked.filter((m) => !m.refs[0]?.entry?.outreachDraft);
+          const b = bulkDraft;
+          if (b && b.running)
+            return (
+              <div style={{ background: "rgba(96,165,250,0.08)", border: `1px solid ${C.blue}`, borderRadius: 12, padding: "12px 14px", marginBottom: 12 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: C.blue }}>
+                  Drafting {b.done + 1} of {b.total}
+                </div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>{b.current}</div>
+                <div style={{ height: 6, background: C.bg, borderRadius: 3, marginTop: 8, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
+                  <div style={{ height: "100%", width: `${Math.round((b.done / b.total) * 100)}%`, background: C.blue, borderRadius: 3, transition: "width 0.3s ease" }} />
+                </div>
+                <Btn ghost onClick={() => (bulkStop.current = true)} style={{ marginTop: 10, width: "100%" }}>
+                  Stop after this one
+                </Btn>
+              </div>
+            );
+          return (
+            <>
+              {b && !b.running && (
+                <div style={{ background: C.panel, border: `1px solid ${b.errors.length ? C.amber : C.green}`, borderRadius: 12, padding: "11px 14px", marginBottom: 12 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: b.errors.length ? C.amber : C.green }}>
+                    {b.stopped ? "Stopped" : "Done"} — {b.done} drafted
+                    {b.errors.length ? `, ${b.errors.length} with problems` : ""}
+                  </div>
+                  {b.errors.slice(0, 5).map((e, i) => (
+                    <div key={i} style={{ fontSize: 11, color: C.muted, marginTop: 4, lineHeight: 1.45 }}>
+                      • {e}
+                    </div>
+                  ))}
+                  <Btn ghost onClick={() => setBulkDraft(null)} style={{ marginTop: 8, padding: "6px 11px", fontSize: 12 }}>
+                    Dismiss
+                  </Btn>
+                </div>
+              )}
+              {undrafted.length > 0 && (
+                <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "11px 14px", marginBottom: 12 }}>
+                  <div style={{ fontSize: 13, color: C.ink, lineHeight: 1.5 }}>
+                    <strong>{undrafted.length}</strong> hooked {undrafted.length === 1 ? "company has" : "companies have"} no draft yet.
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 3 }}>
+                    Runs one at a time so you can watch the first few and stop if they come back wrong. Each still needs opening and editing before it goes anywhere — these
+                    are drafts, and a batch of them is worth less than three you actually rewrote.
+                  </div>
+                  <Btn onClick={() => runBulkDraft(byReadiness.hooked)} style={{ width: "100%", marginTop: 10 }}>
+                    ✍ Draft all {undrafted.length}
+                  </Btn>
+                </div>
+              )}
+              {byReadiness.hooked.length ? (
             byReadiness.hooked.map((m) => (
               <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} />
             ))
-          ) : (
-            <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
-              Nothing hooked and unwritten yet. Write hooks in &ldquo;Need a hook&rdquo; and they land here.
-            </div>
-          ))}
+              ) : (
+                <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
+                  Nothing hooked and unwritten yet. Write hooks in &ldquo;Need a hook&rdquo; and they land here.
+                </div>
+              )}
+            </>
+          );
+        })()}
 
         {view === "contacted" &&
           (byReadiness.contacted.length ? (
@@ -4878,6 +4979,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             aiBaseUrl: data.aiBaseUrl || "",
             aiPitch: data.aiPitch || "",
             aiWebSearch: data.aiWebSearch !== false,
+            aiMaxTokens: clampTokens(data.aiMaxTokens),
             draftSections: normDraftSections(data.draftSections),
             autoArchiveStale: data.autoArchiveStale !== false,
             autoArchiveDays: Math.max(7, Math.min(365, +data.autoArchiveDays || HOUSEKEEPING_STALE_DAYS)),
@@ -8248,7 +8350,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiWebSearch: state.settings?.aiWebSearch, draftSections: state.settings?.draftSections, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiWebSearch: state.settings?.aiWebSearch, aiMaxTokens: state.settings?.aiMaxTokens, draftSections: state.settings?.draftSections, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -8368,6 +8470,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           text={draftModal.text}
           loading={draftModal.loading}
           error={draftModal.error}
+          missing={draftModal.missing}
           foundHook={draftModal.foundHook}
           searched={draftModal.searched}
           generic={draftModal.generic}
@@ -8458,6 +8561,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         aiPitch: modal.aiPitch || "",
         aiKey: readAiKey(),
         aiWebSearch: modal.aiWebSearch !== false,
+        aiMaxTokens: String(modal.aiMaxTokens ?? AI_MAX_TOKENS_DEFAULT),
         draftSections: normDraftSections(modal.draftSections),
         autoArchiveStale: modal.autoArchiveStale !== false,
         autoArchiveDays: String(modal.autoArchiveDays ?? HOUSEKEEPING_STALE_DAYS),
@@ -9426,6 +9530,19 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   </div>
                 </>
               )}
+
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 10 }}>Token limit per draft</div>
+              <input
+                type="number"
+                inputMode="numeric"
+                value={f.aiMaxTokens}
+                onChange={(e) => set("aiMaxTokens")(e.target.value)}
+                style={{ ...inputStyle, width: 110, fontFamily: mono, padding: "8px 10px" }}
+              />
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4, marginBottom: 10 }}>
+                500–16000. An email needs perhaps 300, but reasoning models spend most of the budget thinking before they write a word — if drafts come back missing their
+                subject and opening, this is usually why. Raising it costs more per draft.
+              </div>
 
               <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 10 }}>Your positioning — one paragraph</div>
               <textarea
@@ -10830,7 +10947,7 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    During reachout weeks the pool is closed, so the control becomes a bench
    parking slip instead of disappearing — capturing a name shouldn't require
    fighting the app. */
-function DraftModal({ member, text, loading, error, onClose, onRegenerate, foundHook, searched, generic, onSaveHook }) {
+function DraftModal({ member, text, loading, error, onClose, onRegenerate, foundHook, searched, generic, onSaveHook, missing }) {
   const [copied, setCopied] = useState(false);
   const [edited, setEdited] = useState(text || "");
   useEffect(() => setEdited(text || ""), [text]);
@@ -10874,6 +10991,12 @@ function DraftModal({ member, text, loading, error, onClose, onRegenerate, found
           </div>
         )}
 
+        {!loading && !error && missing && missing.length > 0 && (
+          <div style={{ background: "rgba(248,113,113,0.08)", border: `1px solid ${C.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12, fontSize: 12, color: C.red, lineHeight: 1.55 }}>
+            ⚠ The model didn&apos;t return: <strong>{missing.join(", ")}</strong>. What&apos;s below is only your fixed sections. Hit Redraft — if it keeps happening, raise the
+            token limit in Settings or switch to a non-reasoning model.
+          </div>
+        )}
         {!loading && !error && (
           <>
             <textarea
