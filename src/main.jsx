@@ -2842,6 +2842,10 @@ export default function FlightDeck() {
   /* Due tab: whether the follow-ups queued behind today's capped batch are
      expanded. Defaults collapsed so the tab opens as a doable list. */
   const [showQueuedDue, setShowQueuedDue] = useState(false);
+  /* which pool list is showing. Seeded once from the cycle phase so the tab
+     opens on whatever the week is actually asking for, then left alone —
+     re-deriving it would yank the view out from under you mid-session. */
+  const [poolView, setPoolView] = useState(null);
   useEffect(() => setPipePage(0), [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
   /* bulk selection for converting applications to accounts */
   const [selectMode, setSelectMode] = useState(false);
@@ -4181,6 +4185,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const pg = computePoolGoal(state, apps);
     const phase = pg.phase;
     const open = phase === "discovery";
+    /* discovery week is about producing hooks; reachout week is about spending
+       them, so each opens on the list you'd otherwise have to go find. Derived
+       rather than set during render — assigning state mid-render is the kind of
+       thing that works until it doesn't. */
+    const view = poolView || (open ? "parked" : "hooked");
     const members = poolMembers(state, apps);
     const byReadiness = { parked: [], hooked: [], contacted: [] };
     members.forEach((m) => byReadiness[memberReadiness(m)].push(m));
@@ -4223,40 +4232,91 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         </div>
 
-        <PoolAdd
-          open={open}
-          onAddApplication={() => openPoolForm("application")}
-          onAddAccount={() => openPoolForm("account")}
-          onPark={(n) => addToPool(n, "", "application")}
-        />
+        {/* ---- segmented list ----
+            A 45-company pool made every section a scroll: hooked entries sat
+            below the un-hooked ones and the bench was at the very bottom, so
+            reaching the thing you wanted meant passing everything you didn't.
+            One list at a time, with the counts always visible up top. */}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+          {[
+            ["parked", `Need a hook (${byReadiness.parked.length})`, C.amber],
+            ["hooked", `✍ Ready to write (${byReadiness.hooked.length})`, C.blue],
+            ["contacted", `✓ Graduated (${byReadiness.contacted.length})`, C.green],
+            ["bench", `🪑 Bench (${bench.length})`, C.muted],
+          ].map(([key, label, col]) => (
+            <button
+              key={key}
+              onClick={() => setPoolView(key)}
+              style={{
+                fontFamily: sans,
+                fontSize: 12,
+                fontWeight: 700,
+                padding: "7px 11px",
+                borderRadius: 20,
+                border: `1px solid ${view === key ? col : C.panelEdge}`,
+                background: view === key ? `${col}1f` : "transparent",
+                color: view === key ? col : C.muted,
+                cursor: "pointer",
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
 
-        {byReadiness.parked.length > 0 && (
-          <>
-            <Label>Need a hook ({byReadiness.parked.length})</Label>
-            {byReadiness.parked.map((m) => (
+        {view !== "bench" && view !== "contacted" && (
+          <PoolAdd
+            open={open}
+            onAddApplication={() => openPoolForm("application")}
+            onAddAccount={() => openPoolForm("account")}
+            onPark={(n) => addToPool(n, "", "application")}
+          />
+        )}
+
+        {view === "parked" &&
+          (byReadiness.parked.length ? (
+            byReadiness.parked.map((m) => (
               <PoolRow key={m.key} member={m} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} />
-            ))}
-          </>
-        )}
+            ))
+          ) : (
+            <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
+              {members.length ? "Every company in the pool has a hook. That's a write session waiting for you." : "The pool is empty — add the companies you'll work through this cycle."}
+            </div>
+          ))}
 
-        {byReadiness.hooked.length > 0 && (
-          <>
-            <Label style={{ marginTop: 14 }}>Ready to write ({byReadiness.hooked.length})</Label>
-            {byReadiness.hooked.map((m) => (
+        {view === "hooked" &&
+          (byReadiness.hooked.length ? (
+            byReadiness.hooked.map((m) => (
               <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} />
-            ))}
-          </>
-        )}
+            ))
+          ) : (
+            <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
+              Nothing hooked and unwritten yet. Write hooks in &ldquo;Need a hook&rdquo; and they land here.
+            </div>
+          ))}
 
-        {byReadiness.contacted.length > 0 && (
-          <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 14px", marginTop: 14 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: C.green }}>✓ {byReadiness.contacted.length} graduated</div>
-                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 2 }}>
-                  Contacted, so they're being worked in the pipeline now. Still counted here — coverage measures a fixed set.
-                </div>
+        {view === "contacted" &&
+          (byReadiness.contacted.length ? (
+            <>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.55, marginBottom: 10 }}>
+                Contacted, so they&apos;re being worked in the pipeline now. Still counted here — coverage measures a fixed set.
               </div>
+              {byReadiness.contacted.map((m) => (
+                <div
+                  key={m.key}
+                  onClick={() => openPoolMember(m)}
+                  style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", marginBottom: 6, cursor: "pointer", display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}
+                >
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 14, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <span style={{ marginRight: 5, fontSize: 12 }}>{m.kind === "account" ? "🏢" : "📋"}</span>
+                      {m.company}
+                    </div>
+                    {m.hook && <div style={{ fontSize: 12, color: C.muted, marginTop: 2, lineHeight: 1.4 }}>{m.hook}</div>}
+                  </div>
+                  <span style={{ fontFamily: mono, fontSize: 10, color: C.green, flexShrink: 0 }}>{m.firstContact || "contacted"}</span>
+                </div>
+              ))}
               <Btn
                 ghost
                 onClick={() => {
@@ -4264,53 +4324,49 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   setPipeFilter("fromPool");
                   setPipePage(0);
                 }}
-                style={{ padding: "7px 11px", fontSize: 12, flexShrink: 0 }}
+                style={{ width: "100%", marginTop: 8 }}
               >
-                View →
+                Open these in the pipeline →
               </Btn>
+            </>
+          ) : (
+            <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
+              Nobody contacted from this pool yet. Reachout weeks are where this fills up.
             </div>
-          </div>
-        )}
+          ))}
 
-        {members.length === 0 && (
-          <div style={{ color: C.muted, fontSize: 13, padding: "18px 4px", textAlign: "center", lineHeight: 1.6 }}>
-            The pool is empty. {open ? "Add the companies you'll work through this cycle — 40–50 in one or two sittings, then it closes." : "Discovery week has passed, so new names go to the bench."}
-          </div>
-        )}
-
-        <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px solid ${C.panelEdge}` }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-            <Label>🪑 Bench ({bench.length})</Label>
+        {view === "bench" && (
+          <>
             {bench.length > 0 && open && (
-              <Btn color={C.amber} onClick={() => pullFromBench(bench.slice(0, 5).map((b) => b.id))} style={{ padding: "6px 11px", fontSize: 12 }}>
-                Pull {Math.min(5, bench.length)} in
+              <Btn color={C.amber} onClick={() => pullFromBench(bench.slice(0, 5).map((b) => b.id))} style={{ width: "100%", marginBottom: 10 }}>
+                Pull {Math.min(5, bench.length)} into the pool
               </Btn>
             )}
-          </div>
-          {bench.length === 0 ? (
-            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55 }}>
-              Empty. When a company catches your eye during a reachout week, it lands here instead of breaking the pool — captured without acting on it.
-            </div>
-          ) : (
-            bench.map((b, i) => (
-              <div key={b.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.panel, border: `1px solid ${i < 5 && open ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 6 }}>
-                <div>
-                  <div style={{ fontSize: 14 }}>
-                    <span style={{ marginRight: 5, fontSize: 12 }}>{(b.kind || "application") === "account" ? "🏢" : "📋"}</span>
-                    {b.company}
-                  </div>
-                  <div style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>
-                    parked {b.addedAt}
-                    {i < 5 && open ? " · next in" : ""}
-                  </div>
-                </div>
-                <Btn ghost onClick={() => removeFromBench(b.id)} style={{ padding: "5px 9px", fontSize: 12 }}>
-                  ×
-                </Btn>
+            {bench.length === 0 ? (
+              <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
+                Empty. When a company catches your eye during a reachout week, it lands here instead of breaking the pool — captured without acting on it.
               </div>
-            ))
-          )}
-        </div>
+            ) : (
+              bench.map((b, i) => (
+                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: C.panel, border: `1px solid ${i < 5 && open ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 6 }}>
+                  <div>
+                    <div style={{ fontSize: 14 }}>
+                      <span style={{ marginRight: 5, fontSize: 12 }}>{(b.kind || "application") === "account" ? "🏢" : "📋"}</span>
+                      {b.company}
+                    </div>
+                    <div style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>
+                      parked {b.addedAt}
+                      {i < 5 && open ? " · next in" : ""}
+                    </div>
+                  </div>
+                  <Btn ghost onClick={() => removeFromBench(b.id)} style={{ padding: "5px 9px", fontSize: 12 }}>
+                    ×
+                  </Btn>
+                </div>
+              ))
+            )}
+          </>
+        )}
       </>
     );
   };
