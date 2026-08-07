@@ -2091,6 +2091,7 @@ function migrate(saved) {
   /* who you are, in one paragraph — without this the drafts are generic */
   if (typeof s.settings.aiPitch !== "string") s.settings.aiPitch = "";
   if (typeof s.settings.aiWebSearch !== "boolean") s.settings.aiWebSearch = true;
+  s.settings.draftSections = normDraftSections(s.settings.draftSections);
   if (typeof s.settings.autoArchiveDays !== "number") s.settings.autoArchiveDays = HOUSEKEEPING_STALE_DAYS;
   /* "standard" = the original N-over-N-days quota. "pool" = coverage pacing
      over Pool Mode's closed company set. */
@@ -2497,6 +2498,86 @@ Instead write a short, honest note that works without a hook: who the sender is,
 
 /* the sentinel the hook field understands */
 const isGenericHook = (h) => /^generic$/i.test((h || "").trim());
+
+/* ============================================================
+   DRAFT SECTIONS — what the AI writes and what it must not touch
+
+   The opening should change every time; the offer and the ask should not.
+   Those are the lines worth testing and keeping stable, and a model asked to
+   "include this ask" will paraphrase it — helpfully, and differently, every
+   single time.
+
+   So fixed sections are never sent through the model as text to reproduce.
+   The AI writes only its own sections; the email is assembled here, and your
+   wording is inserted byte-for-byte. That's the only way "consistent" actually
+   means consistent. The model still SEES your fixed text as context, so its
+   sections don't duplicate or contradict the ask.
+   ============================================================ */
+const DRAFT_SECTION_DEFS = [
+  { id: "subject", label: "Subject line", hint: "One line, specific, no clickbait" },
+  { id: "opening", label: "Opening — the hook", hint: "The researched detail. Almost always AI." },
+  { id: "bridge", label: "Why them / why you", hint: "Connects the hook to what you do" },
+  { id: "offer", label: "What you offer", hint: "Your standing pitch. Usually fixed." },
+  { id: "ask", label: "The ask", hint: "The one action you want. Usually fixed." },
+  { id: "signoff", label: "Sign-off", hint: "Name, link, portfolio. Almost always fixed." },
+];
+const DEFAULT_DRAFT_SECTIONS = {
+  subject: { mode: "ai", text: "" },
+  opening: { mode: "ai", text: "" },
+  bridge: { mode: "ai", text: "" },
+  offer: { mode: "fixed", text: "" },
+  ask: { mode: "fixed", text: "" },
+  signoff: { mode: "fixed", text: "" },
+};
+const normDraftSections = (raw) => {
+  const out = {};
+  DRAFT_SECTION_DEFS.forEach((d) => {
+    const v = raw?.[d.id] || {};
+    out[d.id] = { mode: v.mode === "fixed" ? "fixed" : "ai", text: typeof v.text === "string" ? v.text : "" };
+  });
+  return out;
+};
+/* a fixed section with no text is simply skipped — an empty slot shouldn't
+   leave a gap in the email or a stray blank line */
+const activeSections = (secs) => DRAFT_SECTION_DEFS.filter((d) => secs[d.id].mode === "ai" || secs[d.id].text.trim());
+
+/* Builds the instruction for exactly the sections the model is allowed to
+   write, using [[markers]] so each can be pulled back out and slotted into
+   place. */
+function buildSectionInstructions(secs) {
+  const aiIds = activeSections(secs).filter((d) => secs[d.id].mode === "ai");
+  const fixedIds = activeSections(secs).filter((d) => secs[d.id].mode === "fixed");
+  const lines = [];
+  lines.push("Write ONLY the sections listed below. Each must start with its marker on its own line.");
+  aiIds.forEach((d) => lines.push(`[[${d.id}]]  — ${d.label}: ${d.hint}`));
+  if (fixedIds.length) {
+    lines.push("");
+    lines.push("The following parts are already written and will be appended verbatim after yours. Do NOT rewrite, repeat, summarise or contradict them — and do not include your own version of them:");
+    fixedIds.forEach((d) => lines.push(`(${d.label}) ${secs[d.id].text.trim()}`));
+  }
+  lines.push("");
+  lines.push(`Keep your sections to roughly ${Math.max(40, 110 - fixedIds.length * 15)} words in total. Output nothing except the marked sections.`);
+  return lines.join("\n");
+}
+
+/* Pulls the [[marked]] blocks out and assembles the final email in section
+   order, substituting your fixed text unchanged. */
+function assembleDraft(raw, secs) {
+  const got = {};
+  const re = /\[\[(\w+)\]\]\s*([\s\S]*?)(?=\n\s*\[\[\w+\]\]|$)/g;
+  let m;
+  while ((m = re.exec(raw || ""))) got[m[1]] = m[2].trim();
+  const pick = (id) => (secs[id].mode === "fixed" ? secs[id].text.trim() : got[id] || "");
+  const subject = pick("subject");
+  const body = DRAFT_SECTION_DEFS.filter((d) => d.id !== "subject")
+    .map((d) => pick(d.id))
+    .filter(Boolean)
+    .join("\n\n");
+  /* if the model ignored the markers entirely, fall back to its raw text so a
+     usable draft still reaches the screen rather than an empty box */
+  if (!subject && !body) return (raw || "").trim();
+  return `${subject ? `Subject: ${subject}\n\n` : ""}${body}`;
+}
 
 /* ---------- supabase rpc ---------- */
 async function rpc(fn, args, timeoutMs = 6000) {
@@ -4130,6 +4211,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     /* only Anthropic can actually search from here; anything else asked to
        "research" would be guessing out loud */
     const canSearch = state.settings?.aiProvider === "anthropic" && state.settings?.aiWebSearch !== false;
+    const secs = normDraftSections(state.settings?.draftSections);
     const existing = ref.entry?.outreachDraft;
     if (existing && !opts.regenerate) return setDraftModal({ member, text: existing, loading: false, error: "" });
 
@@ -4154,7 +4236,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         model: state.settings?.aiModel,
         baseUrl: state.settings?.aiBaseUrl,
         key: readAiKey(),
-        system: generic ? (canSearch ? OUTREACH_SYSTEM_GENERIC_SEARCH : OUTREACH_SYSTEM_GENERIC_NOSEARCH) : OUTREACH_SYSTEM,
+        system: `${generic ? (canSearch ? OUTREACH_SYSTEM_GENERIC_SEARCH : OUTREACH_SYSTEM_GENERIC_NOSEARCH) : OUTREACH_SYSTEM}\n\n=== SECTIONS ===\n${buildSectionInstructions(secs)}`,
         user: lines.join("\n"),
         webSearch: generic && canSearch,
       });
@@ -4162,7 +4244,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
          first line, so it can be saved back rather than lost in the email */
       const m = raw.match(/^\s*Hook:\s*(.+)$/im);
       const foundHook = m && !/^none found$/i.test(m[1].trim()) ? m[1].trim() : "";
-      const text = raw.replace(/^\s*Hook:.*$/im, "").trim();
+      /* fixed sections are spliced in here, not written by the model */
+      const text = assembleDraft(raw.replace(/^\s*Hook:.*$/im, "").trim(), secs);
       setDraftModal({ member, text, loading: false, error: "", foundHook, searched: generic && canSearch, generic });
       mutate((st) =>
         ref.kind === "account"
@@ -4795,6 +4878,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             aiBaseUrl: data.aiBaseUrl || "",
             aiPitch: data.aiPitch || "",
             aiWebSearch: data.aiWebSearch !== false,
+            draftSections: normDraftSections(data.draftSections),
             autoArchiveStale: data.autoArchiveStale !== false,
             autoArchiveDays: Math.max(7, Math.min(365, +data.autoArchiveDays || HOUSEKEEPING_STALE_DAYS)),
             goalMode: data.goalMode === "pool" ? "pool" : "standard",
@@ -8164,7 +8248,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiWebSearch: state.settings?.aiWebSearch, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiWebSearch: state.settings?.aiWebSearch, draftSections: state.settings?.draftSections, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -8374,6 +8458,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         aiPitch: modal.aiPitch || "",
         aiKey: readAiKey(),
         aiWebSearch: modal.aiWebSearch !== false,
+        draftSections: normDraftSections(modal.draftSections),
         autoArchiveStale: modal.autoArchiveStale !== false,
         autoArchiveDays: String(modal.autoArchiveDays ?? HOUSEKEEPING_STALE_DAYS),
         goalMode: modal.goalMode === "pool" ? "pool" : "standard",
@@ -9351,6 +9436,69 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               />
               <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: -10, marginBottom: 16 }}>
                 Without this the drafts are generic. It never leaves your device except in the drafting request itself.
+              </div>
+
+              <Label>✂️ What the AI writes</Label>
+              <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+                Fixed sections are inserted word-for-word and never sent through the model to reproduce — asking it to &ldquo;include this ask&rdquo; gets you a helpful
+                paraphrase every time. Leave a fixed section empty to drop it from the email entirely.
+              </div>
+              {DRAFT_SECTION_DEFS.map((d) => {
+                const sec = f.draftSections[d.id];
+                const setSec = (patch) => set("draftSections")({ ...f.draftSections, [d.id]: { ...sec, ...patch } });
+                return (
+                  <div key={d.id} style={{ border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 6 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: C.ink }}>{d.label}</div>
+                        <div style={{ fontSize: 11, color: C.muted, marginTop: 1 }}>{d.hint}</div>
+                      </div>
+                      <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                        {[
+                          ["ai", "AI"],
+                          ["fixed", "Fixed"],
+                        ].map(([mode, label]) => (
+                          <button
+                            key={mode}
+                            onClick={() => setSec({ mode })}
+                            style={{
+                              fontFamily: sans,
+                              fontSize: 11,
+                              fontWeight: 700,
+                              padding: "5px 9px",
+                              borderRadius: 14,
+                              cursor: "pointer",
+                              border: `1px solid ${sec.mode === mode ? (mode === "ai" ? C.blue : C.green) : C.panelEdge}`,
+                              background: sec.mode === mode ? (mode === "ai" ? "rgba(96,165,250,0.12)" : "rgba(74,222,128,0.12)") : "transparent",
+                              color: sec.mode === mode ? (mode === "ai" ? C.blue : C.green) : C.muted,
+                            }}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    {sec.mode === "fixed" && (
+                      <textarea
+                        value={sec.text}
+                        onChange={(e) => setSec({ text: e.target.value })}
+                        placeholder={
+                          d.id === "ask"
+                            ? "e.g. If it's useful, I'm happy to send over two or three ideas for your onboarding screens — no strings."
+                            : d.id === "signoff"
+                            ? "e.g. Justine\nPortfolio: …"
+                            : d.id === "offer"
+                            ? "e.g. I do brand and product design for small SaaS teams — design systems, marketing sites, and the bits in between."
+                            : "Your exact wording"
+                        }
+                        style={{ ...inputStyle, minHeight: 62, resize: "vertical", fontSize: 12, marginTop: 8 }}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 6, marginBottom: 16 }}>
+                The model still sees your fixed text as context, so its sections won&apos;t duplicate or argue with the ask.
               </div>
             </div>
 
