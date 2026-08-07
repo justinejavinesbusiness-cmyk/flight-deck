@@ -2502,8 +2502,40 @@ This is important: do not invent a hook. Do not reference a launch, rebrand, fun
 
 Instead write a short, honest note that works without a hook: who the sender is, why this kind of company, and one clear ask. Keep it under 90 words — a generic email should be brief and make no claim to have done homework it hasn't done.`;
 
-/* the sentinel the hook field understands */
+/* the sentinels the hook field understands */
 const isGenericHook = (h) => /^generic$/i.test((h || "").trim());
+/* "generic person" — no company research, but address a named human by role.
+   Weaker than a real hook and stronger than a nameless generic: the recipient
+   at least sees you know who they are and what they do. */
+const isGenericPersonHook = (h) => /^generic\s+person$/i.test((h || "").trim());
+
+/* every addressable human on a pool member, normalised across both shapes.
+   Applications carry a single loose contact field and no position; accounts
+   carry a proper contact list. */
+function contactsOf(member) {
+  const ref = member?.refs?.[0];
+  if (!ref) return [];
+  const e = ref.entry || {};
+  if (ref.kind === "account")
+    return (e.contacts || [])
+      .filter((c) => !c.archivedAt && !c.tombstoned && (c.name || "").trim())
+      .map((c) => ({ id: c.id, name: c.name.trim(), position: (c.position || "").trim() }));
+  return (e.contact || "").trim() ? [{ id: ref.id, name: e.contact.trim(), position: (e.role || "").trim() }] : [];
+}
+const firstNameOf = (n) => (n || "").trim().split(/\s+/)[0] || "";
+
+const OUTREACH_SYSTEM_GENERIC_PERSON = `${OUTREACH_SYSTEM}
+
+The sender has not researched this company, and you have NO web access — you cannot look anything up. What you DO know is who you're writing to and what they do.
+
+Open by addressing them directly by first name and role, in this shape:
+"Hey <first name>, I saw you're the <position> so I had to reach out."
+
+Adapt the wording so it reads naturally rather than copied, but keep it that short and that direct.
+
+Then: do not invent anything about the company — no launches, funding rounds, products, redesigns or hires. You know the person's name and role and nothing else, and a wrong claim in the first paragraph is worse than a plain one. If no position was supplied, drop that clause rather than guessing at their job.
+
+Keep the whole thing under 90 words.`;
 
 /* ============================================================
    DRAFT SECTIONS — what the AI writes and what it must not touch
@@ -4217,18 +4249,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   /* One generator, used by both the single ✍ button and the bulk run, so a
      bulk draft is never a lower-grade version of a manual one. */
-  const generateDraft = async (member) => {
+  const generateDraft = async (member, chosenContact) => {
     const ref = member.refs[0];
     const hook = (member.hook || "").trim();
-    const generic = isGenericHook(hook);
+    const personMode = isGenericPersonHook(hook);
+    const generic = isGenericHook(hook) || personMode;
     const canSearch = state.settings?.aiProvider === "anthropic" && state.settings?.aiWebSearch !== false;
     const secs = normDraftSections(state.settings?.draftSections);
     const e = ref.entry;
     const contacts = ref.kind === "account" ? (e.contacts || []).filter((c) => !c.archivedAt) : [];
     const who = contacts.length ? contacts.map((c) => `${c.name || "unnamed"}${c.position ? ` (${c.position})` : ""}`).join(", ") : "";
+    const target = personMode ? chosenContact || contactsOf(member)[0] : null;
     const lines = [
       `Company: ${member.company}`,
       generic ? "" : `Hook (the specific thing you researched): ${hook}`,
+      /* named explicitly so the model uses the real first name rather than a
+         placeholder, and drops the role clause when there isn't one */
+      target ? `Write to this person — first name: ${firstNameOf(target.name)}${target.position ? `, position: ${target.position}` : ", position: not known"}` : "",
       ref.kind === "application" && e.role ? `Role being applied for: ${e.role}` : "",
       who ? `Contact(s) at the company: ${who}` : "",
       e.industry ? `Industry: ${e.industry}` : "",
@@ -4241,15 +4278,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       model: state.settings?.aiModel,
       baseUrl: state.settings?.aiBaseUrl,
       key: readAiKey(),
-      system: `${generic ? (canSearch ? OUTREACH_SYSTEM_GENERIC_SEARCH : OUTREACH_SYSTEM_GENERIC_NOSEARCH) : OUTREACH_SYSTEM}\n\n=== SECTIONS ===\n${buildSectionInstructions(secs)}`,
+      system: `${
+        personMode ? OUTREACH_SYSTEM_GENERIC_PERSON : generic ? (canSearch ? OUTREACH_SYSTEM_GENERIC_SEARCH : OUTREACH_SYSTEM_GENERIC_NOSEARCH) : OUTREACH_SYSTEM
+      }\n\n=== SECTIONS ===\n${buildSectionInstructions(secs)}`,
       user: lines.join("\n"),
-      webSearch: generic && canSearch,
+      webSearch: generic && canSearch && !personMode,
       maxTokens: state.settings?.aiMaxTokens,
     });
     const m = raw.match(/^\s*Hook:\s*(.+)$/im);
     const foundHook = m && !/^none found$/i.test(m[1].trim()) ? m[1].trim() : "";
     const { text, missing } = assembleDraft(raw.replace(/^\s*Hook:.*$/im, "").trim(), secs);
-    return { text, missing, foundHook, generic, searched: generic && canSearch };
+    return { text, missing, foundHook, generic, personMode, target, searched: generic && canSearch && !personMode };
   };
 
   const saveDraftToRecord = (ref, text) =>
@@ -4276,8 +4315,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       const member = queue[i];
       setBulkDraft((b) => ({ ...b, done: i, current: member.company }));
       try {
-        const { text, missing } = await generateDraft(member);
+        /* a batch can't stop to ask who — it addresses the first contact and
+           reports it, so anything worth re-aiming is visible afterwards */
+        const people = isGenericPersonHook(member.hook) ? contactsOf(member) : [];
+        if (isGenericPersonHook(member.hook) && !people.length) {
+          errors.push(`${member.company}: skipped — no named contact to write to`);
+          continue;
+        }
+        const { text, missing } = await generateDraft(member, people[0]);
         if (missing.length) errors.push(`${member.company}: missing ${missing.join(", ")}`);
+        if (people.length > 1) errors.push(`${member.company}: addressed ${people[0].name} (${people.length} contacts — check it's the right one)`);
         saveDraftToRecord(member.refs[0], text);
       } catch (err) {
         errors.push(`${member.company}: ${err?.message || "failed"}`);
@@ -4296,13 +4343,22 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const existing = ref.entry?.outreachDraft;
     if (existing && !opts.regenerate) return setDraftModal({ member, text: existing, loading: false, error: "" });
 
+    /* "generic person" needs a human to address. Ask BEFORE calling the model
+       so picking the wrong one doesn't cost a request. */
+    if (isGenericPersonHook(hook) && !opts.contact) {
+      const people = contactsOf(member);
+      if (!people.length) return flash("Add a contact with a name first — this mode writes to a person");
+      if (people.length > 1) return setDraftModal({ member, text: "", loading: false, error: "", pickContacts: people });
+      opts = { ...opts, contact: people[0] };
+    }
+
     setDraftModal({ member, text: "", loading: true, error: "" });
     try {
-      const { text, missing, foundHook, generic, searched } = await generateDraft(member);
-      setDraftModal({ member, text, loading: false, error: "", foundHook, searched, generic, missing });
+      const { text, missing, foundHook, generic, searched, personMode, target } = await generateDraft(member, opts.contact);
+      setDraftModal({ member, text, loading: false, error: "", foundHook, searched, generic, missing, personMode, target });
       saveDraftToRecord(ref, text);
     } catch (err) {
-      setDraftModal({ member, text: "", loading: false, error: err?.message || "Draft failed", generic: isGenericHook(hook) });
+      setDraftModal({ member, text: "", loading: false, error: err?.message || "Draft failed", generic: isGenericHook(hook) || isGenericPersonHook(hook) });
     }
   };
 
@@ -8471,6 +8527,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           loading={draftModal.loading}
           error={draftModal.error}
           missing={draftModal.missing}
+          pickContacts={draftModal.pickContacts}
+          personMode={draftModal.personMode}
+          target={draftModal.target}
+          onPickContact={(c) => draftOutreach(draftModal.member, { regenerate: true, contact: c })}
           foundHook={draftModal.foundHook}
           searched={draftModal.searched}
           generic={draftModal.generic}
@@ -9138,7 +9198,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       const v = e.target.value.slice(0, 120);
                       setF((p) => ({ ...p, hook: v, researchedAt: v.trim() ? p.researchedAt || today() : "" }));
                     }}
-                    placeholder='Hook — one line, or "generic"' 
+                    placeholder='Hook — one line, "generic", or "generic person"' 
                     style={{ ...inputStyle, marginTop: 6 }}
                   />
                 )}
@@ -10947,7 +11007,7 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    During reachout weeks the pool is closed, so the control becomes a bench
    parking slip instead of disappearing — capturing a name shouldn't require
    fighting the app. */
-function DraftModal({ member, text, loading, error, onClose, onRegenerate, foundHook, searched, generic, onSaveHook, missing }) {
+function DraftModal({ member, text, loading, error, onClose, onRegenerate, foundHook, searched, generic, onSaveHook, missing, pickContacts, onPickContact, personMode, target }) {
   const [copied, setCopied] = useState(false);
   const [edited, setEdited] = useState(text || "");
   useEffect(() => setEdited(text || ""), [text]);
@@ -10963,7 +11023,49 @@ function DraftModal({ member, text, loading, error, onClose, onRegenerate, found
         style={{ width: "100%", maxWidth: 480, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 18, boxSizing: "border-box", maxHeight: "88vh", overflowY: "auto" }}
       >
         <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 4 }}>✍ Draft — {member.company}</div>
-        <div style={{ fontSize: 12, color: C.amber, lineHeight: 1.45, marginBottom: 12 }}>{generic ? (searched ? "Generic — AI searched for a hook" : "Generic — no hook, no web access") : member.hook}</div>
+        <div style={{ fontSize: 12, color: C.amber, lineHeight: 1.45, marginBottom: 12 }}>
+          {personMode
+            ? `To ${target?.name || "a contact"}${target?.position ? ` · ${target.position}` : ""}`
+            : generic
+            ? searched
+              ? "Generic — AI searched for a hook"
+              : "Generic — no hook, no web access"
+            : member.hook}
+        </div>
+
+        {/* asked before any request goes out, so a wrong pick costs nothing */}
+        {pickContacts && (
+          <>
+            <div style={{ fontSize: 13, color: C.ink, lineHeight: 1.55, marginBottom: 10 }}>Who is this going to?</div>
+            {pickContacts.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => onPickContact(c)}
+                style={{
+                  width: "100%",
+                  boxSizing: "border-box",
+                  textAlign: "left",
+                  background: "transparent",
+                  border: `1px solid ${C.panelEdge}`,
+                  borderRadius: 10,
+                  padding: "10px 12px",
+                  marginBottom: 6,
+                  cursor: "pointer",
+                  color: C.ink,
+                  fontFamily: sans,
+                  fontSize: 13,
+                  fontWeight: 700,
+                }}
+              >
+                {c.name}
+                <div style={{ fontSize: 11, fontWeight: 400, color: c.position ? C.muted : C.amber, marginTop: 2 }}>{c.position || "no position set — the role line will be dropped"}</div>
+              </button>
+            ))}
+            <Btn ghost onClick={onClose} style={{ width: "100%", marginTop: 4 }}>
+              Cancel
+            </Btn>
+          </>
+        )}
 
         {/* the model went looking and found something real — worth keeping */}
         {foundHook && (
@@ -10977,7 +11079,7 @@ function DraftModal({ member, text, loading, error, onClose, onRegenerate, found
           </div>
         )}
 
-        {generic && !searched && !loading && (
+        {generic && !personMode && !searched && !loading && !pickContacts && (
           <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12, fontSize: 11, color: C.muted, lineHeight: 1.55 }}>
             Written without research — this provider can&apos;t browse, so the model was told not to invent anything about {member.company}. That makes it honest but plain.
             A real hook converts far better; five minutes on their site usually finds one. Anthropic + web search is the only setup here that can look things up for you.
@@ -10991,13 +11093,13 @@ function DraftModal({ member, text, loading, error, onClose, onRegenerate, found
           </div>
         )}
 
-        {!loading && !error && missing && missing.length > 0 && (
+        {!pickContacts && !loading && !error && missing && missing.length > 0 && (
           <div style={{ background: "rgba(248,113,113,0.08)", border: `1px solid ${C.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12, fontSize: 12, color: C.red, lineHeight: 1.55 }}>
             ⚠ The model didn&apos;t return: <strong>{missing.join(", ")}</strong>. What&apos;s below is only your fixed sections. Hit Redraft — if it keeps happening, raise the
             token limit in Settings or switch to a non-reasoning model.
           </div>
         )}
-        {!loading && !error && (
+        {!pickContacts && !loading && !error && (
           <>
             <textarea
               value={edited}
@@ -11010,6 +11112,7 @@ function DraftModal({ member, text, loading, error, onClose, onRegenerate, found
           </>
         )}
 
+        {!pickContacts && (
         <div style={{ display: "flex", gap: 8 }}>
           <Btn ghost onClick={onClose} style={{ flex: 1 }}>
             Close
@@ -11036,6 +11139,7 @@ function DraftModal({ member, text, loading, error, onClose, onRegenerate, found
             </Btn>
           )}
         </div>
+        )}
       </div>
     </div>
   );
@@ -11135,7 +11239,7 @@ function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft }) {
         <input
           value={draft}
           onChange={(e) => setDraft(e.target.value.slice(0, 120))}
-          placeholder='Hook — one line, or "generic"' 
+          placeholder='Hook — one line, "generic", or "generic person"' 
           style={{ ...inputStyle, fontSize: 13, padding: "7px 10px" }}
           onKeyDown={(e) => e.key === "Enter" && dirty && save()}
         />
