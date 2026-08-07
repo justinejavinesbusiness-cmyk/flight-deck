@@ -2969,6 +2969,7 @@ export default function FlightDeck() {
      opens on whatever the week is actually asking for, then left alone —
      re-deriving it would yank the view out from under you mid-session. */
   const [poolView, setPoolView] = useState(null);
+  const [poolSearch, setPoolSearch] = useState("");
   useEffect(() => setPipePage(0), [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
   /* bulk selection for converting applications to accounts */
   const [selectMode, setSelectMode] = useState(false);
@@ -4304,8 +4305,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      first two come back wrong — which is the actual failure mode of drafting
      forty emails at once. Skips anything already drafted so a re-run costs
      nothing, and never touches a company without a hook. */
-  const runBulkDraft = async (members) => {
-    const queue = members.filter((m) => (m.hook || "").trim() && !m.refs[0]?.entry?.outreachDraft);
+  const runBulkDraft = async (members, opts = {}) => {
+    /* force: a retry pass over entries that already saved a bad draft, which
+       the normal run deliberately skips */
+    const queue = members.filter((m) => (m.hook || "").trim() && (opts.force || !m.refs[0]?.entry?.outreachDraft));
     if (!queue.length) return flash("Everything hooked already has a draft");
     bulkStop.current = false;
     setBulkDraft({ total: queue.length, done: 0, current: queue[0].company, errors: [], running: true });
@@ -4319,15 +4322,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
            reports it, so anything worth re-aiming is visible afterwards */
         const people = isGenericPersonHook(member.hook) ? contactsOf(member) : [];
         if (isGenericPersonHook(member.hook) && !people.length) {
-          errors.push(`${member.company}: skipped — no named contact to write to`);
+          errors.push({ key: member.key, company: member.company, text: "skipped — no named contact to write to", retry: false });
           continue;
         }
         const { text, missing } = await generateDraft(member, people[0]);
-        if (missing.length) errors.push(`${member.company}: missing ${missing.join(", ")}`);
-        if (people.length > 1) errors.push(`${member.company}: addressed ${people[0].name} (${people.length} contacts — check it's the right one)`);
         saveDraftToRecord(member.refs[0], text);
+        /* retry:true marks the ones a second attempt could actually fix. The
+           contact-choice note is information, not a fault — redrafting a good
+           email because it warned you would just cost money. */
+        if (missing.length) errors.push({ key: member.key, company: member.company, text: `missing ${missing.join(", ")}`, retry: true });
+        if (people.length > 1) errors.push({ key: member.key, company: member.company, text: `addressed ${people[0].name} of ${people.length} contacts — check it's the right one`, retry: false });
       } catch (err) {
-        errors.push(`${member.company}: ${err?.message || "failed"}`);
+        errors.push({ key: member.key, company: member.company, text: err?.message || "failed", retry: true });
       }
       /* a breath between calls keeps provider rate limits happy */
       if (i < queue.length - 1 && !bulkStop.current) await new Promise((r) => setTimeout(r, 700));
@@ -4378,10 +4384,25 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
        rather than set during render — assigning state mid-render is the kind of
        thing that works until it doesn't. */
     const view = poolView || (open ? "parked" : "hooked");
-    const members = poolMembers(state, apps);
+    const allMembers = poolMembers(state, apps);
+    /* Search spans company, hook and contact names — at 45 companies you often
+       remember the person or the angle rather than the company name.
+       The chip COUNTS stay unfiltered on purpose: they're the state of the
+       pool, and having them shrink as you type would hide how much is left. */
+    const q = poolSearch.trim().toLowerCase();
+    const matches = (m) => {
+      if (!q) return true;
+      if ((m.company || "").toLowerCase().includes(q)) return true;
+      if ((m.hook || "").toLowerCase().includes(q)) return true;
+      return contactsOf(m).some((c) => `${c.name} ${c.position}`.toLowerCase().includes(q));
+    };
+    const members = allMembers.filter(matches);
     const byReadiness = { parked: [], hooked: [], contacted: [] };
     members.forEach((m) => byReadiness[memberReadiness(m)].push(m));
-    const bench = state.poolBench || [];
+    const byReadinessAll = { parked: [], hooked: [], contacted: [] };
+    allMembers.forEach((m) => byReadinessAll[memberReadiness(m)].push(m));
+    const allBench = state.poolBench || [];
+    const bench = q ? allBench.filter((b) => (b.company || "").toLowerCase().includes(q)) : allBench;
 
     const readinessBadge = (r) => {
       const meta = POOL_READINESS_META[r];
@@ -4420,6 +4441,24 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         </div>
 
+        <div style={{ position: "relative", marginBottom: 10 }}>
+          <input
+            value={poolSearch}
+            onChange={(e) => setPoolSearch(e.target.value)}
+            placeholder="🔎 Search company, hook, or contact…"
+            style={{ ...inputStyle, padding: "10px 30px 10px 12px" }}
+          />
+          {poolSearch && (
+            <button
+              onClick={() => setPoolSearch("")}
+              aria-label="Clear search"
+              style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", color: C.muted, fontSize: 16, cursor: "pointer", padding: "2px 6px", lineHeight: 1 }}
+            >
+              ×
+            </button>
+          )}
+        </div>
+
         {/* ---- segmented list ----
             A 45-company pool made every section a scroll: hooked entries sat
             below the un-hooked ones and the bench was at the very bottom, so
@@ -4427,10 +4466,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             One list at a time, with the counts always visible up top. */}
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
           {[
-            ["parked", `Need a hook (${byReadiness.parked.length})`, C.amber],
-            ["hooked", `✍ Ready to write (${byReadiness.hooked.length})`, C.blue],
-            ["contacted", `✓ Graduated (${byReadiness.contacted.length})`, C.green],
-            ["bench", `🪑 Bench (${bench.length})`, C.muted],
+            ["parked", `Need a hook (${byReadinessAll.parked.length})`, C.amber],
+            ["hooked", `✍ Ready to write (${byReadinessAll.hooked.length})`, C.blue],
+            ["contacted", `✓ Graduated (${byReadinessAll.contacted.length})`, C.green],
+            ["bench", `🪑 Bench (${allBench.length})`, C.muted],
           ].map(([key, label, col]) => (
             <button
               key={key}
@@ -4459,6 +4498,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             onAddAccount={() => openPoolForm("account")}
             onPark={(n) => addToPool(n, "", "application")}
           />
+        )}
+
+        {q && members.length === 0 && bench.length === 0 && (
+          <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
+            Nothing in the pool matches &ldquo;{poolSearch}&rdquo;.
+          </div>
+        )}
+        {q && members.length > 0 && byReadiness[view === "bench" ? "parked" : view].length === 0 && view !== "bench" && (
+          <div style={{ color: C.muted, fontSize: 13, padding: "14px 4px", textAlign: "center", lineHeight: 1.6 }}>
+            No matches in this list — {["parked", "hooked", "contacted"].filter((k) => k !== view && byReadiness[k].length).map((k) => `${byReadiness[k].length} in ${{ parked: "Need a hook", hooked: "Ready to write", contacted: "Graduated" }[k]}`).join(", ") || "try another tab"}.
+          </div>
         )}
 
         {view === "parked" &&
@@ -4492,22 +4542,44 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             );
           return (
             <>
-              {b && !b.running && (
-                <div style={{ background: C.panel, border: `1px solid ${b.errors.length ? C.amber : C.green}`, borderRadius: 12, padding: "11px 14px", marginBottom: 12 }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: b.errors.length ? C.amber : C.green }}>
-                    {b.stopped ? "Stopped" : "Done"} — {b.done} drafted
-                    {b.errors.length ? `, ${b.errors.length} with problems` : ""}
-                  </div>
-                  {b.errors.slice(0, 5).map((e, i) => (
-                    <div key={i} style={{ fontSize: 11, color: C.muted, marginTop: 4, lineHeight: 1.45 }}>
-                      • {e}
+              {b && !b.running && (() => {
+                /* only the faults a second attempt could actually fix. Keys are
+                   re-resolved against the CURRENT pool rather than reusing the
+                   stale member objects captured during the run. */
+                const retryKeys = new Set(b.errors.filter((e) => e.retry).map((e) => e.key));
+                /* full pool, not the filtered view — a search left in the box
+                   must not silently shrink what gets retried */
+                const retryable = byReadinessAll.hooked.filter((m) => retryKeys.has(m.key));
+                return (
+                  <div style={{ background: C.panel, border: `1px solid ${b.errors.length ? C.amber : C.green}`, borderRadius: 12, padding: "11px 14px", marginBottom: 12 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: b.errors.length ? C.amber : C.green }}>
+                      {b.stopped ? "Stopped" : "Done"} — {b.done} drafted
+                      {b.errors.length ? `, ${b.errors.length} with problems` : ""}
                     </div>
-                  ))}
-                  <Btn ghost onClick={() => setBulkDraft(null)} style={{ marginTop: 8, padding: "6px 11px", fontSize: 12 }}>
-                    Dismiss
-                  </Btn>
-                </div>
-              )}
+                    {b.errors.slice(0, 6).map((e, i) => (
+                      <div key={i} style={{ fontSize: 11, color: e.retry ? C.amber : C.muted, marginTop: 4, lineHeight: 1.45 }}>
+                        • <strong>{e.company}</strong> — {e.text}
+                      </div>
+                    ))}
+                    {b.errors.length > 6 && <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>+ {b.errors.length - 6} more</div>}
+                    <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                      <Btn ghost onClick={() => setBulkDraft(null)} style={{ flex: 1, padding: "7px 11px", fontSize: 12 }}>
+                        Dismiss
+                      </Btn>
+                      {retryable.length > 0 && (
+                        <Btn color={C.amber} onClick={() => runBulkDraft(retryable, { force: true })} style={{ flex: 2, padding: "7px 11px", fontSize: 12 }}>
+                          ↻ Redraft {retryable.length}
+                        </Btn>
+                      )}
+                    </div>
+                    {b.errors.some((e) => !e.retry) && retryable.length > 0 && (
+                      <div style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.45 }}>
+                        Grey notes above aren&apos;t faults — those drafts are fine and are left alone.
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
               {undrafted.length > 0 && (
                 <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "11px 14px", marginBottom: 12 }}>
                   <div style={{ fontSize: 13, color: C.ink, lineHeight: 1.5 }}>
@@ -4518,8 +4590,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                     are drafts, and a batch of them is worth less than three you actually rewrote.
                   </div>
                   <Btn onClick={() => runBulkDraft(byReadiness.hooked)} style={{ width: "100%", marginTop: 10 }}>
-                    ✍ Draft all {undrafted.length}
+                    ✍ Draft {q ? `these ${undrafted.length}` : `all ${undrafted.length}`}
                   </Btn>
+                  {q && <div style={{ fontSize: 11, color: C.amber, lineHeight: 1.5, marginTop: 6 }}>Filtered by &ldquo;{poolSearch}&rdquo; — only matching companies will be drafted.</div>}
                 </div>
               )}
               {byReadiness.hooked.length ? (
