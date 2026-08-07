@@ -2090,6 +2090,7 @@ function migrate(saved) {
   if (typeof s.settings.aiBaseUrl !== "string") s.settings.aiBaseUrl = "";
   /* who you are, in one paragraph — without this the drafts are generic */
   if (typeof s.settings.aiPitch !== "string") s.settings.aiPitch = "";
+  if (typeof s.settings.aiWebSearch !== "boolean") s.settings.aiWebSearch = true;
   if (typeof s.settings.autoArchiveDays !== "number") s.settings.autoArchiveDays = HOUSEKEEPING_STALE_DAYS;
   /* "standard" = the original N-over-N-days quota. "pool" = coverage pacing
      over Pool Mode's closed company set. */
@@ -2370,7 +2371,7 @@ function stripReasoning(raw) {
    thinking before they write anything; a tight cap produced responses that
    were ONLY scratchpad, with the email never reaching the page. */
 const AI_MAX_TOKENS = 3000;
-async function callAI({ provider, model, baseUrl, key, system, user }) {
+async function callAI({ provider, model, baseUrl, key, system, user, webSearch }) {
   const prov = provider || "builtin";
   if (prov === "builtin") {
     const res = await fetch("/api/coach", {
@@ -2399,7 +2400,17 @@ async function callAI({ provider, model, baseUrl, key, system, user }) {
         /* required for calls made straight from a browser */
         "anthropic-dangerous-direct-browser-access": "true",
       },
-      body: JSON.stringify({ model: model || AI_PROVIDERS.anthropic.defaultModel, max_tokens: AI_MAX_TOKENS, system, messages: [{ role: "user", content: user }] }),
+      body: JSON.stringify({
+        model: model || AI_PROVIDERS.anthropic.defaultModel,
+        max_tokens: AI_MAX_TOKENS,
+        system,
+        messages: [{ role: "user", content: user }],
+        /* Anthropic runs this server-side and returns the finished text in one
+           response, so no client round-trip is needed. It's the only provider
+           here that can actually LOOK — everything else is working from
+           training data and must not be asked to "research". */
+        ...(webSearch ? { tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 4 }] } : {}),
+      }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data?.error?.message || `Anthropic error ${res.status}`);
@@ -2455,6 +2466,37 @@ Return EXACTLY this shape and nothing else. No preamble, no explanation, no reas
 Subject: <subject line>
 
 <email body>`;
+
+/* When the hook is the word "generic", there is no researched detail to open
+   with. Two honest paths from there, and which one applies depends entirely on
+   whether the model can actually see the web:
+
+   WITH web search  — go and find a real hook, then write the email around it,
+                      and report the hook so it can be saved back to the record.
+   WITHOUT it       — do NOT pretend. A model working from training data that's
+                      asked to "research a company" will produce plausible,
+                      specific, wrong claims, and a fabricated detail in the
+                      opening line is worse than having no opening line at all.
+                      So it writes a short honest note instead. */
+const OUTREACH_SYSTEM_GENERIC_SEARCH = `${OUTREACH_SYSTEM}
+
+The sender has not researched this company yet. Use web search to find ONE specific, recent, verifiable thing about them — a launch, a rebrand, a funding round, a design hire, a redesign — and open the email with it.
+
+Only use what you actually found in search results. If search returns nothing solid about this specific company, say so by returning the hook line as "Hook: none found" and write a short honest note with no invented specifics.
+
+Put this as the FIRST line of your reply, before the subject:
+Hook: <the one-line hook you found, or "none found">`;
+
+const OUTREACH_SYSTEM_GENERIC_NOSEARCH = `${OUTREACH_SYSTEM}
+
+The sender has not researched this company, and you have NO web access — you cannot look anything up.
+
+This is important: do not invent a hook. Do not reference a launch, rebrand, funding round, product, hire, or anything else specific about this company, because you have no way to know it and a wrong detail in the first line is worse than a plain opening. Anything you "remember" about this company may be outdated or wrong.
+
+Instead write a short, honest note that works without a hook: who the sender is, why this kind of company, and one clear ask. Keep it under 90 words — a generic email should be brief and make no claim to have done homework it hasn't done.`;
+
+/* the sentinel the hook field understands */
+const isGenericHook = (h) => /^generic$/i.test((h || "").trim());
 
 /* ---------- supabase rpc ---------- */
 async function rpc(fn, args, timeoutMs = 6000) {
@@ -4079,7 +4121,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const ref = member.refs[0];
     if (!ref) return;
     const hook = (member.hook || "").trim();
-    if (!hook) return flash("Write the hook first — that's what the draft opens with");
+    if (!hook) return flash("Write the hook first, or type \u201cgeneric\u201d to let the AI handle it");
+    const generic = isGenericHook(hook);
+    /* only Anthropic can actually search from here; anything else asked to
+       "research" would be guessing out loud */
+    const canSearch = state.settings?.aiProvider === "anthropic" && state.settings?.aiWebSearch !== false;
     const existing = ref.entry?.outreachDraft;
     if (existing && !opts.regenerate) return setDraftModal({ member, text: existing, loading: false, error: "" });
 
@@ -4089,7 +4135,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const who = contacts.length ? contacts.map((c) => `${c.name || "unnamed"}${c.position ? ` (${c.position})` : ""}`).join(", ") : "";
     const lines = [
       `Company: ${member.company}`,
-      `Hook (the specific thing you researched): ${hook}`,
+      generic ? "" : `Hook (the specific thing you researched): ${hook}`,
       ref.kind === "application" && e.role ? `Role being applied for: ${e.role}` : "",
       who ? `Contact(s) at the company: ${who}` : "",
       e.industry ? `Industry: ${e.industry}` : "",
@@ -4099,22 +4145,28 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     ].filter(Boolean);
 
     try {
-      const text = await callAI({
+      const raw = await callAI({
         provider: state.settings?.aiProvider,
         model: state.settings?.aiModel,
         baseUrl: state.settings?.aiBaseUrl,
         key: readAiKey(),
-        system: OUTREACH_SYSTEM,
+        system: generic ? (canSearch ? OUTREACH_SYSTEM_GENERIC_SEARCH : OUTREACH_SYSTEM_GENERIC_NOSEARCH) : OUTREACH_SYSTEM,
         user: lines.join("\n"),
+        webSearch: generic && canSearch,
       });
-      setDraftModal({ member, text, loading: false, error: "" });
+      /* in searched-generic mode the model reports the hook it found on the
+         first line, so it can be saved back rather than lost in the email */
+      const m = raw.match(/^\s*Hook:\s*(.+)$/im);
+      const foundHook = m && !/^none found$/i.test(m[1].trim()) ? m[1].trim() : "";
+      const text = raw.replace(/^\s*Hook:.*$/im, "").trim();
+      setDraftModal({ member, text, loading: false, error: "", foundHook, searched: generic && canSearch, generic });
       mutate((st) =>
         ref.kind === "account"
           ? { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
           : { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
       );
     } catch (err) {
-      setDraftModal({ member, text: "", loading: false, error: err?.message || "Draft failed" });
+      setDraftModal({ member, text: "", loading: false, error: err?.message || "Draft failed", generic });
     }
   };
 
@@ -4686,6 +4738,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             aiModel: data.aiModel || "",
             aiBaseUrl: data.aiBaseUrl || "",
             aiPitch: data.aiPitch || "",
+            aiWebSearch: data.aiWebSearch !== false,
             autoArchiveStale: data.autoArchiveStale !== false,
             autoArchiveDays: Math.max(7, Math.min(365, +data.autoArchiveDays || HOUSEKEEPING_STALE_DAYS)),
             goalMode: data.goalMode === "pool" ? "pool" : "standard",
@@ -8055,7 +8108,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiWebSearch: state.settings?.aiWebSearch, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -8175,8 +8228,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           text={draftModal.text}
           loading={draftModal.loading}
           error={draftModal.error}
+          foundHook={draftModal.foundHook}
+          searched={draftModal.searched}
+          generic={draftModal.generic}
           onClose={() => setDraftModal(null)}
           onRegenerate={() => draftOutreach(draftModal.member, { regenerate: true })}
+          onSaveHook={(h) => {
+            const ref = draftModal.member.refs[0];
+            if (ref) setPoolHook(ref.id, h, ref.kind);
+            setDraftModal((d) => (d ? { ...d, foundHook: "" } : d));
+            flash("Hook saved");
+          }}
         />
       )}
       {reapplySuggestion && (
@@ -8255,6 +8317,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         aiBaseUrl: modal.aiBaseUrl || "",
         aiPitch: modal.aiPitch || "",
         aiKey: readAiKey(),
+        aiWebSearch: modal.aiWebSearch !== false,
         autoArchiveStale: modal.autoArchiveStale !== false,
         autoArchiveDays: String(modal.autoArchiveDays ?? HOUSEKEEPING_STALE_DAYS),
         goalMode: modal.goalMode === "pool" ? "pool" : "standard",
@@ -8830,7 +8893,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       const v = e.target.value.slice(0, 120);
                       setF((p) => ({ ...p, hook: v, researchedAt: v.trim() ? p.researchedAt || today() : "" }));
                     }}
-                    placeholder="Hook — one line"
+                    placeholder='Hook — one line, or "generic"' 
                     style={{ ...inputStyle, marginTop: 6 }}
                   />
                 )}
@@ -9193,6 +9256,33 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       <input value={f.aiBaseUrl} onChange={(e) => set("aiBaseUrl")(e.target.value)} placeholder="https://openrouter.ai/api/v1" style={{ ...inputStyle, fontFamily: mono, fontSize: 12 }} />
                     </>
                   )}
+                </>
+              )}
+
+              {f.aiProvider === "anthropic" && (
+                <>
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 10 }}>Let it research</div>
+                  <button
+                    onClick={() => set("aiWebSearch")(!f.aiWebSearch)}
+                    style={{
+                      width: "100%",
+                      boxSizing: "border-box",
+                      textAlign: "left",
+                      background: f.aiWebSearch ? "rgba(74,222,128,0.09)" : "transparent",
+                      border: `1px solid ${f.aiWebSearch ? C.green : C.panelEdge}`,
+                      color: f.aiWebSearch ? C.green : C.muted,
+                      borderRadius: 10,
+                      padding: "9px 12px",
+                      fontSize: 13,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {f.aiWebSearch ? "◉ Web search on" : "○ Web search off"}
+                  </button>
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                    When a hook is set to &ldquo;generic&rdquo;, the model searches for a real one and writes the email around it. Billed as extra usage on your key. Only
+                    Anthropic supports this here — the other providers are told not to invent anything instead.
+                  </div>
                 </>
               )}
 
@@ -10536,7 +10626,7 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    During reachout weeks the pool is closed, so the control becomes a bench
    parking slip instead of disappearing — capturing a name shouldn't require
    fighting the app. */
-function DraftModal({ member, text, loading, error, onClose, onRegenerate }) {
+function DraftModal({ member, text, loading, error, onClose, onRegenerate, foundHook, searched, generic, onSaveHook }) {
   const [copied, setCopied] = useState(false);
   const [edited, setEdited] = useState(text || "");
   useEffect(() => setEdited(text || ""), [text]);
@@ -10552,7 +10642,26 @@ function DraftModal({ member, text, loading, error, onClose, onRegenerate }) {
         style={{ width: "100%", maxWidth: 480, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 18, boxSizing: "border-box", maxHeight: "88vh", overflowY: "auto" }}
       >
         <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 4 }}>✍ Draft — {member.company}</div>
-        <div style={{ fontSize: 12, color: C.amber, lineHeight: 1.45, marginBottom: 12 }}>{member.hook}</div>
+        <div style={{ fontSize: 12, color: C.amber, lineHeight: 1.45, marginBottom: 12 }}>{generic ? (searched ? "Generic — AI searched for a hook" : "Generic — no hook, no web access") : member.hook}</div>
+
+        {/* the model went looking and found something real — worth keeping */}
+        {foundHook && (
+          <div style={{ background: "rgba(74,222,128,0.08)", border: `1px solid ${C.green}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+            <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted, marginBottom: 4 }}>HOOK FOUND</div>
+            <div style={{ fontSize: 13, color: C.ink, lineHeight: 1.45 }}>{foundHook}</div>
+            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, margin: "6px 0 8px" }}>Verify it before sending — search results can be stale or about a different company with a similar name.</div>
+            <Btn color={C.green} onClick={() => onSaveHook(foundHook)} style={{ padding: "6px 11px", fontSize: 12 }}>
+              Save as this company&apos;s hook
+            </Btn>
+          </div>
+        )}
+
+        {generic && !searched && !loading && (
+          <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12, fontSize: 11, color: C.muted, lineHeight: 1.55 }}>
+            Written without research — this provider can&apos;t browse, so the model was told not to invent anything about {member.company}. That makes it honest but plain.
+            A real hook converts far better; five minutes on their site usually finds one. Anthropic + web search is the only setup here that can look things up for you.
+          </div>
+        )}
 
         {loading && <div style={{ color: C.muted, fontSize: 13, padding: "18px 0", textAlign: "center" }}>Drafting…</div>}
         {error && (
@@ -10699,7 +10808,7 @@ function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft }) {
         <input
           value={draft}
           onChange={(e) => setDraft(e.target.value.slice(0, 120))}
-          placeholder="Hook — one line"
+          placeholder='Hook — one line, or "generic"' 
           style={{ ...inputStyle, fontSize: 13, padding: "7px 10px" }}
           onKeyDown={(e) => e.key === "Enter" && dirty && save()}
         />
