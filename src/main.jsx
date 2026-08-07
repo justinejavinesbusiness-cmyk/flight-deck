@@ -2345,8 +2345,31 @@ const AI_PROVIDERS = {
   custom: { label: "Custom", sub: "Any OpenAI-compatible endpoint (OpenRouter, Groq, local…)", needsKey: true, defaultModel: "" },
 };
 
+/* Reasoning models (DeepSeek R1, QwQ, and most "thinking" variants on
+   OpenRouter) emit their scratchpad inline before the answer. Strip it — you
+   asked for an email, not a transcript of the model deciding to write one.
+
+   Handles the truncated case too: an opening tag with no closing tag means the
+   response ran out of tokens mid-thought, so everything from that tag on is
+   incomplete reasoning and there is no answer to salvage. */
+function stripReasoning(raw) {
+  let out = String(raw || "");
+  out = out.replace(/<(think|thinking|reasoning|scratchpad)>[\s\S]*?<\/\1>/gi, "");
+  /* unclosed opener — drop the tail rather than showing half a thought */
+  out = out.replace(/<(think|thinking|reasoning|scratchpad)>[\s\S]*$/gi, "");
+  /* some models close without opening after a stripped prefix */
+  out = out.replace(/^[\s\S]*?<\/(think|thinking|reasoning|scratchpad)>/gi, "");
+  out = out.replace(/```[a-z]*\n?|```/gi, "");
+  return out.trim();
+}
+
 /* one call, four backends, plain text out. Throws with a readable message so
-   the UI can show what actually went wrong instead of a spinner that stops. */
+   the UI can show what actually went wrong instead of a spinner that stops.
+
+   max_tokens is generous because reasoning models spend most of their budget
+   thinking before they write anything; a tight cap produced responses that
+   were ONLY scratchpad, with the email never reaching the page. */
+const AI_MAX_TOKENS = 3000;
 async function callAI({ provider, model, baseUrl, key, system, user }) {
   const prov = provider || "builtin";
   if (prov === "builtin") {
@@ -2357,11 +2380,12 @@ async function callAI({ provider, model, baseUrl, key, system, user }) {
     });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
-    return (data.content || [])
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("\n")
-      .trim();
+    return stripReasoning(
+      (data.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+    );
   }
   if (!key) throw new Error("No API key saved — add one in Settings.");
 
@@ -2375,15 +2399,16 @@ async function callAI({ provider, model, baseUrl, key, system, user }) {
         /* required for calls made straight from a browser */
         "anthropic-dangerous-direct-browser-access": "true",
       },
-      body: JSON.stringify({ model: model || AI_PROVIDERS.anthropic.defaultModel, max_tokens: 700, system, messages: [{ role: "user", content: user }] }),
+      body: JSON.stringify({ model: model || AI_PROVIDERS.anthropic.defaultModel, max_tokens: AI_MAX_TOKENS, system, messages: [{ role: "user", content: user }] }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data?.error?.message || `Anthropic error ${res.status}`);
-    return (data.content || [])
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("\n")
-      .trim();
+    return stripReasoning(
+      (data.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+    );
   }
 
   /* openai and custom share the chat-completions shape */
@@ -2393,7 +2418,7 @@ async function callAI({ provider, model, baseUrl, key, system, user }) {
     headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
     body: JSON.stringify({
       model: model || AI_PROVIDERS.openai.defaultModel,
-      max_tokens: 700,
+      max_tokens: AI_MAX_TOKENS,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -2402,7 +2427,15 @@ async function callAI({ provider, model, baseUrl, key, system, user }) {
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error?.message || `Provider error ${res.status}`);
-  return (data.choices?.[0]?.message?.content || "").trim();
+  /* note: only `content` is read. Providers that expose the scratchpad in a
+     separate `reasoning` / `reasoning_content` field are ignored by design. */
+  const text = stripReasoning(data.choices?.[0]?.message?.content || "");
+  if (!text) {
+    const reason = data.choices?.[0]?.finish_reason;
+    if (reason === "length") throw new Error("The model used its whole budget thinking and never wrote the email. Try a non-reasoning model, or a smaller one.");
+    throw new Error("The model returned nothing usable. Try Redraft, or a different model.");
+  }
+  return text;
 }
 
 /* The prompt deliberately forbids the padding that makes cold outreach read as
@@ -2418,7 +2451,7 @@ Hard rules:
 - Sound like a person writing one email, not a campaign.
 - If the hook is thin, say less rather than inventing detail. Never fabricate facts about the company, its funding, its people, or its work.
 
-Return EXACTLY this shape and nothing else:
+Return EXACTLY this shape and nothing else. No preamble, no explanation, no reasoning, no <think> blocks — start your reply with the word "Subject:":
 Subject: <subject line>
 
 <email body>`;
