@@ -181,6 +181,20 @@ const LI_STATUSES = [
 ];
 const LI_META = (k) => LI_STATUSES.find((x) => x.key === (k || "")) || LI_STATUSES[0];
 const LI_STALE_DAYS = 7;
+const DEFAULT_TOUCH_CHANNEL = "LinkedIn";
+
+/* Ticking a follow-up means you actually sent something, so it should leave a
+   trace in the log rather than only moving the next due date. The channel is
+   chosen per follow-up (defaulting to whatever you use most) because "I
+   followed up" is useless six weeks later if you can't remember whether it was
+   a LinkedIn DM or an email. */
+const followUpTouchpoint = (channel, index) => ({
+  id: uid(),
+  date: today(),
+  channel: channel || DEFAULT_TOUCH_CHANNEL,
+  note: `Follow-up #${(index || 0) + 1}`,
+  fromFollowUp: true,
+});
 /* only a PENDING request can go stale — the other states are resolved */
 const liStaleDays = (c) => {
   if (!c?.linkedin || c.liStatus !== "requested" || !c.liStatusAt) return 0;
@@ -193,6 +207,7 @@ const liStaleDays = (c) => {
    which is the part that was previously invisible — a contact could move from
    outreach to closed with nothing to show when or why. */
 const logEntry = (kind, text) => ({ id: uid(), at: today(), kind, text });
+
 const withLog = (c, entries) => ({ ...c, history: [...(entries || []), ...(c.history || [])].slice(0, 200) });
 /* merges the change log and the touch points into one ordered timeline */
 function contactTimeline(c) {
@@ -2132,6 +2147,7 @@ function migrate(saved) {
   if (typeof s.settings.aiPitch !== "string") s.settings.aiPitch = "";
   if (typeof s.settings.aiWebSearch !== "boolean") s.settings.aiWebSearch = true;
   if (typeof s.settings.aiMaxTokens !== "number") s.settings.aiMaxTokens = AI_MAX_TOKENS_DEFAULT;
+  if (!s.settings.defaultTouchChannel) s.settings.defaultTouchChannel = DEFAULT_TOUCH_CHANNEL;
   s.settings.draftSections = normDraftSections(s.settings.draftSections);
   if (typeof s.settings.autoArchiveDays !== "number") s.settings.autoArchiveDays = HOUSEKEEPING_STALE_DAYS;
   /* "standard" = the original N-over-N-days quota. "pool" = coverage pacing
@@ -4160,7 +4176,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     badReasons: [],
     notes: "",
     /* one empty contact row, exactly like the standard account form starts with */
-    contacts: [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], liStatus: "", liStatusAt: "", history: [], linkedApplicationId: null }],
+    contacts: [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], followUpChannel: "", liStatus: "", liStatusAt: "", history: [], linkedApplicationId: null }],
     fromPool: true,
     poolAddedAt: today(),
     ...extra,
@@ -5161,6 +5177,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             aiPitch: data.aiPitch || "",
             aiWebSearch: data.aiWebSearch !== false,
             aiMaxTokens: clampTokens(data.aiMaxTokens),
+            defaultTouchChannel: data.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL,
             draftSections: normDraftSections(data.draftSections),
             autoArchiveStale: data.autoArchiveStale !== false,
             autoArchiveDays: Math.max(7, Math.min(365, +data.autoArchiveDays || HOUSEKEEPING_STALE_DAYS)),
@@ -8550,7 +8567,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiWebSearch: state.settings?.aiWebSearch, aiMaxTokens: state.settings?.aiMaxTokens, draftSections: state.settings?.draftSections, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiWebSearch: state.settings?.aiWebSearch, aiMaxTokens: state.settings?.aiMaxTokens, defaultTouchChannel: state.settings?.defaultTouchChannel, draftSections: state.settings?.draftSections, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -8769,6 +8786,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         aiKey: readAiKey(),
         aiWebSearch: modal.aiWebSearch !== false,
         aiMaxTokens: String(modal.aiMaxTokens ?? AI_MAX_TOKENS_DEFAULT),
+        defaultTouchChannel: modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL,
         draftSections: normDraftSections(modal.draftSections),
         autoArchiveStale: modal.autoArchiveStale !== false,
         autoArchiveDays: String(modal.autoArchiveDays ?? HOUSEKEEPING_STALE_DAYS),
@@ -8827,12 +8845,13 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               contacted: c.contacted || "",
               followUps: Array.isArray(c.followUps) ? c.followUps.map((f) => ({ ...f })) : [],
               touchpoints: Array.isArray(c.touchpoints) ? c.touchpoints.map((t) => ({ ...t })) : [],
+              followUpChannel: c.followUpChannel || "",
               liStatus: c.liStatus || "",
               liStatusAt: c.liStatusAt || "",
               history: Array.isArray(c.history) ? c.history.map((h) => ({ ...h })) : [],
               linkedApplicationId: c.linkedApplicationId || null,
             }))
-          : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], liStatus: "", liStatusAt: "", history: [], linkedApplicationId: null }],
+          : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], followUpChannel: "", liStatus: "", liStatusAt: "", history: [], linkedApplicationId: null }],
       };
     }
     if (kind === "content")
@@ -9151,14 +9170,6 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                         ))}
                       </select>
                       {f.liStatusAt && <span style={{ fontFamily: mono, fontSize: 11, color: stale ? C.red : C.muted, flexShrink: 0 }}>{daysSince(f.liStatusAt)}d</span>}
-                      <button
-                        onClick={() => setHistoryContact({ contact: { name: f.contact || f.company, position: f.role, linkedin: f.contactLinkedin, liStatus: f.liStatus, liStatusAt: f.liStatusAt, contacted: f.contacted, history: f.history, touchpoints: f.touchpoints }, company: f.company })}
-                        title="History"
-                        style={{ position: "relative", background: "transparent", border: `1px solid ${stale ? C.red : C.panelEdge}`, color: stale ? C.red : C.muted, borderRadius: 10, width: 42, height: 42, cursor: "pointer", flexShrink: 0, fontSize: 15 }}
-                      >
-                        🕘
-                        {stale > 0 && <span style={{ position: "absolute", top: -4, right: -4, width: 8, height: 8, borderRadius: 4, background: C.red }} />}
-                      </button>
                     </div>
                     {stale > 0 && (
                       <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginTop: 4 }}>
@@ -9170,6 +9181,39 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               })()}
 
             <Field label="Date contacted / applied" type="date" value={f.contacted} onChange={set("contacted")} />
+
+            {/* history is a property of the LEAD, not of a LinkedIn profile —
+                status moves and touch points happen regardless */}
+            {(() => {
+              const stale = liStaleDays({ linkedin: f.contactLinkedin, liStatus: f.liStatus, liStatusAt: f.liStatusAt });
+              const count = contactTimeline({ contacted: f.contacted, history: f.history, touchpoints: f.touchpoints }).length;
+              return (
+                <button
+                  onClick={() =>
+                    setHistoryContact({
+                      contact: { name: f.contact || f.company, position: f.role, linkedin: f.contactLinkedin, liStatus: f.liStatus, liStatusAt: f.liStatusAt, contacted: f.contacted, history: f.history, touchpoints: f.touchpoints },
+                      company: f.company,
+                    })
+                  }
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    textAlign: "left",
+                    background: "transparent",
+                    border: `1px solid ${stale ? C.red : C.panelEdge}`,
+                    color: stale ? C.red : C.muted,
+                    borderRadius: 10,
+                    padding: "9px 12px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                    marginBottom: 12,
+                  }}
+                >
+                  🕘 History{count ? ` · ${count} event${count === 1 ? "" : "s"}` : " · nothing logged yet"}
+                  {stale > 0 ? ` · ⚠ LinkedIn request ${stale}d pending` : ""}
+                </button>
+              );
+            })()}
 
             <div style={{ marginBottom: 4 }}>
               <Label>Touch points (every message sent — Facebook, cold email, etc.)</Label>
@@ -9257,9 +9301,34 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     {d || "—"}
                     {fu.done ? " ✓" : due ? " ⚑ DUE" : ""}
                   </div>
+                  {/* which channel this follow-up goes out on — the touch point
+                      it creates inherits it, so the log says how you reached them */}
+                  <select
+                    value={fu.channel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL}
+                    onChange={(e) => setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, channel: e.target.value } : x)) }))}
+                    style={{ ...selectStyle, width: 104, fontSize: 11, padding: "7px 6px", flexShrink: 0 }}
+                  >
+                    {TOUCHPOINT_CHANNELS.map((ch) => (
+                      <option key={ch} value={ch}>
+                        {ch}
+                      </option>
+                    ))}
+                  </select>
                   <button
                     onClick={() =>
-                      setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, done: !x.done, doneAt: !x.done ? today() : "" } : x)) }))
+                      setF((p) => {
+                        const wasDone = !!p.followUps[i]?.done;
+                        const ch = p.followUps[i]?.channel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL;
+                        return {
+                          ...p,
+                          followUps: p.followUps.map((x, j) => (j === i ? { ...x, done: !x.done, doneAt: !x.done ? today() : "" } : x)),
+                          /* ticking it logs the send; un-ticking removes only the
+                             auto-created entry, never one you wrote yourself */
+                          touchpoints: wasDone
+                            ? (p.touchpoints || []).filter((t) => !(t.fromFollowUp && t.note === `Follow-up #${i + 1}`))
+                            : [...(p.touchpoints || []), followUpTouchpoint(ch, i)],
+                        };
+                      })
                     }
                     title={fu.done ? "Mark not done" : "Mark done"}
                     style={{ background: "transparent", border: `1px solid ${fu.done ? C.green : C.panelEdge}`, color: fu.done ? C.green : C.muted, borderRadius: 10, width: 34, height: 34, cursor: "pointer", flexShrink: 0 }}
@@ -9884,6 +9953,30 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 The model still sees your fixed text as context, so its sections won&apos;t duplicate or argue with the ask.
               </div>
             </div>
+
+            <Label>Default follow-up channel</Label>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+              Ticking a follow-up logs a touch point automatically. This is the channel it assumes — changeable per follow-up.
+            </div>
+            <select value={f.defaultTouchChannel} onChange={(e) => set("defaultTouchChannel")(e.target.value)} style={{ ...selectStyle, width: 160, marginBottom: 16 }}>
+              {TOUCHPOINT_CHANNELS.map((ch) => (
+                <option key={ch} value={ch}>
+                  {ch}
+                </option>
+              ))}
+            </select>
+
+            <Label>Default follow-up channel</Label>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+              Ticking a follow-up logs a touch point automatically, and this is the channel it assumes. Each contact and each individual follow-up can still override it.
+            </div>
+            <select value={f.defaultTouchChannel} onChange={(e) => set("defaultTouchChannel")(e.target.value)} style={{ ...selectStyle, width: 160, marginBottom: 16 }}>
+              {TOUCHPOINT_CHANNELS.map((ch) => (
+                <option key={ch} value={ch}>
+                  {ch}
+                </option>
+              ))}
+            </select>
 
             <Label>🗄 File applications that never got an answer</Label>
             <button
@@ -10578,12 +10671,35 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   {fus.length > 0 && (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
                       <span style={{ fontSize: 10, color: C.muted }}>Follow-ups:</span>
+                      {/* one channel for this contact's follow-ups — the touch
+                          point each tick creates inherits it */}
+                      <select
+                        value={c.followUpChannel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL}
+                        onChange={(e) => setContact({ followUpChannel: e.target.value })}
+                        style={{ ...selectStyle, width: 96, fontSize: 10, padding: "3px 6px" }}
+                      >
+                        {TOUCHPOINT_CHANNELS.map((ch) => (
+                          <option key={ch} value={ch}>
+                            {ch}
+                          </option>
+                        ))}
+                      </select>
                       {fus.map((fu, fi) => {
                         const due = c.contacted ? followUpDueDate(c.contacted, fus, fi) : "";
                         return (
                           <button
                             key={fi}
-                            onClick={() => setContact({ followUps: fus.map((x, xi) => (xi === fi ? { ...x, done: !x.done, doneAt: !x.done ? today() : "" } : x)) })}
+                            onClick={() => {
+                              const wasDone = !!fu.done;
+                              const ch = c.followUpChannel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL;
+                              setContact({
+                                followUps: fus.map((x, xi) => (xi === fi ? { ...x, done: !x.done, doneAt: !x.done ? today() : "" } : x)),
+                                touchpoints: wasDone
+                                  ? (c.touchpoints || []).filter((t) => !(t.fromFollowUp && t.note === `Follow-up #${fi + 1}`))
+                                  : [...(c.touchpoints || []), followUpTouchpoint(ch, fi)],
+                                history: wasDone ? c.history || [] : withLog(c, [logEntry("followup", `Follow-up #${fi + 1} sent via ${ch}`)]).history,
+                              });
+                            }}
                             title={due ? `Due ${due}` : ""}
                             style={{
                               fontFamily: mono,
