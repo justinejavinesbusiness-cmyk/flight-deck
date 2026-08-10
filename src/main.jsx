@@ -164,6 +164,46 @@ const isContactDue = (c) => {
 const ACCOUNT_STATUSES = ["", "closed", "bad fit"];
 const accountStatusLabel = (s) => (s === "closed" ? "closed" : s === "bad fit" ? "bad fit" : "active");
 const accountStatusColor = (s) => (s === "closed" ? C.muted : s === "bad fit" ? C.red : C.green);
+/* ---- LinkedIn connection state ----
+   A connection request is its own little pipeline sitting before any real
+   conversation, and it has a failure mode the rest of the app doesn't cover:
+   it can sit pending forever with nothing to react to. So a request that's
+   been out 7 days is flagged — not because LinkedIn tells you anything, but
+   because at that point it's on you to either follow up another way or write
+   it off, and an unmarked pending request quietly becomes a dead lead. */
+const LI_STATUSES = [
+  { key: "", label: "Not sent", color: "muted" },
+  { key: "requested", label: "Request sent", color: "amber" },
+  { key: "connected", label: "Connected", color: "green" },
+  { key: "declined", label: "Declined / ignored", color: "red" },
+  { key: "withdrawn", label: "Withdrawn", color: "muted" },
+  { key: "na", label: "Messaged without connecting", color: "blue" },
+];
+const LI_META = (k) => LI_STATUSES.find((x) => x.key === (k || "")) || LI_STATUSES[0];
+const LI_STALE_DAYS = 7;
+/* only a PENDING request can go stale — the other states are resolved */
+const liStaleDays = (c) => {
+  if (!c?.linkedin || c.liStatus !== "requested" || !c.liStatusAt) return 0;
+  const d = daysSince(c.liStatusAt);
+  return d >= LI_STALE_DAYS ? d : 0;
+};
+
+/* ---- per-contact history ----
+   Append-only. Touch points record what you did; this records what CHANGED,
+   which is the part that was previously invisible — a contact could move from
+   outreach to closed with nothing to show when or why. */
+const logEntry = (kind, text) => ({ id: uid(), at: today(), kind, text });
+const withLog = (c, entries) => ({ ...c, history: [...(entries || []), ...(c.history || [])].slice(0, 200) });
+/* merges the change log and the touch points into one ordered timeline */
+function contactTimeline(c) {
+  const events = [
+    ...(c?.history || []).map((h) => ({ id: h.id, at: h.at, kind: h.kind, text: h.text })),
+    ...(c?.touchpoints || []).map((t) => ({ id: t.id, at: t.date, kind: "touch", text: `${t.channel || "Touch point"}${t.note ? ` — ${t.note}` : ""}` })),
+  ];
+  if (c?.contacted) events.push({ id: "first", at: c.contacted, kind: "first", text: "First contacted" });
+  return events.filter((e) => e.at).sort((a, b) => b.at.localeCompare(a.at) || String(b.id).localeCompare(String(a.id)));
+}
+
 const isAccountOpen = (acc) => !acc.status;
 /* live = not archived. An account is UNTOUCHED when nobody inside it has been
    reached yet — including accounts with no contacts at all, which are the ones
@@ -4115,7 +4155,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     badReasons: [],
     notes: "",
     /* one empty contact row, exactly like the standard account form starts with */
-    contacts: [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], linkedApplicationId: null }],
+    contacts: [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], liStatus: "", liStatusAt: "", history: [], linkedApplicationId: null }],
     fromPool: true,
     poolAddedAt: today(),
     ...extra,
@@ -8750,9 +8790,12 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               contacted: c.contacted || "",
               followUps: Array.isArray(c.followUps) ? c.followUps.map((f) => ({ ...f })) : [],
               touchpoints: Array.isArray(c.touchpoints) ? c.touchpoints.map((t) => ({ ...t })) : [],
+              liStatus: c.liStatus || "",
+              liStatusAt: c.liStatusAt || "",
+              history: Array.isArray(c.history) ? c.history.map((h) => ({ ...h })) : [],
               linkedApplicationId: c.linkedApplicationId || null,
             }))
-          : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], linkedApplicationId: null }],
+          : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], liStatus: "", liStatusAt: "", history: [], linkedApplicationId: null }],
       };
     }
     if (kind === "content")
@@ -8774,6 +8817,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
   });
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
   const [shotBusy, setShotBusy] = useState(false);
+  const [historyContact, setHistoryContact] = useState(null);
   const [confirmClearCsv, setConfirmClearCsv] = useState(false);
   const [shotErr, setShotErr] = useState("");
   const [customBoard, setCustomBoard] = useState(
@@ -8864,6 +8908,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
       onTouchEnd={(e) => e.stopPropagation()}
       style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
     >
+      {/* sits above the account modal it was opened from */}
+      {historyContact && <ContactHistoryModal contact={historyContact.contact} company={historyContact.company} onClose={() => setHistoryContact(null)} />}
       <div
         onClick={(e) => e.stopPropagation()}
         style={{ width: "100%", maxWidth: ["application", "account"].includes(kind) ? 620 : kind === "content" ? 760 : 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
@@ -10236,13 +10282,28 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 const needsDate = willBeContacted && !c.contacted;
                 /* keep "they answered" alive when the contact gets closed */
                 const withReply = "status" in patch ? { ...patch, ...latchContactReply(c, patch.status) } : patch;
-                if (!needsDate) return setContact(withReply);
+                /* record the change itself — touch points say what you did,
+                   history says what moved, which was previously invisible */
+                const logged =
+                  "status" in patch && patch.status !== c.status
+                    ? { ...withReply, history: withLog(c, [logEntry("status", `Status → ${contactStatusLabel(patch.status) || "not contacted yet"}`)]).history }
+                    : withReply;
+                if (!needsDate) return setContact(logged);
                 setContact({
-                  ...withReply,
+                  ...logged,
                   contacted: today(),
                   followUps: fus.length === 0 ? DEFAULT_FOLLOWUPS.map((d) => ({ days: d, done: false })) : fus,
                 });
               };
+              /* LinkedIn state changes are logged the same way, and re-stamp
+                 the date so the 7-day staleness clock restarts on each move */
+              const setLiStatus = (v) =>
+                setContact({
+                  liStatus: v,
+                  liStatusAt: v ? today() : "",
+                  history: withLog(c, [logEntry("linkedin", `LinkedIn → ${LI_META(v).label}`)]).history,
+                });
+              const stale = liStaleDays(c);
               return (
                 <div key={c.id || i} style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10, marginBottom: 8 }}>
                   <div style={{ display: "flex", gap: 8, marginBottom: 6, alignItems: "center" }}>
@@ -10253,6 +10314,14 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       style={{ ...inputStyle, flex: 1 }}
                     />
                     <CopyButton text={c.email} title="Copy email" />
+                    <button
+                      onClick={() => setHistoryContact({ contact: c, company: f.company })}
+                      title="History — status changes, LinkedIn moves and touch points"
+                      style={{ position: "relative", background: "transparent", border: `1px solid ${stale ? C.red : C.panelEdge}`, color: stale ? C.red : C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0, fontSize: 14 }}
+                    >
+                      🕘
+                      {stale > 0 && <span style={{ position: "absolute", top: -4, right: -4, width: 8, height: 8, borderRadius: 4, background: C.red }} />}
+                    </button>
                     <button
                       onClick={() => setContact({ archivedAt: today() })}
                       title="Archive — hides it from view, doesn't affect any counted numbers"
@@ -10308,6 +10377,36 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       </a>
                     )}
                   </div>
+
+                  {/* the connection request is its own small pipeline, and only
+                      worth showing once there's a profile to connect on */}
+                  {(c.linkedin || "").trim() && (
+                    <div style={{ marginBottom: 6 }}>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                        <select
+                          value={c.liStatus || ""}
+                          onChange={(e) => setLiStatus(e.target.value)}
+                          style={{ ...selectStyle, fontSize: 12, padding: "7px 9px", flex: 1, color: LI_META(c.liStatus).color === "muted" ? C.muted : C[LI_META(c.liStatus).color] }}
+                        >
+                          {LI_STATUSES.map((x) => (
+                            <option key={x.key || "none"} value={x.key}>
+                              in · {x.label}
+                            </option>
+                          ))}
+                        </select>
+                        {c.liStatusAt && (
+                          <span style={{ fontFamily: mono, fontSize: 10, color: stale ? C.red : C.muted, flexShrink: 0 }}>
+                            {daysSince(c.liStatusAt)}d
+                          </span>
+                        )}
+                      </div>
+                      {stale > 0 && (
+                        <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginTop: 4 }}>
+                          ⚠ Request pending {stale} days. LinkedIn won't tell you it was ignored — either reach them another way or mark it declined so it stops looking live.
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 6 }}>
                     <select
@@ -11080,6 +11179,65 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    During reachout weeks the pool is closed, so the control becomes a bench
    parking slip instead of disappearing — capturing a name shouldn't require
    fighting the app. */
+/* Per-contact timeline. Read-only by design: it's a record of what happened,
+   and a record you can edit after the fact isn't much of a record. */
+function ContactHistoryModal({ contact, company, onClose }) {
+  const events = contactTimeline(contact);
+  const ICON = { status: "◑", linkedin: "in", touch: "✉", first: "●", followup: "⚑" };
+  const COLOR = { status: C.amber, linkedin: C.blue, touch: C.ink, first: C.green, followup: C.red };
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60, padding: 16 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 420, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 18, boxSizing: "border-box", maxHeight: "82vh", overflowY: "auto" }}
+      >
+        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink }}>🕘 {contact.name || "Unnamed contact"}</div>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
+          {[contact.position, company].filter(Boolean).join(" · ") || "History"}
+        </div>
+
+        {(contact.linkedin || "").trim() && (
+          <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 12 }}>
+            <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted, marginBottom: 3 }}>LINKEDIN</div>
+            <div style={{ fontSize: 13, color: LI_META(contact.liStatus).color === "muted" ? C.muted : C[LI_META(contact.liStatus).color] }}>
+              {LI_META(contact.liStatus).label}
+              {contact.liStatusAt ? ` · ${daysSince(contact.liStatusAt)}d ago` : ""}
+            </div>
+            {liStaleDays(contact) > 0 && <div style={{ fontSize: 11, color: C.red, marginTop: 4, lineHeight: 1.45 }}>Pending {liStaleDays(contact)} days — treat it as ignored unless you hear otherwise.</div>}
+          </div>
+        )}
+
+        {events.length === 0 ? (
+          <div style={{ color: C.muted, fontSize: 13, padding: "14px 2px", textAlign: "center", lineHeight: 1.6 }}>
+            Nothing logged yet. Status changes, LinkedIn moves and touch points all land here automatically.
+          </div>
+        ) : (
+          events.map((e) => (
+            <div key={e.id} style={{ display: "flex", gap: 10, alignItems: "flex-start", paddingBottom: 10, marginBottom: 10, borderBottom: `1px solid ${C.panelEdge}` }}>
+              <span style={{ fontFamily: mono, fontSize: 10, color: COLOR[e.kind] || C.muted, flexShrink: 0, width: 18, textAlign: "center", paddingTop: 2 }}>{ICON[e.kind] || "·"}</span>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ fontSize: 13, color: C.ink, lineHeight: 1.45 }}>{e.text}</div>
+                <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 2 }}>
+                  {e.at} · {daysSince(e.at)}d ago
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+
+        <Btn ghost onClick={onClose} style={{ width: "100%", marginTop: 4 }}>
+          Close
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
 function DraftModal({ member, text, loading, error, onClose, onRegenerate, foundHook, searched, generic, onSaveHook, missing, pickContacts, onPickContact, personMode, target }) {
   const [copied, setCopied] = useState(false);
   const [edited, setEdited] = useState(text || "");
