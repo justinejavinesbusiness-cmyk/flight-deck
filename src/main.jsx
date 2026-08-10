@@ -3982,6 +3982,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             milestonesLogged: m ? m.milestonesLogged : a.milestonesLogged,
             /* preserve "a human actually answered" across the close */
             ...latchOnClose(a, status),
+            /* and record the move itself, so the history isn't LinkedIn-only */
+            history: [logEntry("status", `Status → ${statusLabel(status) || "not set"}`), ...(a.history || [])].slice(0, 200),
           };
           return updatedSource;
         });
@@ -4140,6 +4142,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     notes: "",
     custom: [],
     touchpoints: [],
+    liStatus: "",
+    liStatusAt: "",
+    history: [],
     fromPool: true,
     poolAddedAt: today(),
     ...extra,
@@ -4970,10 +4975,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                  it's the only way to correct an entry closed without stepping
                  through the stages. Forward-transition milestones and the
                  close-latch are then applied on top of the corrected value. */
+              const statusMoved = data.status !== a.status;
               const formMs = Array.isArray(data.milestonesLogged) ? data.milestonesLogged : a.milestonesLogged || [];
               const baseMs = Array.from(new Set([...(m ? m.milestonesLogged : []), ...formMs]));
               const latched = latchOnClose({ ...a, milestonesLogged: baseMs, gotReply: data.gotReply }, data.status);
-              return { ...a, ...data, milestonesLogged: latched.milestonesLogged || baseMs, ...(latched.gotReply ? { gotReply: true } : {}) };
+              return {
+                ...a,
+                ...data,
+                milestonesLogged: latched.milestonesLogged || baseMs,
+                ...(latched.gotReply ? { gotReply: true } : {}),
+                history: statusMoved ? [logEntry("status", `Status → ${statusLabel(data.status) || "not set"}`), ...(data.history || a.history || [])].slice(0, 200) : data.history || a.history || [],
+              };
             });
           } else {
             /* brand-new entry created directly at an advanced status (rare, but possible) */
@@ -5814,6 +5826,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       },
       { key: "checkPost", label: `⚠ Check posting (${apps.filter((a) => postingNeedsCheck(a) && !a.archivedAt).length})` },
       { key: "fromPool", label: `🎯 From pool (${apps.filter((a) => isFromPool(a) && !a.archivedAt).length})` },
+      {
+        key: "liPending",
+        label: `in ${apps.filter((a) => !a.archivedAt && liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt }) > 0).length} pending`,
+      },
       { key: "badFit", label: `🚫 Bad fit (${apps.filter((a) => isBadFit(a) && !a.archivedAt).length})` },
       { key: "repliedRejected", label: `✉ Replied, then no (${apps.filter((a) => isRepliedThenRejected(a) && !a.archivedAt).length})` },
       { key: "noReply", label: `🔇 Closed, no reply (${apps.filter((a) => isRejectedNoReply(a) && !a.archivedAt).length})` },
@@ -5830,6 +5846,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? postingNeedsCheck(a)
           : pipeFilter === "fromPool"
           ? isFromPool(a)
+          : pipeFilter === "liPending"
+          ? liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt }) > 0
           : pipeFilter === "blank"
           ? isBlankStatus(a)
           : pipeFilter === "active"
@@ -6601,6 +6619,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                             </option>
                           ))}
                         </select>
+                        {liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt }) > 0 && (
+                          <div
+                            title="LinkedIn request has been pending 7+ days — resolve it or it stays looking live"
+                            style={{ marginTop: 4, display: "inline-block", border: `1px solid ${C.red}`, borderRadius: 5, color: C.red, fontFamily: mono, fontSize: 9, padding: "1px 5px", letterSpacing: 0.4 }}
+                          >
+                            in · {liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt })}d PENDING
+                          </div>
+                        )}
                         {!isOpenApp(a) && a.status !== "offer" && (
                           <button
                             onClick={(e) => {
@@ -6885,6 +6911,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         {!isOpenApp(a) && a.status !== "offer" && (
                           <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: 0.4, color: hadReply(a) ? C.blue : C.muted, marginTop: 4 }}>
                             {hadReply(a) ? "✉ REPLIED" : "🔇 NO REPLY"}
+                          </div>
+                        )}
+                        {liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt }) > 0 && (
+                          <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: 0.4, color: C.red, marginTop: 4 }}>
+                            in · {liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt })}d PENDING
                           </div>
                         )}
                       </td>
@@ -8709,6 +8740,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         highConfidence: entry?.highConfidence || false,
         gotReply: entry?.gotReply || false,
         milestonesLogged: entry?.milestonesLogged ? [...entry.milestonesLogged] : [],
+        liStatus: entry?.liStatus || "",
+        liStatusAt: entry?.liStatusAt || "",
+        history: Array.isArray(entry?.history) ? entry.history.map((h) => ({ ...h })) : [],
         fromPool: entry?.fromPool ?? pre.fromPool ?? false,
         poolName: entry?.poolName ?? pre.poolName ?? "",
         hook: entry?.hook ?? pre.hook ?? "",
@@ -8774,6 +8808,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
            first-class pool member, countable in coverage */
         hook: entry?.hook ?? pre.hook ?? "",
         researchedAt: entry?.researchedAt ?? pre.researchedAt ?? "",
+        liStatus: entry?.liStatus || "",
+        liStatusAt: entry?.liStatusAt || "",
+        history: Array.isArray(entry?.history) ? entry.history.map((h) => ({ ...h })) : [],
         fromPool: entry?.fromPool ?? pre.fromPool ?? false,
         poolName: entry?.poolName ?? pre.poolName ?? "",
         contacts: entry?.contacts
@@ -9082,6 +9119,56 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               <Field label="Phone number" value={f.contactPhone} onChange={set("contactPhone")} placeholder="e.g. +63 917 000 0000" />
               <Field label="LinkedIn profile" value={f.contactLinkedin} onChange={set("contactLinkedin")} placeholder="https://linkedin.com/in/…" />
             </div>
+
+            {/* an application's contact is a single person, so the same
+                connection pipeline applies — just at the application level
+                rather than inside a contacts array */}
+            {(f.contactLinkedin || "").trim() &&
+              (() => {
+                const asContact = { linkedin: f.contactLinkedin, liStatus: f.liStatus, liStatusAt: f.liStatusAt };
+                const stale = liStaleDays(asContact);
+                return (
+                  <div style={{ marginBottom: 12 }}>
+                    <Label>LinkedIn connection</Label>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <select
+                        value={f.liStatus || ""}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setF((p) => ({
+                            ...p,
+                            liStatus: v,
+                            liStatusAt: v ? today() : "",
+                            history: [logEntry("linkedin", `LinkedIn → ${LI_META(v).label}`), ...(p.history || [])].slice(0, 200),
+                          }));
+                        }}
+                        style={{ ...selectStyle, flex: 1, color: LI_META(f.liStatus).color === "muted" ? C.muted : C[LI_META(f.liStatus).color] }}
+                      >
+                        {LI_STATUSES.map((x) => (
+                          <option key={x.key || "none"} value={x.key}>
+                            in · {x.label}
+                          </option>
+                        ))}
+                      </select>
+                      {f.liStatusAt && <span style={{ fontFamily: mono, fontSize: 11, color: stale ? C.red : C.muted, flexShrink: 0 }}>{daysSince(f.liStatusAt)}d</span>}
+                      <button
+                        onClick={() => setHistoryContact({ contact: { name: f.contact || f.company, position: f.role, linkedin: f.contactLinkedin, liStatus: f.liStatus, liStatusAt: f.liStatusAt, contacted: f.contacted, history: f.history, touchpoints: f.touchpoints }, company: f.company })}
+                        title="History"
+                        style={{ position: "relative", background: "transparent", border: `1px solid ${stale ? C.red : C.panelEdge}`, color: stale ? C.red : C.muted, borderRadius: 10, width: 42, height: 42, cursor: "pointer", flexShrink: 0, fontSize: 15 }}
+                      >
+                        🕘
+                        {stale > 0 && <span style={{ position: "absolute", top: -4, right: -4, width: 8, height: 8, borderRadius: 4, background: C.red }} />}
+                      </button>
+                    </div>
+                    {stale > 0 && (
+                      <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginTop: 4 }}>
+                        ⚠ Request pending {stale} days. LinkedIn won&apos;t tell you it was ignored — reach them another way or mark it declined so it stops looking live.
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
             <Field label="Date contacted / applied" type="date" value={f.contacted} onChange={set("contacted")} />
 
             <div style={{ marginBottom: 4 }}>
