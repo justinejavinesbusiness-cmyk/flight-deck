@@ -37,6 +37,26 @@ const C = {
 };
 
 const MODES = ["DASHBOARD", "GOAL", "PIPELINE", "CONTENT", "EMOTIONS", "RUNWAY", "HISTORY"];
+/* ---- navigation glyphs ----
+   One visual family: thin monochrome geometric shapes, no colour emoji. The
+   old set mixed both (⌂ ▦ ♡ ★ against 🎯 📝 ⛽), so three items carried their
+   own fixed colours and fought the amber active state that's supposed to be
+   the only thing drawing your eye.
+
+   Monochrome also means the glyph inherits the active/inactive colour, which
+   is what makes the selected tab read instantly on a dark bar. Shapes lean
+   instrument-panel to match the rest of the app: a bullseye for the target,
+   a half-filled gauge for runway. */
+const NAV_ITEMS = [
+  ["⌂", "Home", 0],
+  ["◎", "Goal", 1],
+  ["▤", "CRM", 2],
+  ["✎", "Content", 3],
+  ["♡", "Mind", 4],
+  ["◑", "Fuel", 5],
+  ["☆", "Wins", 6],
+];
+
 const TITLES = {
   DASHBOARD: "Dashboard",
   GOAL: "Goal Planner",
@@ -8447,15 +8467,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         {/* desktop: top tab navigation (mirrors the mobile bottom bar, one mode at a time) */}
         {isDesktop && (
           <div style={{ display: "flex", gap: 6, margin: "16px 0 4px", borderBottom: `1px solid ${C.panelEdge}`, paddingBottom: 10 }}>
-            {[
-              ["⌂", "Home", 0],
-              ["🎯", "Goal", 1],
-              ["▦", "CRM", 2, totalDueCount],
-              ["📝", "Content", 3],
-              ["♡", "Mind", 4],
-              ["⛽", "Fuel", 5],
-              ["★", "Wins", 6],
-            ].map(([icon, label, i, badge]) => (
+            {NAV_ITEMS.map(([icon, label, i]) => {
+              const badge = i === 2 ? totalDueCount : 0;
+              return (
               <button
                 key={label}
                 onClick={() => setMode(i)}
@@ -8475,7 +8489,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   position: "relative",
                 }}
               >
-                <span style={{ fontSize: 15 }}>{icon}</span>
+                <span style={{ fontSize: 16, lineHeight: 1, opacity: mode === i ? 1 : 0.75 }}>{icon}</span>
                 {label}
                 {badge > 0 && (
                   <span style={{ minWidth: 16, height: 16, borderRadius: 8, background: C.red, color: "#2b0b0b", fontFamily: mono, fontSize: 9, fontWeight: 800, lineHeight: "16px", padding: "0 4px" }}>
@@ -8483,7 +8497,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   </span>
                 )}
               </button>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -8523,15 +8538,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             zIndex: 40,
           }}
         >
-          {[
-            ["⌂", "Home", 0],
-            ["🎯", "Goal", 1],
-            ["▦", "CRM", 2, totalDueCount],
-            ["📝", "Content", 3],
-            ["♡", "Mind", 4],
-            ["⛽", "Fuel", 5],
-            ["★", "Wins", 6],
-          ].map(([icon, label, i, badge]) => (
+          {NAV_ITEMS.map(([icon, label, i]) => {
+            const badge = i === 2 ? totalDueCount : 0;
+            return (
             <button
               key={label}
               onClick={() => setMode(i)}
@@ -8545,7 +8554,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 position: "relative",
               }}
             >
-              <div style={{ fontSize: 17, lineHeight: 1 }}>{icon}</div>
+              <div style={{ fontSize: 19, lineHeight: 1, opacity: mode === i ? 1 : 0.7 }}>{icon}</div>
               <div style={{ fontFamily: sans, fontSize: 9, letterSpacing: "0.06em", marginTop: 3, fontWeight: mode === i ? 800 : 600 }}>{label}</div>
               {badge > 0 && (
                 <div style={{ position: "absolute", top: 4, left: "50%", marginLeft: 8, minWidth: 15, height: 15, borderRadius: 8, background: C.red, color: "#2b0b0b", fontFamily: mono, fontSize: 9, fontWeight: 800, lineHeight: "15px", padding: "0 3px" }}>
@@ -8553,7 +8562,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </div>
               )}
             </button>
-          ))}
+            );
+          })}
         </div>
       )}
 
