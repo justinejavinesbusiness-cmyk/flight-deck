@@ -173,8 +173,46 @@ const contactStatusLabel = (s) => (s ? s : "Not contacted yet");
 const contactStatusColor = (s) =>
   s === "closed" ? C.muted : s === "ongoing" ? C.green : s === "discovery call" ? C.amber : s === "replied" || s === "outreach" ? C.blue : C.muted;
 const isContactBlankStatus = (c) => !c.status;
+/* whole days between a date and today (negative if the date is in the future).
+   Declared up here because nurtureState below needs it and `const` doesn't
+   hoist — calling it earlier would throw at runtime, not at build. */
+const daysSince = (isoDate) => {
+  if (!isoDate) return null;
+  return Math.floor((new Date(today() + "T00:00:00") - new Date(isoDate + "T00:00:00")) / 86400000);
+};
 const isContactOpen = (c) => c.status !== "closed";
 const isContactOutreached = (c) => !!c.status; /* any status set means real contact has happened */
+/* ---- nurture stage ----
+   A contact that hasn't moved in months isn't dead and isn't active — it's
+   dormant, and the app previously had no word for that. It sat in "outreach"
+   looking identical to something you messaged yesterday.
+
+   The window is deliberate: before 60 days it's just a slow thread, and the
+   follow-up queue already covers it. After ~90 days a cold restart reads
+   better than another follow-up on the old one, so the entry graduates to
+   STALE and stops pretending it's a live conversation.
+
+   Only OPEN, already-outreached contacts qualify — a closed contact is
+   resolved, and one you never wrote to was never nurturing. */
+const NURTURE_FROM_DAYS = 60;
+const NURTURE_TO_DAYS = 90;
+const nurtureState = (c) => {
+  if (!c || !isContactOpen(c) || !isContactOutreached(c)) return "";
+  /* "discovery call" and beyond means it IS moving — nurture is about silence
+     in the early stages, not about a slow interview process */
+  if (["discovery call", "ongoing"].includes(c.status)) return "";
+  const last = lastActivityDate(c);
+  if (!last) return "";
+  const d = daysSince(last);
+  if (d >= NURTURE_TO_DAYS) return "stale";
+  if (d >= NURTURE_FROM_DAYS) return "nurture";
+  return "";
+};
+const NURTURE_META = {
+  nurture: { label: "NURTURE", color: "amber", hint: "quiet 60+ days — worth a light touch, not a hard pitch" },
+  stale: { label: "GONE COLD", color: "muted", hint: "quiet 90+ days — restart cold rather than follow up again" },
+};
+
 const isContactDue = (c) => {
   if (isContactBlankStatus(c)) return false;
   const n = nextFollowUp(c);
@@ -1733,11 +1771,6 @@ function lastActivityDate(a) {
   (a.touchpoints || []).forEach((t) => bump(t?.date));
   return latest;
 }
-/* whole days between a date and today (negative if the date is in the future) */
-const daysSince = (isoDate) => {
-  if (!isoDate) return null;
-  return Math.floor((new Date(today() + "T00:00:00") - new Date(isoDate + "T00:00:00")) / 86400000);
-};
 
 const HOUSEKEEPING_STALE_DAYS = 30;
 
@@ -2165,6 +2198,7 @@ function migrate(saved) {
   if (typeof s.settings.aiBaseUrl !== "string") s.settings.aiBaseUrl = "";
   /* who you are, in one paragraph — without this the drafts are generic */
   if (typeof s.settings.aiPitch !== "string") s.settings.aiPitch = "";
+  if (typeof s.settings.aiSenderName !== "string") s.settings.aiSenderName = "";
   if (typeof s.settings.aiWebSearch !== "boolean") s.settings.aiWebSearch = true;
   if (typeof s.settings.aiMaxTokens !== "number") s.settings.aiMaxTokens = AI_MAX_TOKENS_DEFAULT;
   if (!s.settings.defaultTouchChannel) s.settings.defaultTouchChannel = DEFAULT_TOUCH_CHANNEL;
@@ -2655,6 +2689,37 @@ const normDraftSections = (raw) => {
    leave a gap in the email or a stray blank line */
 const activeSections = (secs) => DRAFT_SECTION_DEFS.filter((d) => secs[d.id].mode === "ai" || secs[d.id].text.trim());
 
+/* ---- placeholders in fixed sections ----
+   Fixed text is inserted verbatim, which is the point — but "verbatim" made it
+   impossible to write one ask that names the company. So a small set of
+   [Tokens] are substituted at assembly time, on your device, before the text
+   is used. The wording still can't be paraphrased by a model; only these exact
+   tokens change.
+
+   Case-insensitive so [company] and [Company] both work, and an unknown token
+   is left visibly intact rather than silently blanked — a draft reading
+   "[Product]" tells you to fix it, one reading "" does not. */
+const DRAFT_TOKENS = [
+  { token: "company", label: "[Company]", desc: "The company name" },
+  { token: "first name", label: "[First name]", desc: "Contact's first name" },
+  { token: "name", label: "[Name]", desc: "Contact's full name" },
+  { token: "position", label: "[Position]", desc: "Their job title" },
+  { token: "role", label: "[Role]", desc: "The role you're going for" },
+  { token: "hook", label: "[Hook]", desc: "Your researched hook line" },
+  { token: "industry", label: "[Industry]", desc: "Their industry" },
+  { token: "me", label: "[Me]", desc: "Your own name" },
+];
+function fillTokens(text, vars) {
+  if (!text) return "";
+  return String(text).replace(/\[([a-z ]+)\]/gi, (whole, key) => {
+    const k = key.trim().toLowerCase();
+    const v = vars[k];
+    /* only substitute when we actually have a value — an empty replacement
+       would leave "Hi , I saw" and read as a bug in the email itself */
+    return v ? v : whole;
+  });
+}
+
 /* Builds the instruction for exactly the sections the model is allowed to
    write, using [[markers]] so each can be pulled back out and slotted into
    place. */
@@ -2676,12 +2741,12 @@ function buildSectionInstructions(secs) {
 
 /* Pulls the [[marked]] blocks out and assembles the final email in section
    order, substituting your fixed text unchanged. */
-function assembleDraft(raw, secs) {
+function assembleDraft(raw, secs, vars) {
   const got = {};
   const re = /\[\[(\w+)\]\]\s*([\s\S]*?)(?=\n\s*\[\[\w+\]\]|$)/g;
   let m;
   while ((m = re.exec(raw || ""))) got[m[1]] = m[2].trim();
-  const pick = (id) => (secs[id].mode === "fixed" ? secs[id].text.trim() : got[id] || "");
+  const pick = (id) => (secs[id].mode === "fixed" ? fillTokens(secs[id].text.trim(), vars || {}) : got[id] || "");
   /* Which AI-mode sections came back empty. Without this the fixed sections
      assemble into something that LOOKS like a finished email — the exact
      failure that made a missing subject and opening look like a normal draft. */
@@ -4369,7 +4434,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     });
     const m = raw.match(/^\s*Hook:\s*(.+)$/im);
     const foundHook = m && !/^none found$/i.test(m[1].trim()) ? m[1].trim() : "";
-    const { text, missing } = assembleDraft(raw.replace(/^\s*Hook:.*$/im, "").trim(), secs);
+    const vars = {
+      company: member.company || "",
+      "first name": firstNameOf(target?.name || contactsOf(member)[0]?.name || ""),
+      name: (target?.name || contactsOf(member)[0]?.name || "").trim(),
+      position: (target?.position || contactsOf(member)[0]?.position || "").trim(),
+      role: ref.kind === "application" ? (e.role || "").trim() : "",
+      hook: generic ? "" : hook,
+      industry: (e.industry || "").trim(),
+      me: (state.settings?.aiSenderName || "").trim(),
+    };
+    const { text, missing } = assembleDraft(raw.replace(/^\s*Hook:.*$/im, "").trim(), secs, vars);
     return { text, missing, foundHook, generic, personMode, target, searched: generic && canSearch && !personMode };
   };
 
@@ -5195,6 +5270,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             aiModel: data.aiModel || "",
             aiBaseUrl: data.aiBaseUrl || "",
             aiPitch: data.aiPitch || "",
+            aiSenderName: data.aiSenderName || "",
             aiWebSearch: data.aiWebSearch !== false,
             aiMaxTokens: clampTokens(data.aiMaxTokens),
             defaultTouchChannel: data.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL,
@@ -7012,6 +7088,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       { key: "highConfidence", label: `⭐ High confidence (${accounts.filter((a) => a.highConfidence).length})` },
       { key: "notContacted", label: `◻ Not contacted yet (${accounts.flatMap(liveContacts).filter(isContactBlankStatus).length})` },
       { key: "untouched", label: `🕳 No one reached (${accounts.filter((a) => isAccountOpen(a) && isAccountUntouched(a)).length})` },
+      { key: "nurture", label: `🌱 Nurture (${accounts.flatMap(liveContacts).filter((c) => nurtureState(c) === "nurture").length})` },
+      { key: "coldGone", label: `❄ Gone cold (${accounts.flatMap(liveContacts).filter((c) => nurtureState(c) === "stale").length})` },
       { key: "outreachedContacts", label: `Outreached contacts (${accounts.filter((a) => (a.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)).length})` },
       { key: "dueContacts", label: `⚑ Due contacts (${accounts.filter((a) => (a.contacts || []).some((c) => isContactDue(c) && !c.archivedAt)).length})` },
       { key: "closed", label: `Closed (${accounts.filter((a) => a.status === "closed").length})` },
@@ -7028,6 +7106,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? liveContacts(acc).some(isContactBlankStatus)
           : accFilter === "untouched"
           ? isAccountOpen(acc) && isAccountUntouched(acc)
+          : accFilter === "nurture"
+          ? liveContacts(acc).some((c) => nurtureState(c) === "nurture")
+          : accFilter === "coldGone"
+          ? liveContacts(acc).some((c) => nurtureState(c) === "stale")
           : accFilter === "outreachedContacts"
           ? (acc.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)
           : accFilter === "dueContacts"
@@ -7061,13 +7143,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
-    const isContactFilterView = accFilter === "outreachedContacts" || accFilter === "dueContacts" || accFilter === "notContacted";
+    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone"].includes(accFilter);
 
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
       ? accounts
           .flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt).map((c) => ({ ...c, _company: acc.company || "Unnamed", _accountId: acc.id })))
-          .filter((c) => (accFilter === "outreachedContacts" ? isContactOutreached(c) : accFilter === "notContacted" ? isContactBlankStatus(c) : isContactDue(c)))
+          .filter((c) =>
+            accFilter === "outreachedContacts"
+              ? isContactOutreached(c)
+              : accFilter === "notContacted"
+              ? isContactBlankStatus(c)
+              : accFilter === "nurture"
+              ? nurtureState(c) === "nurture"
+              : accFilter === "coldGone"
+              ? nurtureState(c) === "stale"
+              : isContactDue(c)
+          )
           .filter((c) => {
             if (!accSearch.trim()) return true;
             const q = accSearch.trim().toLowerCase();
@@ -8577,7 +8669,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiWebSearch: state.settings?.aiWebSearch, aiMaxTokens: state.settings?.aiMaxTokens, defaultTouchChannel: state.settings?.defaultTouchChannel, draftSections: state.settings?.draftSections, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiSenderName: state.settings?.aiSenderName, aiWebSearch: state.settings?.aiWebSearch, aiMaxTokens: state.settings?.aiMaxTokens, defaultTouchChannel: state.settings?.defaultTouchChannel, draftSections: state.settings?.draftSections, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -8793,6 +8885,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         aiModel: modal.aiModel || "",
         aiBaseUrl: modal.aiBaseUrl || "",
         aiPitch: modal.aiPitch || "",
+        aiSenderName: modal.aiSenderName || "",
         aiKey: readAiKey(),
         aiWebSearch: modal.aiWebSearch !== false,
         aiMaxTokens: String(modal.aiMaxTokens ?? AI_MAX_TOKENS_DEFAULT),
@@ -9959,9 +10052,26 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   </div>
                 );
               })}
-              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 6, marginBottom: 16 }}>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 6 }}>
                 The model still sees your fixed text as context, so its sections won&apos;t duplicate or argue with the ask.
               </div>
+              <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", marginTop: 8, marginBottom: 16 }}>
+                <div style={{ fontSize: 12, color: C.ink, lineHeight: 1.5, marginBottom: 6 }}>
+                  Fixed text can still vary — these are swapped in per company when the draft is built:
+                </div>
+                {DRAFT_TOKENS.map((t) => (
+                  <div key={t.token} style={{ display: "flex", gap: 8, fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+                    <span style={{ fontFamily: mono, color: C.blue, minWidth: 92 }}>{t.label}</span>
+                    <span>{t.desc}</span>
+                  </div>
+                ))}
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 6 }}>
+                  e.g. &ldquo;I&apos;d love to help [Company] with…&rdquo;. A token with no value stays visible rather than leaving a gap, so you can spot it.
+                </div>
+              </div>
+
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Your name (for [Me])</div>
+              <input value={f.aiSenderName} onChange={(e) => set("aiSenderName")(e.target.value)} placeholder="Justine Javines" style={{ ...inputStyle, marginBottom: 16 }} />
             </div>
 
             <Label>Default follow-up channel</Label>
