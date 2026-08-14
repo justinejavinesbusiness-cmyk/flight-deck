@@ -213,6 +213,41 @@ const NURTURE_META = {
   stale: { label: "GONE COLD", color: "muted", hint: "quiet 90+ days — restart cold rather than follow up again" },
 };
 
+/* ---- social engagement cadence ----
+   Engaging with someone's posts is a different loop from following up: it's
+   commenting on their work, not chasing a reply, and its rhythm is set by THEM
+   rather than by you. Someone posting daily expects interaction often enough
+   to be noticed; someone posting monthly would find weekly engagement odd.
+
+   So the cadence is derived from their posting frequency, not chosen. The
+   ratios are deliberately conservative — roughly one engagement per 2-3 of
+   their posts. Engaging with everything reads as monitoring, not interest. */
+const POST_FREQUENCIES = [
+  { key: "daily", label: "Daily", sub: "posts most days", everyDays: 4 },
+  { key: "weekly", label: "A few times a week", sub: "2-4 posts a week", everyDays: 9 },
+  { key: "biweekly", label: "Weekly", sub: "about one a week", everyDays: 16 },
+  { key: "monthly", label: "Monthly or less", sub: "occasional", everyDays: 35 },
+];
+const postFreqOf = (k) => POST_FREQUENCIES.find((f) => f.key === k) || null;
+/* last time you engaged — falls back to when you marked them active, so a
+   newly-flagged contact becomes due on their own cadence rather than instantly */
+const lastEngagedDate = (c) => c?.lastEngagedAt || c?.socialSince || "";
+const engagementDueDate = (c) => {
+  const f = postFreqOf(c?.postFrequency);
+  if (!c?.socialActive || !f) return "";
+  const from = lastEngagedDate(c);
+  return from ? addDays(from, f.everyDays) : today();
+};
+const isEngagementDue = (c) => {
+  if (!c?.socialActive || !isContactOpen(c)) return false;
+  const due = engagementDueDate(c);
+  return !!due && due <= today();
+};
+const engagementOverdueDays = (c) => {
+  const due = engagementDueDate(c);
+  return due && due <= today() ? daysSince(due) : 0;
+};
+
 const isContactDue = (c) => {
   if (isContactBlankStatus(c)) return false;
   const n = nextFollowUp(c);
@@ -3367,6 +3402,17 @@ export default function FlightDeck() {
     () => (state.accounts || []).reduce((s, a) => s + (a.contacts || []).filter((c) => isContactDue(c) && !c.archivedAt).length, 0),
     [state.accounts]
   );
+  /* people whose posting cadence says it's time to engage. Kept separate from
+     the follow-up queue on purpose: commenting on someone's post is a
+     different action from chasing a reply, and merging them would make the
+     due count mean two things at once. */
+  const engageDueList = useMemo(
+    () =>
+      (state.accounts || [])
+        .flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt && isEngagementDue(c)).map((c) => ({ ...c, _company: a.company })))
+        .sort((a, b) => (engagementDueDate(a) || "9999-12-31").localeCompare(engagementDueDate(b) || "9999-12-31")),
+    [state.accounts]
+  );
   const totalDueCount = dueList.length + dueContactsCount;
   const housekeepingProposals = useMemo(() => computeHousekeepingProposals(state, apps), [state.applications, state.accounts]);
 
@@ -5668,6 +5714,38 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       </div>
 
       {/* due follow-ups queue */}
+      {engageDueList.length > 0 && (
+        <div style={{ background: "rgba(96,165,250,0.07)", border: `1px solid ${C.blue}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
+          <Label>💬 Engage — {engageDueList.length} due</Label>
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+            Comment on something they posted. Cheaper than a follow-up and it keeps you visible between messages.
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {engageDueList.slice(0, 5).map((c) => (
+              <div key={c.id} style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 13, alignItems: "center" }}>
+                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <strong>{c.name || "Unnamed"}</strong>
+                  <span style={{ color: C.muted }}> · {c._company}</span>
+                </span>
+                {c.linkedin ? (
+                  <a
+                    href={c.linkedin.startsWith("http") ? c.linkedin : "https://" + c.linkedin}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ color: C.blue, fontSize: 12, textDecoration: "none", flexShrink: 0 }}
+                  >
+                    open →
+                  </a>
+                ) : (
+                  <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>{engagementOverdueDays(c)}d over</span>
+                )}
+              </div>
+            ))}
+            {engageDueList.length > 5 && <div style={{ fontSize: 11, color: C.muted }}>+ {engageDueList.length - 5} more in Accounts → Engage</div>}
+          </div>
+        </div>
+      )}
+
       {dueList.length > 0 && (() => {
         /* show a realistic ask, not the whole backlog. dueList is sorted
            oldest-first, so the batch is genuinely the highest-priority slice —
@@ -7088,6 +7166,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       { key: "highConfidence", label: `⭐ High confidence (${accounts.filter((a) => a.highConfidence).length})` },
       { key: "notContacted", label: `◻ Not contacted yet (${accounts.flatMap(liveContacts).filter(isContactBlankStatus).length})` },
       { key: "untouched", label: `🕳 No one reached (${accounts.filter((a) => isAccountOpen(a) && isAccountUntouched(a)).length})` },
+      { key: "engageDue", label: `💬 Engage (${accounts.flatMap(liveContacts).filter(isEngagementDue).length})` },
       { key: "nurture", label: `🌱 Nurture (${accounts.flatMap(liveContacts).filter((c) => nurtureState(c) === "nurture").length})` },
       { key: "coldGone", label: `❄ Gone cold (${accounts.flatMap(liveContacts).filter((c) => nurtureState(c) === "stale").length})` },
       { key: "outreachedContacts", label: `Outreached contacts (${accounts.filter((a) => (a.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)).length})` },
@@ -7106,6 +7185,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? liveContacts(acc).some(isContactBlankStatus)
           : accFilter === "untouched"
           ? isAccountOpen(acc) && isAccountUntouched(acc)
+          : accFilter === "engageDue"
+          ? liveContacts(acc).some(isEngagementDue)
           : accFilter === "nurture"
           ? liveContacts(acc).some((c) => nurtureState(c) === "nurture")
           : accFilter === "coldGone"
@@ -7143,7 +7224,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
-    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone"].includes(accFilter);
+    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue"].includes(accFilter);
 
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
@@ -7154,6 +7235,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               ? isContactOutreached(c)
               : accFilter === "notContacted"
               ? isContactBlankStatus(c)
+              : accFilter === "engageDue"
+              ? isEngagementDue(c)
               : accFilter === "nurture"
               ? nurtureState(c) === "nurture"
               : accFilter === "coldGone"
@@ -7170,6 +7253,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           .sort((a, b) =>
             accFilter === "dueContacts"
               ? (followUpOf(a) || "9999-12-31").localeCompare(followUpOf(b) || "9999-12-31") || a._company.localeCompare(b._company)
+              : accFilter === "engageDue"
+              ? /* longest-overdue first — same work-queue logic as follow-ups */
+                (engagementDueDate(a) || "9999-12-31").localeCompare(engagementDueDate(b) || "9999-12-31") || a._company.localeCompare(b._company)
               : a._company.localeCompare(b._company)
           )
       : [];
@@ -8951,6 +9037,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               followUpChannel: c.followUpChannel || "",
               liStatus: c.liStatus || "",
               liStatusAt: c.liStatusAt || "",
+              socialActive: !!c.socialActive,
+              postFrequency: c.postFrequency || "",
+              socialSince: c.socialSince || "",
+              lastEngagedAt: c.lastEngagedAt || "",
               history: Array.isArray(c.history) ? c.history.map((h) => ({ ...h })) : [],
               linkedApplicationId: c.linkedApplicationId || null,
             }))
@@ -10770,6 +10860,87 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   >
                     {c.gotReply ? "✉ They replied" : "☐ No reply yet"}
                   </button>
+
+                  {(() => {
+                    const n = nurtureState(c);
+                    if (!n) return null;
+                    const col = NURTURE_META[n].color === "amber" ? C.amber : C.muted;
+                    return (
+                      <div style={{ background: n === "nurture" ? "rgba(245,185,66,0.08)" : "transparent", border: `1px solid ${col}`, borderRadius: 8, padding: "7px 10px", marginBottom: 6 }}>
+                        <span style={{ fontFamily: mono, fontSize: 9, letterSpacing: 0.4, color: col }}>
+                          🌱 {NURTURE_META[n].label} · {daysSince(lastActivityDate(c))}d quiet
+                        </span>
+                        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.45, marginTop: 3 }}>{NURTURE_META[n].hint}</div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* engagement loop — a different rhythm from follow-ups,
+                      set by how often THEY post rather than by your queue */}
+                  <div style={{ border: `1px solid ${isEngagementDue(c) ? C.blue : C.panelEdge}`, borderRadius: 8, padding: "8px 10px", marginBottom: 6 }}>
+                    <button
+                      onClick={() =>
+                        setContact({
+                          socialActive: !c.socialActive,
+                          socialSince: !c.socialActive ? today() : "",
+                          postFrequency: !c.socialActive ? c.postFrequency : "",
+                          history: withLog(c, [logEntry("status", !c.socialActive ? "Marked active on social" : "Stopped tracking social")]).history,
+                        })
+                      }
+                      style={{ background: "transparent", border: "none", padding: 0, cursor: "pointer", fontSize: 13, fontWeight: 700, color: c.socialActive ? C.blue : C.muted, textAlign: "left" }}
+                    >
+                      {c.socialActive ? "☑" : "☐"} Active on social
+                    </button>
+                    {c.socialActive && (
+                      <>
+                        <div style={{ fontSize: 11, color: C.muted, marginTop: 6, marginBottom: 4 }}>How often do they post?</div>
+                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                          {POST_FREQUENCIES.map((fq) => (
+                            <button
+                              key={fq.key}
+                              onClick={() => setContact({ postFrequency: fq.key })}
+                              title={`${fq.sub} → engage about every ${fq.everyDays} days`}
+                              style={{
+                                fontFamily: sans,
+                                fontSize: 11,
+                                fontWeight: 700,
+                                padding: "5px 9px",
+                                borderRadius: 14,
+                                cursor: "pointer",
+                                border: `1px solid ${c.postFrequency === fq.key ? C.blue : C.panelEdge}`,
+                                background: c.postFrequency === fq.key ? "rgba(96,165,250,0.12)" : "transparent",
+                                color: c.postFrequency === fq.key ? C.blue : C.muted,
+                              }}
+                            >
+                              {fq.label}
+                            </button>
+                          ))}
+                        </div>
+                        {c.postFrequency && (
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 8 }}>
+                            <div style={{ fontSize: 11, color: isEngagementDue(c) ? C.blue : C.muted, lineHeight: 1.45 }}>
+                              {isEngagementDue(c) ? `Due to engage${engagementOverdueDays(c) > 0 ? ` · ${engagementOverdueDays(c)}d over` : ""}` : `Next around ${engagementDueDate(c)}`}
+                              <div style={{ color: C.muted }}>
+                                every ~{postFreqOf(c.postFrequency).everyDays}d · {lastEngagedDate(c) ? `last ${lastEngagedDate(c)}` : "not engaged yet"}
+                              </div>
+                            </div>
+                            <Btn
+                              onClick={() =>
+                                setContact({
+                                  lastEngagedAt: today(),
+                                  touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "LinkedIn", note: "Engaged with a post" }],
+                                  history: withLog(c, [logEntry("touch", "Engaged with a post")]).history,
+                                })
+                              }
+                              style={{ padding: "6px 10px", fontSize: 12, flexShrink: 0 }}
+                            >
+                              ✓ Engaged
+                            </Btn>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
 
                   <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                     <span style={{ fontSize: 11, color: C.muted, flexShrink: 0 }}>Contacted:</span>
