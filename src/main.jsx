@@ -357,34 +357,58 @@ const mapAppStatusToContactStatus = (appStatus) => APP_TO_CONTACT_STATUS[appStat
    contact, email, phone, linkedin, status, etc.) — used both when converting
    a whole application into an account, and when merging a second application
    for the same company+role into an account as an additional contact. */
+/* Everything the application knew about the PERSON, carried across. This used
+   to silently drop the LinkedIn connection state, the engagement cadence, the
+   reply flag and the whole history log — so converting an old lead quietly
+   erased months of tracking. Conversion must never lose data; it changes the
+   shape of a record, not its contents. */
 function contactFromApplicationData(data) {
   return {
     id: uid(),
     name: data.contact || "",
-    position: "",
+    /* the role is the closest thing an application has to a job title, and
+       dropping it meant "generic person" drafts lost their role clause */
+    position: data.contactPosition || "",
     email: data.email || "",
     phone: data.contactPhone || "",
     linkedin: data.contactLinkedin || "",
     notes: data.notes || "",
     status: mapAppStatusToContactStatus(data.status),
     outreachKind: data.outreachKind || "",
+    outreachChannel: data.outreachChannel || "",
     contacted: data.contacted || "",
     followUps: Array.isArray(data.followUps) ? data.followUps.map((f) => ({ ...f })) : [],
     touchpoints: Array.isArray(data.touchpoints) ? data.touchpoints.map((t) => ({ ...t })) : [],
+    /* LinkedIn connection pipeline */
+    liStatus: data.liStatus || "",
+    liStatusAt: data.liStatusAt || "",
+    /* social engagement cadence */
+    socialActive: !!data.socialActive,
+    postFrequency: data.postFrequency || "",
+    socialSince: data.socialSince || "",
+    lastEngagedAt: data.lastEngagedAt || "",
+    /* "a human actually answered" — feeds the funnel's replied-vs-silent split */
+    gotReply: !!data.gotReply,
+    history: Array.isArray(data.history) ? data.history.map((h) => ({ ...h })) : [],
     linkedApplicationId: null,
   };
 }
+/* The company-level half. Notes and bad-fit reasons were being thrown away
+   here too — an application's notes are about the company as much as the
+   person, so they're kept on BOTH rather than picked between. */
 function convertApplicationToAccount(app) {
   return {
     id: uid(),
     company: app.company || "",
     website: app.website || "",
-    industry: "",
-    headcount: "",
+    industry: app.industry || "",
+    headcount: app.headcount || "",
     status: "",
     highConfidence: !!app.highConfidence,
-    badReasons: [],
-    notes: "",
+    badReasons: Array.isArray(app.badReasons) ? [...app.badReasons] : [],
+    notes: app.notes || "",
+    /* pool membership survives the shape change, so coverage doesn't drop */
+    ...(app.fromPool ? { fromPool: true, poolName: app.poolName || "", hook: app.hook || "", researchedAt: app.researchedAt || "", poolAddedAt: app.poolAddedAt || today() } : {}),
     contacts: [contactFromApplicationData(app)],
   };
 }
@@ -497,10 +521,14 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
       return { ...c, linkedApplicationId: null };
     }
 
+    /* mirror of contactFromApplicationData — the two directions must carry the
+       same fields, or a round trip through convert-and-sync would quietly
+       shed data each time it crossed */
     const payload = {
       company: accountCompany,
       website: accountWebsite,
       contact: c.name,
+      contactPosition: c.position || "",
       email: c.email,
       contactPhone: c.phone,
       contactLinkedin: c.linkedin,
@@ -508,8 +536,17 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
       status: mapContactStatusToAppStatus(c.status),
       contacted: c.contacted,
       outreachKind: c.outreachKind,
+      outreachChannel: c.outreachChannel || "",
       followUps: c.followUps || [],
       touchpoints: c.touchpoints || [],
+      liStatus: c.liStatus || "",
+      liStatusAt: c.liStatusAt || "",
+      socialActive: !!c.socialActive,
+      postFrequency: c.postFrequency || "",
+      socialSince: c.socialSince || "",
+      lastEngagedAt: c.lastEngagedAt || "",
+      gotReply: !!c.gotReply,
+      history: Array.isArray(c.history) ? c.history.map((h) => ({ ...h })) : [],
       notes: c.notes,
       fromAccountContact: true,
     };
@@ -2665,7 +2702,10 @@ function contactsOf(member) {
     return (e.contacts || [])
       .filter((c) => !c.archivedAt && !c.tombstoned && (c.name || "").trim())
       .map((c) => ({ id: c.id, name: c.name.trim(), position: (c.position || "").trim() }));
-  return (e.contact || "").trim() ? [{ id: ref.id, name: e.contact.trim(), position: (e.role || "").trim() }] : [];
+  /* deliberately NOT falling back to e.role — that's the job being applied
+     for, not this person's title, and "I saw you're the Senior Designer" to a
+     hiring manager is a wrong claim in the opening line */
+  return (e.contact || "").trim() ? [{ id: ref.id, name: e.contact.trim(), position: (e.contactPosition || "").trim() }] : [];
 }
 const firstNameOf = (n) => (n || "").trim().split(/\s+/)[0] || "";
 
@@ -8931,6 +8971,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         screenshotLink: entry?.screenshotLink || "",
         salary: entry?.salary || pre.salary || "",
         contact: entry?.contact || "",
+        contactPosition: entry?.contactPosition || "",
         email: entry?.email || "",
         contactLinkedin: entry?.contactLinkedin || "",
         contactPhone: entry?.contactPhone || "",
@@ -9133,6 +9174,37 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     runway: "Update runway numbers",
   };
 
+  /* ---- dismiss without losing work ----
+     The overlay used to call onClose directly, so tapping outside threw away
+     everything typed since opening — brutal for the content modal, where the
+     notes and draft fields hold the most work and the least urgency to press
+     Save. Now an outside tap COMMITS instead.
+
+     Two guards keep that from being its own problem: nothing happens unless
+     the form actually changed, and a brand-new entry is only created if it has
+     something identifying in it, so a stray tap can't litter the list with
+     blank records. */
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const initialRef = useRef(null);
+  useEffect(() => {
+    if (initialRef.current === null) initialRef.current = JSON.stringify(f);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const isDirty = () => initialRef.current !== null && initialRef.current !== JSON.stringify(f);
+  /* enough substance to be worth creating as a new record */
+  const hasSubstance = () => {
+    if (kind === "content") return !!(f.title || "").trim() || !!(f.notes || "").trim() || !!(f.draft || "").trim() || !!(f.outline || "").trim() || !!(f.hook || "").trim();
+    if (kind === "application" || kind === "account") return !!(f.company || "").trim();
+    return true;
+  };
+  const dismiss = () => {
+    if (isDirty() && (entry || hasSubstance())) {
+      save();
+      return;
+    }
+    onClose();
+  };
+
   const save = () => {
     if (kind === "application") {
       onSave({
@@ -9152,7 +9224,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
 
   return (
     <div
-      onClick={onClose}
+      onClick={dismiss}
       onTouchStart={(e) => e.stopPropagation()}
       onTouchEnd={(e) => e.stopPropagation()}
       style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
@@ -9164,7 +9236,16 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         style={{ width: "100%", maxWidth: ["application", "account"].includes(kind) ? 620 : kind === "content" ? 760 : 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
       >
         <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
-          <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 14 }}>{titles[kind]}</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, marginBottom: 14 }}>
+            <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink }}>{titles[kind]}</div>
+            {/* makes the commit-on-dismiss behaviour legible rather than magic */}
+            {isDirty() && (
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: 0.4, color: C.amber, flexShrink: 0, textAlign: "right", lineHeight: 1.4 }}>
+                UNSAVED
+                <div style={{ color: C.muted, letterSpacing: 0 }}>tap outside to save</div>
+              </div>
+            )}
+          </div>
         </div>
 
         <div style={{ flex: 1, overflowY: "auto", padding: "0 20px 16px", minHeight: 0 }}>
@@ -9318,6 +9399,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             <Field label="Salary / offer" value={f.salary} onChange={set("salary")} placeholder="e.g. ₱120K–150K/mo or $1,800/mo" />
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, alignItems: "flex-end" }}>
               <Field label="Contact person" value={f.contact} onChange={set("contact")} placeholder="e.g. Jane Cruz" />
+              {/* their title, not the role you're applying for — the two were
+                  being conflated, which put a wrong claim in draft openings */}
+              <Field label="Their position" value={f.contactPosition} onChange={set("contactPosition")} placeholder="e.g. Head of Design" />
               <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 12 }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <Field label="Email" value={f.email} onChange={set("email")} placeholder="jane@acme.com" />
@@ -11235,7 +11319,22 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
           ) : (
             <>
-              <Btn ghost onClick={onClose} style={{ flex: 1 }}>Cancel</Btn>
+              {/* Cancel still means cancel — but throwing away typed work on a
+                  single tap is how notes disappear, so when the form is dirty
+                  it asks once. */}
+              <Btn
+                ghost
+                color={confirmDiscard ? C.red : undefined}
+                onClick={() => {
+                  if (!isDirty()) return onClose();
+                  if (confirmDiscard) return onClose();
+                  setConfirmDiscard(true);
+                  setTimeout(() => setConfirmDiscard(false), 4000);
+                }}
+                style={{ flex: 1, ...(confirmDiscard ? { borderColor: C.red, color: C.red } : {}) }}
+              >
+                {confirmDiscard ? "Discard?" : "Cancel"}
+              </Btn>
               <Btn onClick={save} style={{ flex: 2 }}>Save</Btn>
             </>
           )}
