@@ -2641,48 +2641,70 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch, 
 /* The prompt deliberately forbids the padding that makes cold outreach read as
    template — no "hope this finds you well", no flattery preamble. The hook is
    the opening line because that's the whole point of having researched it. */
-const OUTREACH_SYSTEM = `You draft short, specific outreach emails for a freelance/in-house graphic designer approaching companies about work.
+/* ---- prompt construction ----
+   The prompt is BUILT from which sections the model actually owns, rather than
+   being a fixed "write an email" instruction with caveats bolted on.
 
-Hard rules:
-- Open with the specific hook you're given. Never open with "I came across your company" or similar.
-- 90-130 words in the body. Shorter is better than longer.
-- No "I hope this finds you well", no flattery preamble, no buzzwords.
-- One clear, low-friction ask at the end (a short call, or a reply if there's a fit).
-- Sound like a person writing one email, not a campaign.
-- If the hook is thin, say less rather than inventing detail. Never fabricate facts about the company, its funding, its people, or its work.
+   That distinction caused a real bug: the base rules said "one clear ask at the
+   end" and the user message supplied the sender's positioning, so the model
+   dutifully wrote an offer and an ask — then the fixed offer and ask were
+   appended underneath, and the email said everything twice. Telling a model
+   "write a complete email" and "don't write these parts of it" in the same
+   breath is a contradiction, and the stronger instruction wins.
 
-Return EXACTLY this shape and nothing else. No preamble, no explanation, no reasoning, no <think> blocks — start your reply with the word "Subject:":
-Subject: <subject line>
+   So: a rule only appears if the model is responsible for that part. */
+const OUTREACH_BASE = `You draft short, specific outreach emails for a freelance/in-house graphic designer approaching companies about work.`;
 
-<email body>`;
+const OUTREACH_RULES_ALWAYS = [
+  `No "I hope this finds you well", no flattery preamble, no buzzwords.`,
+  `Sound like a person writing one email, not a campaign.`,
+  `Never fabricate facts about the company, its funding, its people, or its work. If you don't know something, leave it out.`,
+];
 
-/* When the hook is the word "generic", there is no researched detail to open
-   with. Two honest paths from there, and which one applies depends entirely on
-   whether the model can actually see the web:
+function outreachRules(secs) {
+  const ai = (id) => secs[id]?.mode === "ai";
+  const rules = [...OUTREACH_RULES_ALWAYS];
+  if (ai("opening")) rules.push(`Open with the specific hook you're given. Never open with "I came across your company" or similar.`);
+  if (ai("ask")) rules.push(`End with one clear, low-friction ask (a short call, or a reply if there's a fit).`);
+  /* The corresponding NEGATIVE rules matter more than the positive ones — a
+     model's default is to produce a whole email, so it has to be told plainly
+     where its part stops. */
+  if (!ai("ask")) rules.push(`Do NOT write any call to action, closing question, or "would it be useful if…" line. The ask is already written and will follow your text. Your section must stop before it.`);
+  if (!ai("offer")) rules.push(`Do NOT describe what the sender does, their services, or their past clients. That is already written and will follow your text.`);
+  if (!ai("signoff")) rules.push(`Do NOT sign off, add a name, or close the email. That is already written.`);
+  if (!ai("subject")) rules.push(`Do NOT write a subject line.`);
+  return rules.map((r) => `- ${r}`).join("\n");
+}
 
-   WITH web search  — go and find a real hook, then write the email around it,
-                      and report the hook so it can be saved back to the record.
-   WITHOUT it       — do NOT pretend. A model working from training data that's
-                      asked to "research a company" will produce plausible,
-                      specific, wrong claims, and a fabricated detail in the
-                      opening line is worse than having no opening line at all.
-                      So it writes a short honest note instead. */
-const OUTREACH_SYSTEM_GENERIC_SEARCH = `${OUTREACH_SYSTEM}
+/* variant-specific guidance, appended after the rules */
+const VARIANT_BLOCKS = {
+  plain: "",
+  genericSearch: `
+The sender has not researched this company yet. Use web search to find ONE specific, recent, verifiable thing about them — a launch, a rebrand, a funding round, a design hire, a redesign — and open with it.
 
-The sender has not researched this company yet. Use web search to find ONE specific, recent, verifiable thing about them — a launch, a rebrand, a funding round, a design hire, a redesign — and open the email with it.
+Only use what you actually found in search results. If search returns nothing solid, return the hook line as "Hook: none found" and keep it plain rather than inventing specifics.
 
-Only use what you actually found in search results. If search returns nothing solid about this specific company, say so by returning the hook line as "Hook: none found" and write a short honest note with no invented specifics.
-
-Put this as the FIRST line of your reply, before the subject:
-Hook: <the one-line hook you found, or "none found">`;
-
-const OUTREACH_SYSTEM_GENERIC_NOSEARCH = `${OUTREACH_SYSTEM}
-
+Put this as the FIRST line of your reply:
+Hook: <the one-line hook you found, or "none found">`,
+  genericNoSearch: `
 The sender has not researched this company, and you have NO web access — you cannot look anything up.
 
-This is important: do not invent a hook. Do not reference a launch, rebrand, funding round, product, hire, or anything else specific about this company, because you have no way to know it and a wrong detail in the first line is worse than a plain opening. Anything you "remember" about this company may be outdated or wrong.
+Do not invent a hook. Do not reference a launch, rebrand, funding round, product, hire, or anything else specific about this company: you have no way to know it, and a wrong detail in the first line is worse than a plain one. Anything you "remember" about this company may be outdated or wrong.
 
-Instead write a short, honest note that works without a hook: who the sender is, why this kind of company, and one clear ask. Keep it under 90 words — a generic email should be brief and make no claim to have done homework it hasn't done.`;
+Keep your sections short and plain — a generic email should make no claim to have done homework it hasn't done.`,
+  genericPerson: `
+The sender has not researched this company, and you have NO web access. What you DO know is who you're writing to and what they do.
+
+Open by addressing them by first name and role, in this shape:
+"Hey <first name>, I saw you're the <position> so I had to reach out."
+Adapt the wording so it reads naturally, but keep it that short and direct.
+
+Do not invent anything about the company. If no position was supplied, drop that clause rather than guessing at their job.`,
+};
+
+function buildOutreachSystem(secs, variant) {
+  return [OUTREACH_BASE, "", "Hard rules:", outreachRules(secs), VARIANT_BLOCKS[variant] || "", "", "=== SECTIONS ===", buildSectionInstructions(secs)].filter((x) => x !== null).join("\n");
+}
 
 /* the sentinels the hook field understands */
 const isGenericHook = (h) => /^generic$/i.test((h || "").trim());
@@ -2709,19 +2731,6 @@ function contactsOf(member) {
 }
 const firstNameOf = (n) => (n || "").trim().split(/\s+/)[0] || "";
 
-const OUTREACH_SYSTEM_GENERIC_PERSON = `${OUTREACH_SYSTEM}
-
-The sender has not researched this company, and you have NO web access — you cannot look anything up. What you DO know is who you're writing to and what they do.
-
-Open by addressing them directly by first name and role, in this shape:
-"Hey <first name>, I saw you're the <position> so I had to reach out."
-
-Adapt the wording so it reads naturally rather than copied, but keep it that short and that direct.
-
-Then: do not invent anything about the company — no launches, funding rounds, products, redesigns or hires. You know the person's name and role and nothing else, and a wrong claim in the first paragraph is worse than a plain one. If no position was supplied, drop that clause rather than guessing at their job.
-
-Keep the whole thing under 90 words.`;
-
 /* ============================================================
    DRAFT SECTIONS — what the AI writes and what it must not touch
 
@@ -2736,13 +2745,32 @@ Keep the whole thing under 90 words.`;
    means consistent. The model still SEES your fixed text as context, so its
    sections don't duplicate or contradict the ask.
    ============================================================ */
+/* `scope` and `exclude` are sent to the model verbatim. The exclusions exist
+   because the section boundaries are genuinely ambiguous to a writer: asked to
+   write "why them / why you", almost any model will drift into credentials and
+   then finish with a call to action — which is precisely the offer and the ask
+   it was told not to touch. Naming the forbidden content per section works far
+   better than one general "don't repeat the fixed parts" instruction. */
 const DRAFT_SECTION_DEFS = [
-  { id: "subject", label: "Subject line", hint: "One line, specific, no clickbait" },
-  { id: "opening", label: "Opening — the hook", hint: "The researched detail. Almost always AI." },
-  { id: "bridge", label: "Why them / why you", hint: "Connects the hook to what you do" },
-  { id: "offer", label: "What you offer", hint: "Your standing pitch. Usually fixed." },
-  { id: "ask", label: "The ask", hint: "The one action you want. Usually fixed." },
-  { id: "signoff", label: "Sign-off", hint: "Name, link, portfolio. Almost always fixed." },
+  { id: "subject", label: "Subject line", hint: "One line, specific, no clickbait", scope: "A subject line only.", exclude: "No greeting, no body text." },
+  {
+    id: "opening",
+    label: "Opening — the hook",
+    hint: "The researched detail. Almost always AI.",
+    scope: "The greeting and ONE or TWO sentences about the specific thing you researched.",
+    exclude: "Do not describe what the sender does. Do not pitch. Do not ask for anything.",
+  },
+  {
+    id: "bridge",
+    label: "Why them / why you",
+    hint: "Connects the hook to what you do",
+    scope: "ONE sentence connecting the hook to why the sender is reaching out to THIS company.",
+    exclude:
+      "Do NOT list the sender's services, credentials, past clients or experience — that belongs to the offer. Do NOT propose anything, suggest a call, or end with a question — that belongs to the ask. One sentence, then stop.",
+  },
+  { id: "offer", label: "What you offer", hint: "Your standing pitch. Usually fixed.", scope: "What the sender does and why it's relevant here.", exclude: "No call to action." },
+  { id: "ask", label: "The ask", hint: "The one action you want. Usually fixed.", scope: "One clear, low-friction request.", exclude: "No new claims about the sender." },
+  { id: "signoff", label: "Sign-off", hint: "Name, link, portfolio. Almost always fixed.", scope: "Name and contact details.", exclude: "No further pitching." },
 ];
 const DEFAULT_DRAFT_SECTIONS = {
   subject: { mode: "ai", text: "" },
@@ -2806,22 +2834,86 @@ function buildSectionInstructions(secs) {
   aiIds.forEach((d) => lines.push(`[[${d.id}]]  — ${d.label}: ${d.hint}`));
   if (fixedIds.length) {
     lines.push("");
-    lines.push("The following parts are already written and will be appended verbatim after yours. Do NOT rewrite, repeat, summarise or contradict them — and do not include your own version of them:");
-    fixedIds.forEach((d) => lines.push(`(${d.label}) ${secs[d.id].text.trim()}`));
+    /* Showing the fixed text is a trade-off: it stops the model contradicting
+       the ask, but it also invites imitation. The framing is therefore
+       explicit that this is CONTEXT ONLY, and the negative rules above carry
+       the real weight. */
+    lines.push("For context only — these parts are ALREADY WRITTEN and will be appended after your sections, word for word. You must not restate, paraphrase, preview or echo any of them. If your draft says anything these already say, delete it:");
+    fixedIds.forEach((d) => lines.push(`(${d.label}, already written) ${secs[d.id].text.trim()}`));
+    lines.push("");
+    lines.push("Write ONLY your own sections. Assume the reader will read yours and then those, in order.");
   }
   lines.push("");
-  lines.push(`Keep your sections to roughly ${Math.max(40, 110 - fixedIds.length * 15)} words in total. Output nothing except the marked sections.`);
+  const bodyIds = aiIds.filter((d) => d.id !== "subject");
+  lines.push(`Your sections together should be roughly ${Math.max(30, bodyIds.length * 35)} words — this is a fragment of an email, not a whole one. Output nothing except the marked sections.`);
   return lines.join("\n");
 }
 
 /* Pulls the [[marked]] blocks out and assembles the final email in section
    order, substituting your fixed text unchanged. */
+/* Prompt rules reduce duplication; they don't guarantee it. This catches what
+   slips through by comparing the model's sentences against the fixed text and
+   dropping ones that say the same thing. Deliberately conservative — it needs
+   a strong content-word overlap, so a shared word or two won't delete a good
+   sentence. */
+const contentWords = (str) =>
+  new Set(
+    String(str || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 3)
+  );
+/* Two thresholds, because certainty varies. Above DROP the sentence is almost
+   word-for-word and goes silently. Between SUSPECT and DROP it's a semantic
+   restatement — same claim, different words — which is too risky to delete on
+   a guess but exactly what you want flagged. A real case: an AI bridge saying
+   "I help tech and IT companies develop visual collateral" against a fixed
+   offer saying "Creative Specialist... develop their marketing collateral"
+   scores 0.50 — obviously duplicated to a reader, invisible to a strict cut. */
+const ECHO_DROP = 0.6;
+const ECHO_SUSPECT = 0.42;
+function dropEchoes(aiText, fixedTexts) {
+  const fixedSets = fixedTexts.filter(Boolean).map(contentWords);
+  if (!fixedSets.length || !aiText) return { text: aiText, suspect: false };
+  const sentences = String(aiText).split(/(?<=[.!?])\s+/);
+  let suspect = false;
+  const kept = sentences.filter((sent) => {
+    const w = contentWords(sent);
+    if (w.size < 4) return true; /* too short to judge — keep it */
+    let worst = 0;
+    fixedSets.forEach((fw) => {
+      let hits = 0;
+      w.forEach((x) => {
+        if (fw.has(x)) hits++;
+      });
+      worst = Math.max(worst, hits / w.size);
+    });
+    if (worst >= ECHO_DROP) return false;
+    if (worst >= ECHO_SUSPECT) suspect = true;
+    return true;
+  });
+  /* never return nothing — if every sentence looked like an echo, the overlap
+     check is more likely wrong than the model */
+  return { text: kept.length ? kept.join(" ").trim() : String(aiText).trim(), suspect };
+}
+
 function assembleDraft(raw, secs, vars) {
   const got = {};
   const re = /\[\[(\w+)\]\]\s*([\s\S]*?)(?=\n\s*\[\[\w+\]\]|$)/g;
   let m;
   while ((m = re.exec(raw || ""))) got[m[1]] = m[2].trim();
-  const pick = (id) => (secs[id].mode === "fixed" ? fillTokens(secs[id].text.trim(), vars || {}) : got[id] || "");
+  /* substituted BEFORE comparing: the model writes "Stanfield IT" while the
+     fixed text still says "[Company]", so an unfilled comparison scores the
+     company name as a difference and understates the overlap every time */
+  const fixedTexts = DRAFT_SECTION_DEFS.filter((d) => secs[d.id].mode === "fixed").map((d) => fillTokens(secs[d.id].text.trim(), vars || {}));
+  const echoWarnings = [];
+  const pick = (id) => {
+    if (secs[id].mode === "fixed") return fillTokens(secs[id].text.trim(), vars || {});
+    const r = dropEchoes(got[id] || "", fixedTexts);
+    if (r.suspect) echoWarnings.push(DRAFT_SECTION_DEFS.find((d) => d.id === id)?.label || id);
+    return r.text;
+  };
   /* Which AI-mode sections came back empty. Without this the fixed sections
      assemble into something that LOOKS like a finished email — the exact
      failure that made a missing subject and opening look like a normal draft. */
@@ -2833,8 +2925,8 @@ function assembleDraft(raw, secs, vars) {
     .join("\n\n");
   /* if the model ignored the markers entirely, fall back to its raw text so a
      usable draft still reaches the screen rather than an empty box */
-  if (!subject && !body) return { text: (raw || "").trim(), missing };
-  return { text: `${subject ? `Subject: ${subject}\n\n` : ""}${body}`, missing };
+  if (!subject && !body) return { text: (raw || "").trim(), missing, echoWarnings };
+  return { text: `${subject ? `Subject: ${subject}\n\n` : ""}${body}`, missing, echoWarnings };
 }
 
 /* ---------- supabase rpc ---------- */
@@ -4504,16 +4596,19 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       e.industry ? `Industry: ${e.industry}` : "",
       e.notes ? `Other notes: ${String(e.notes).slice(0, 400)}` : "",
       "",
-      `About the sender: ${state.settings?.aiPitch || "A graphic designer looking for in-house or contract work. No positioning paragraph was provided, so keep claims about the sender minimal and generic rather than inventing specifics."}`,
+      /* The pitch is only supplied when the model actually writes the offer.
+         Handing it over while the offer section is fixed is what produced
+         drafts that pitched the sender twice. */
+      secs.offer?.mode === "ai"
+        ? `About the sender: ${state.settings?.aiPitch || "A graphic designer looking for in-house or contract work. No positioning paragraph was provided, so keep claims about the sender minimal rather than inventing specifics."}`
+        : "Do not introduce the sender or describe their services — that is already written and follows your text.",
     ].filter(Boolean);
     const raw = await callAI({
       provider: state.settings?.aiProvider,
       model: state.settings?.aiModel,
       baseUrl: state.settings?.aiBaseUrl,
       key: readAiKey(),
-      system: `${
-        personMode ? OUTREACH_SYSTEM_GENERIC_PERSON : generic ? (canSearch ? OUTREACH_SYSTEM_GENERIC_SEARCH : OUTREACH_SYSTEM_GENERIC_NOSEARCH) : OUTREACH_SYSTEM
-      }\n\n=== SECTIONS ===\n${buildSectionInstructions(secs)}`,
+      system: buildOutreachSystem(secs, personMode ? "genericPerson" : generic ? (canSearch ? "genericSearch" : "genericNoSearch") : "plain"),
       user: lines.join("\n"),
       webSearch: generic && canSearch && !personMode,
       maxTokens: state.settings?.aiMaxTokens,
@@ -4530,8 +4625,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       industry: (e.industry || "").trim(),
       me: (state.settings?.aiSenderName || "").trim(),
     };
-    const { text, missing } = assembleDraft(raw.replace(/^\s*Hook:.*$/im, "").trim(), secs, vars);
-    return { text, missing, foundHook, generic, personMode, target, searched: generic && canSearch && !personMode };
+    const { text, missing, echoWarnings } = assembleDraft(raw.replace(/^\s*Hook:.*$/im, "").trim(), secs, vars);
+    return { text, missing, echoWarnings, foundHook, generic, personMode, target, searched: generic && canSearch && !personMode };
   };
 
   const saveDraftToRecord = (ref, text) =>
@@ -4567,8 +4662,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           errors.push({ key: member.key, company: member.company, text: "skipped — no named contact to write to", retry: false });
           continue;
         }
-        const { text, missing } = await generateDraft(member, people[0]);
+        const { text, missing, echoWarnings } = await generateDraft(member, people[0]);
         saveDraftToRecord(member.refs[0], text);
+        if (echoWarnings && echoWarnings.length) errors.push({ key: member.key, company: member.company, text: `${echoWarnings.join(", ")} may repeat your fixed text`, retry: true });
         /* retry:true marks the ones a second attempt could actually fix. The
            contact-choice note is information, not a fault — redrafting a good
            email because it warned you would just cost money. */
@@ -4602,8 +4698,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     setDraftModal({ member, text: "", loading: true, error: "" });
     try {
-      const { text, missing, foundHook, generic, searched, personMode, target } = await generateDraft(member, opts.contact);
-      setDraftModal({ member, text, loading: false, error: "", foundHook, searched, generic, missing, personMode, target });
+      const { text, missing, echoWarnings, foundHook, generic, searched, personMode, target } = await generateDraft(member, opts.contact);
+      setDraftModal({ member, text, loading: false, error: "", foundHook, searched, generic, missing, echoWarnings, personMode, target });
       saveDraftToRecord(ref, text);
     } catch (err) {
       setDraftModal({ member, text: "", loading: false, error: err?.message || "Draft failed", generic: isGenericHook(hook) || isGenericPersonHook(hook) });
@@ -8916,6 +9012,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           loading={draftModal.loading}
           error={draftModal.error}
           missing={draftModal.missing}
+          echoWarnings={draftModal.echoWarnings}
           pickContacts={draftModal.pickContacts}
           personMode={draftModal.personMode}
           target={draftModal.target}
@@ -11831,7 +11928,7 @@ function ContactHistoryModal({ contact, company, onClose }) {
   );
 }
 
-function DraftModal({ member, text, loading, error, onClose, onRegenerate, foundHook, searched, generic, onSaveHook, missing, pickContacts, onPickContact, personMode, target }) {
+function DraftModal({ member, text, loading, error, onClose, onRegenerate, foundHook, searched, generic, onSaveHook, missing, echoWarnings, pickContacts, onPickContact, personMode, target }) {
   const [copied, setCopied] = useState(false);
   const [edited, setEdited] = useState(text || "");
   useEffect(() => setEdited(text || ""), [text]);
@@ -11917,6 +12014,12 @@ function DraftModal({ member, text, loading, error, onClose, onRegenerate, found
           </div>
         )}
 
+        {!pickContacts && !loading && !error && echoWarnings && echoWarnings.length > 0 && (
+          <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12, fontSize: 12, color: C.amber, lineHeight: 1.55 }}>
+            ⚠ <strong>{echoWarnings.join(", ")}</strong> may say the same thing as your fixed offer or ask. Near-identical sentences were removed automatically; these are close
+            enough to check but not to cut. Read the draft as a whole before sending.
+          </div>
+        )}
         {!pickContacts && !loading && !error && missing && missing.length > 0 && (
           <div style={{ background: "rgba(248,113,113,0.08)", border: `1px solid ${C.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12, fontSize: 12, color: C.red, lineHeight: 1.55 }}>
             ⚠ The model didn&apos;t return: <strong>{missing.join(", ")}</strong>. What&apos;s below is only your fixed sections. Hit Redraft — if it keeps happening, raise the
