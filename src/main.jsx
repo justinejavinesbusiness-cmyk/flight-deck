@@ -5455,8 +5455,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       }, entry ? "Account updated" : "Account tracked");
       if (!entry) setCrmView("accounts"); /* land on the Accounts table after creating one */
       if (winMsg) setTimeout(() => flash(winMsg), 400);
-    } else if (kind === "copyDraft") {
-      onSave({ ...f });
     } else if (kind === "content") {
       let winMsg = "";
       mutate((s) => {
@@ -9565,6 +9563,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
   };
 
   const save = () => {
+    /* copyDraft is a plain record — the generic tail below would work, but an
+       explicit branch keeps it from silently inheriting future changes meant
+       for other kinds */
+    if (kind === "copyDraft") return onSave({ ...f });
     if (kind === "application") {
       onSave({
         ...f,
