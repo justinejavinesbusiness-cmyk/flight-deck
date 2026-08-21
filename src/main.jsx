@@ -36,7 +36,47 @@ const C = {
   blue: "#7DB0F7",
 };
 
-const MODES = ["DASHBOARD", "GOAL", "PIPELINE", "CONTENT", "EMOTIONS", "RUNWAY", "HISTORY"];
+const MODES = ["DASHBOARD", "GOAL", "PIPELINE", "CONTENT", "EMOTIONS", "COPY", "HISTORY"];
+
+/* ============================================================
+   COPY LIBRARY
+
+   A reusable store of email copy, kept separate from any one lead. The reason
+   it exists: the same message gets rewritten from scratch every time, so
+   nothing is ever tested. A library makes copy comparable — you grade what
+   worked, and next time you start from the best version instead of a blank box.
+
+   Drafts are slotted by PURPOSE (first contact, follow-up 1..N, re-engage),
+   which is what lets a follow-up row pull the right one automatically.
+   ============================================================ */
+const COPY_PURPOSES = [
+  { key: "outreach", label: "First contact", hint: "The opening message" },
+  { key: "followup:1", label: "Follow-up 1", hint: "First nudge, usually days later" },
+  { key: "followup:2", label: "Follow-up 2", hint: "Second nudge — change the angle" },
+  { key: "followup:3", label: "Follow-up 3", hint: "Last in the sequence" },
+  { key: "followup:4", label: "Follow-up 4+", hint: "Anything beyond the third" },
+  { key: "reconnect", label: "Re-engage", hint: "For nurture and gone-cold leads" },
+  { key: "other", label: "Other", hint: "Thank-yous, replies, anything else" },
+];
+const copyPurposeLabel = (k) => COPY_PURPOSES.find((p) => p.key === k)?.label || "Other";
+/* follow-up rows are 0-indexed internally; anything past the third shares the
+   "4+" slot rather than creating an endless list of near-identical purposes */
+const purposeForFollowUp = (i) => (i >= 3 ? "followup:4" : `followup:${i + 1}`);
+const normCopyDraft = (d) => ({
+  id: d?.id || uid(),
+  title: d?.title || "",
+  body: d?.body || "",
+  purpose: COPY_PURPOSES.some((p) => p.key === d?.purpose) ? d.purpose : "outreach",
+  grade: Math.max(0, Math.min(5, +d?.grade || 0)),
+  source: d?.source === "ai" ? "ai" : "user",
+  createdAt: d?.createdAt || today(),
+  timesUsed: Math.max(0, +d?.timesUsed || 0),
+  lastUsedAt: d?.lastUsedAt || "",
+});
+/* best = highest graded, then most used, then newest. Ungraded drafts sort
+   last so a fresh untested draft never displaces one you've rated. */
+const rankCopy = (a, b) => b.grade - a.grade || b.timesUsed - a.timesUsed || (b.createdAt || "").localeCompare(a.createdAt || "");
+const bestCopyFor = (drafts, purpose) => (drafts || []).filter((d) => d.purpose === purpose).sort(rankCopy)[0] || null;
 /* ---- navigation glyphs ----
    One visual family: thin monochrome geometric shapes, no colour emoji. The
    old set mixed both (⌂ ▦ ♡ ★ against 🎯 📝 ⛽), so three items carried their
@@ -53,7 +93,7 @@ const NAV_ITEMS = [
   ["▤", "CRM", 2],
   ["✎", "Content", 3],
   ["♡", "Mind", 4],
-  ["◑", "Fuel", 5],
+  ["✉", "Copy", 5],
   ["☆", "Wins", 6],
 ];
 
@@ -63,7 +103,7 @@ const TITLES = {
   PIPELINE: "Pipeline (CRM)",
   CONTENT: "Content",
   EMOTIONS: "Mind",
-  RUNWAY: "Runway Gauge",
+  COPY: "Copy Library",
   HISTORY: "Accomplishments",
 };
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -2198,6 +2238,7 @@ const DEFAULT_STATE = {
   goal: null,
   cycleCount: 0,
   runway: { fund: 1200000, expenses: 50000 },
+  copyDrafts: [],
   settings: { checkinDay: 1, timezoneOffset: 8 },
   lastCheckinMonth: null,
   lastDigestShownDate: null,
@@ -2207,6 +2248,16 @@ const DEFAULT_STATE = {
      pulls them in. This is the pressure valve: ideas keep arriving whether the
      pool is open or not, and blocking them outright just makes you fight the app. */
   poolBench: [],
+  /* ---- housekeeping snoozes ----
+     Skipping used to live in the modal's own state, so it evaporated the
+     moment the modal closed and every skipped entry came straight back on the
+     next open. "Skip" has to mean "not now" for longer than the session or
+     it's just a way to scroll.
+
+     Stored as { key, until } and re-offered after the snooze window — a stale
+     entry you deliberately kept should still resurface eventually, otherwise
+     it's silently dropped from the sweep forever. */
+  housekeepingSnoozes: [],
   /* ---- deletion tombstones ----
      Sync merges the local and remote copies with a UNION, which can only ever
      ADD records — it has no way to express "this one is gone". So a delete was
@@ -2232,6 +2283,10 @@ function migrate(saved) {
   if (!Array.isArray(s.content)) s.content = [];
   if (!Array.isArray(s.archivedCsvRows)) s.archivedCsvRows = [];
   if (!Array.isArray(s.poolBench)) s.poolBench = [];
+  if (!Array.isArray(s.housekeepingSnoozes)) s.housekeepingSnoozes = [];
+  s.copyDrafts = Array.isArray(s.copyDrafts) ? s.copyDrafts.map(normCopyDraft) : [];
+  /* drop expired snoozes so the list can't grow forever */
+  s.housekeepingSnoozes = s.housekeepingSnoozes.filter((x) => x && x.key && x.until && x.until > today());
   if (!Array.isArray(s.deletedIds)) s.deletedIds = [];
   /* tombstones only need to outlive the window in which a stale copy could
      still resurface; 180 days is far beyond that, and pruning keeps the
@@ -2349,10 +2404,16 @@ function mergeStates(localS, remoteS) {
     decisions: alive(unionById(localS.decisions, remoteS.decisions)),
     accomplishments: alive(unionById(localS.accomplishments, remoteS.accomplishments)),
     poolBench: alive(unionById(localS.poolBench, remoteS.poolBench)),
+    /* keyed by proposal key, not id — union by key so a snooze made on one
+       device isn't undone by a sync from another */
+    housekeepingSnoozes: Array.from(
+      new Map([...(localS.housekeepingSnoozes || []), ...(remoteS.housekeepingSnoozes || [])].filter((x) => x && x.key).map((x) => [x.key, x])).values()
+    ),
     supportSessions: alive(unionById(localS.supportSessions, remoteS.supportSessions)),
     goal: remoteS.goal || localS.goal || null,
     cycleCount: Math.max(localS.cycleCount || 0, remoteS.cycleCount || 0),
     runway: remoteS.runway || localS.runway,
+    copyDrafts: alive(unionById(localS.copyDrafts, remoteS.copyDrafts)),
     settings: { ...localS.settings, ...remoteS.settings },
     lastCheckinMonth:
       (remoteS.lastCheckinMonth || "") > (localS.lastCheckinMonth || "")
@@ -3278,6 +3339,7 @@ export default function FlightDeck() {
      re-deriving it would yank the view out from under you mid-session. */
   const [poolView, setPoolView] = useState(null);
   const [poolSearch, setPoolSearch] = useState("");
+  const [copyFilter, setCopyFilter] = useState("all");
   useEffect(() => setPipePage(0), [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
   /* bulk selection for converting applications to accounts */
   const [selectMode, setSelectMode] = useState(false);
@@ -3546,7 +3608,21 @@ export default function FlightDeck() {
     [state.accounts]
   );
   const totalDueCount = dueList.length + dueContactsCount;
-  const housekeepingProposals = useMemo(() => computeHousekeepingProposals(state, apps), [state.applications, state.accounts]);
+  const housekeepingProposals = useMemo(() => {
+    /* a skipped entry stays hidden until its snooze expires, so the badge
+       count reflects what's actually waiting on a decision */
+    const snoozed = new Set((state.housekeepingSnoozes || []).filter((x) => x.until > today()).map((x) => x.key));
+    return computeHousekeepingProposals(state, apps).filter((p) => !snoozed.has(p.type + (p.id || p.contactId)));
+  }, [state.applications, state.accounts, state.housekeepingSnoozes]);
+  /* default 30 days: long enough that "not now" means something, short enough
+     that a genuinely dead entry comes back rather than vanishing */
+  const snoozeHousekeeping = (keys, days = 30) =>
+    mutate((st) => {
+      const until = addDays(today(), days);
+      const byKey = new Map((st.housekeepingSnoozes || []).map((x) => [x.key, x]));
+      keys.forEach((k) => byKey.set(k, { key: k, until }));
+      return { ...st, housekeepingSnoozes: Array.from(byKey.values()) };
+    });
 
   const weekRows = useMemo(() => {
     const map = new Map();
@@ -5379,6 +5455,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       }, entry ? "Account updated" : "Account tracked");
       if (!entry) setCrmView("accounts"); /* land on the Accounts table after creating one */
       if (winMsg) setTimeout(() => flash(winMsg), 400);
+    } else if (kind === "copyDraft") {
+      onSave({ ...f });
     } else if (kind === "content") {
       let winMsg = "";
       mutate((s) => {
@@ -5424,6 +5502,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         }),
         entry ? "Accomplishment updated" : "Accomplishment logged"
       );
+    } else if (kind === "copyDraft") {
+      saveCopyDraft(data);
+      setModal(null);
+      return;
     } else if (kind === "runway") {
       mutate(
         (s) => ({
@@ -5578,6 +5660,29 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   };
 
   /* ============ SECTION RENDERERS ============ */
+
+  /* ---- outreach discipline metrics ----
+     These answer a different question from the funnel. The funnel says how
+     many replies you got; these say whether you actually worked the leads —
+     the most common reason a search underperforms isn't the message, it's
+     stopping after one touch. */
+  const outreachStats = useMemo(() => {
+    const leads = apps.filter((a) => !a.archivedAt && !a.tombstoned && a.contacted && !isBlankStatus(a));
+    const contacts = (state.accounts || []).flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt && c.contacted && c.status));
+    const all = [...leads, ...contacts];
+    const doneFus = all.reduce((n, x) => n + (x.followUps || []).filter((f) => f.done).length, 0);
+    const avgFollowUps = all.length ? doneFus / all.length : 0;
+    /* a lead sitting at one touch with nothing scheduled is the leak */
+    const oneAndDone = all.filter((x) => (x.followUps || []).filter((f) => f.done).length === 0 && isOpenApp(x)).length;
+
+    const liAll = [...apps, ...contacts].filter((x) => !x.archivedAt && (x.linkedin || x.contactLinkedin) && x.liStatus);
+    const requested = liAll.filter((x) => ["requested", "connected", "declined", "withdrawn"].includes(x.liStatus)).length;
+    const accepted = liAll.filter((x) => x.liStatus === "connected").length;
+    const pending = liAll.filter((x) => x.liStatus === "requested").length;
+    const liRate = requested ? Math.round((accepted / requested) * 100) : null;
+
+    return { leads: all.length, avgFollowUps, oneAndDone, requested, accepted, pending, liRate };
+  }, [apps, state.accounts]);
 
   const renderDashboard = () => {
     const g = computeGoal(state.goal, apps, state);
@@ -5770,12 +5875,69 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ["OFFERS", totals.offers, totals.offers > 0 ? C.green : C.ink],
           ["RUNWAY", months.toFixed(1) + "mo", zone.color],
         ].map(([k, v, col]) => (
-          <div key={k} style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
+          <div
+            key={k}
+            /* Runway lost its own tab but not its job — it still sets the zone
+               the whole app reads, and the playbook makes decisions from it.
+               So the card stays and became the way to edit it. */
+            onClick={k === "RUNWAY" ? () => setModal({ kind: "runway", entry: { fund: state.runway.fund, expenses: state.runway.expenses } }) : undefined}
+            title={k === "RUNWAY" ? "Update your runway numbers" : undefined}
+            style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px", cursor: k === "RUNWAY" ? "pointer" : "default" }}
+          >
             <div style={{ fontSize: 9, letterSpacing: "0.16em", color: C.muted }}>{k}</div>
             <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 700, color: col }}>{v}</div>
           </div>
         ))}
       </div>
+
+      {/* ---- outreach discipline ----
+          Sits above the funnel because it explains it: a low reply rate with
+          0.4 follow-ups per lead is a persistence problem, not a copy problem,
+          and those two get confused constantly. */}
+      {outreachStats.leads > 0 && (
+        <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+          <Label>Outreach discipline</Label>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 8 }}>
+            <div style={{ flex: "1 1 118px" }}>
+              <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: outreachStats.avgFollowUps >= 2 ? C.green : outreachStats.avgFollowUps >= 1 ? C.amber : C.red }}>
+                {outreachStats.avgFollowUps.toFixed(1)}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>follow-ups per lead</div>
+            </div>
+            <div style={{ flex: "1 1 118px" }}>
+              <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: outreachStats.oneAndDone > outreachStats.leads / 2 ? C.red : C.ink }}>{outreachStats.oneAndDone}</div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>open, never followed up</div>
+            </div>
+            <div style={{ flex: "1 1 118px" }}>
+              <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: outreachStats.liRate === null ? C.muted : outreachStats.liRate >= 40 ? C.green : C.amber }}>
+                {outreachStats.liRate === null ? "—" : `${outreachStats.liRate}%`}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>
+                LinkedIn accepted
+                {outreachStats.requested > 0 && (
+                  <span style={{ fontFamily: mono }}>
+                    {" "}
+                    ({outreachStats.accepted}/{outreachStats.requested})
+                  </span>
+                )}
+              </div>
+            </div>
+            {outreachStats.pending > 0 && (
+              <div style={{ flex: "1 1 118px" }}>
+                <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: C.amber }}>{outreachStats.pending}</div>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>requests pending</div>
+              </div>
+            )}
+          </div>
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 10 }}>
+            {outreachStats.avgFollowUps < 1
+              ? "Under one follow-up per lead. Most replies come from the second or third touch, so this is the cheapest thing to change."
+              : outreachStats.avgFollowUps < 2
+              ? "Roughly one follow-up each. Two or three is where reply rates usually move."
+              : "Leads are being worked properly — a weak reply rate here points at the copy, not the persistence."}
+          </div>
+        </div>
+      )}
 
       {/* donut analytics — by status, by source, or warm/cold outreach */}
       <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
@@ -8641,72 +8803,156 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     </>
   );
 
-  const renderRunway = () => (
-    <>
-      <div
-        onClick={() => setModal({ kind: "runway", entry: { fund: state.runway.fund, expenses: state.runway.expenses } })}
-        style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14, cursor: "pointer" }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-          <Label>Runway remaining ({isDesktop ? "click" : "tap"} to update numbers)</Label>
-          <div style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>
-            ₱{Number(state.runway.fund).toLocaleString()} ÷ ₱{Number(state.runway.expenses).toLocaleString()}
-          </div>
+  /* ---- copy library actions ---- */
+  const saveCopyDraft = (draft) =>
+    mutate((st) => {
+      const d = normCopyDraft(draft);
+      const exists = (st.copyDrafts || []).some((x) => x.id === d.id);
+      return { ...st, copyDrafts: exists ? st.copyDrafts.map((x) => (x.id === d.id ? d : x)) : [d, ...(st.copyDrafts || [])] };
+    }, "Copy saved");
+  const deleteCopyDraft = (id) =>
+    mutate((st) => ({ ...st, copyDrafts: (st.copyDrafts || []).filter((x) => x.id !== id), deletedIds: tombstones(st, [id]) }), "Copy deleted");
+  const gradeCopyDraft = (id, grade) =>
+    mutate((st) => ({ ...st, copyDrafts: (st.copyDrafts || []).map((x) => (x.id === id ? { ...x, grade: x.grade === grade ? 0 : grade } : x)) }));
+  /* every use is counted, which is what makes "best" mean something over time */
+  const markCopyUsed = (id) =>
+    mutate((st) => ({ ...st, copyDrafts: (st.copyDrafts || []).map((x) => (x.id === id ? { ...x, timesUsed: (x.timesUsed || 0) + 1, lastUsedAt: today() } : x)) }));
+
+  const [copyBusy, setCopyBusy] = useState("");
+  /* fills a library draft with THIS lead's details and puts it on the
+     clipboard. Falls back to a clear message rather than copying an empty
+     string, which would look like it worked. */
+  const copyFollowUpDraft = (index, formData) => {
+    const purpose = purposeForFollowUp(index);
+    const draft = bestCopyFor(state.copyDrafts, purpose);
+    if (!draft) return flash(`No "${copyPurposeLabel(purpose)}" copy saved yet — add one in Copy`);
+    const filled = fillTokens(draft.body, {
+      company: formData.company || "",
+      "first name": firstNameOf(formData.contact || ""),
+      name: (formData.contact || "").trim(),
+      position: (formData.contactPosition || "").trim(),
+      role: (formData.role || "").trim(),
+      hook: (formData.hook || "").trim(),
+      industry: (formData.industry || "").trim(),
+      me: (state.settings?.aiSenderName || "").trim(),
+    });
+    (navigator.clipboard?.writeText(filled) || Promise.reject()).then(
+      () => {
+        markCopyUsed(draft.id);
+        flash(`⧉ Copied "${draft.title || copyPurposeLabel(purpose)}"`);
+      },
+      () => flash("Couldn't reach the clipboard")
+    );
+  };
+  const aiWriteCopy = async (purpose) => {
+    setCopyBusy(purpose);
+    try {
+      const p = COPY_PURPOSES.find((x) => x.key === purpose);
+      /* written as a TEMPLATE, not a one-off: tokens stay in place so the same
+         draft works for every lead it's later applied to */
+      const text = await callAI({
+        provider: state.settings?.aiProvider,
+        model: state.settings?.aiModel,
+        baseUrl: state.settings?.aiBaseUrl,
+        key: readAiKey(),
+        maxTokens: state.settings?.aiMaxTokens,
+        system: `You write short, reusable outreach email templates for a freelance/in-house designer.
+
+Rules:
+- This is a TEMPLATE for many companies, not one email. Use these placeholders literally where they belong: [Company], [First name], [Position], [Hook], [Me].
+- 60-110 words. No "I hope this finds you well", no flattery preamble, no buzzwords.
+- One clear, low-friction ask.
+- Never invent facts about any company.
+
+Return exactly:
+Subject: <subject line>
+
+<body>`,
+        user: `Purpose: ${p?.label} — ${p?.hint}
+About the sender: ${state.settings?.aiPitch || "A graphic designer looking for in-house or contract work."}
+${purpose.startsWith("followup") ? "This is a follow-up to an earlier unanswered message. Do not repeat the original pitch — change the angle and keep it shorter than a first contact." : ""}
+${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fresh, low-pressure restart rather than another chase." : ""}`,
+      });
+      saveCopyDraft({ title: `${p?.label} draft`, body: text, purpose, source: "ai" });
+    } catch (e) {
+      flash(e?.message || "Couldn't write that");
+    }
+    setCopyBusy("");
+  };
+
+  const renderCopy = () => {
+    const drafts = (state.copyDrafts || []).slice().sort(rankCopy);
+    const byPurpose = COPY_PURPOSES.map((p) => ({ ...p, items: drafts.filter((d) => d.purpose === p.key) }));
+    const shown = copyFilter === "all" ? byPurpose : byPurpose.filter((g) => g.key === copyFilter);
+    return (
+      <>
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 12 }}>
+          Reusable email copy, graded by how it performs. Follow-up rows in the CRM pull from here, so grading a draft actually changes what you send next.
+          Placeholders like <span style={{ fontFamily: mono, color: C.blue }}>[Company]</span> are filled in when you use one.
         </div>
-        <div style={{ fontFamily: mono, fontSize: 44, fontWeight: 800, color: zone.color, lineHeight: 1.1 }}>
-          {months.toFixed(1)}
-          <span style={{ fontSize: 16, color: C.muted, marginLeft: 8 }}>months</span>
-        </div>
-        <div style={{ height: 10, background: C.bg, borderRadius: 5, marginTop: 12, overflow: "hidden", border: `1px solid ${C.panelEdge}` }}>
-          <div style={{ height: "100%", width: `${Math.min((months / 24) * 100, 100)}%`, background: zone.color, borderRadius: 5, transition: "width 0.4s ease" }} />
-        </div>
-        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
-          {["0", "3", "6", "12", "24 mo"].map((t) => (
-            <span key={t} style={{ fontFamily: mono, fontSize: 9, color: C.muted }}>{t}</span>
+
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+          {[["all", `All (${drafts.length})`], ...COPY_PURPOSES.map((p) => [p.key, `${p.label} (${drafts.filter((d) => d.purpose === p.key).length})`])].map(([k, label]) => (
+            <button
+              key={k}
+              onClick={() => setCopyFilter(k)}
+              style={{
+                fontFamily: sans,
+                fontSize: 11,
+                fontWeight: 700,
+                padding: "6px 10px",
+                borderRadius: 20,
+                cursor: "pointer",
+                border: `1px solid ${copyFilter === k ? C.amber : C.panelEdge}`,
+                background: copyFilter === k ? "rgba(245,185,66,0.12)" : "transparent",
+                color: copyFilter === k ? C.amber : C.muted,
+              }}
+            >
+              {label}
+            </button>
           ))}
         </div>
-        <div style={{ marginTop: 12, fontFamily: mono, fontSize: 11, letterSpacing: "0.14em", color: zone.color }}>▮ {zone.name}</div>
-        <div style={{ fontSize: 13, color: C.muted, marginTop: 4, lineHeight: 1.5 }}>{zone.note}</div>
-      </div>
 
-      <div
-        onClick={() => setModal({ kind: "checkinDay", entry: { day: checkinDay, timezoneOffset: state.settings?.timezoneOffset, contentSchedule: state.contentSchedule } })}
-        style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 14px", marginBottom: 14, cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
-      >
-        <div style={{ fontSize: 13, color: C.muted }}>Settings: check-in day & follow-up defaults</div>
-        <div style={{ fontFamily: mono, fontSize: 14, color: C.amber, fontWeight: 700 }}>
-          Day {checkinDay}{state.lastCheckinMonth === thisMonth() ? " · ✓ done this month" : checkinDue ? " · ⚠ due" : ""}
-        </div>
-      </div>
+        {shown.map((g) => (
+          <div key={g.key} style={{ marginBottom: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <div>
+                <Label>{g.label}</Label>
+                <div style={{ fontSize: 11, color: C.muted, marginTop: -2 }}>{g.hint}</div>
+              </div>
+              <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                <Btn ghost onClick={() => setModal({ kind: "copyDraft", entry: null, prefill: { purpose: g.key } })} style={{ padding: "6px 10px", fontSize: 11 }}>
+                  + Write
+                </Btn>
+                <Btn onClick={() => aiWriteCopy(g.key)} disabled={copyBusy === g.key} style={{ padding: "6px 10px", fontSize: 11 }}>
+                  {copyBusy === g.key ? "…" : "✍ AI"}
+                </Btn>
+              </div>
+            </div>
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-        <Label>{isDesktop ? "Written decisions — click to edit, × to delete" : "Written decisions — tap to edit, swipe left to delete"}</Label>
-        <Btn onClick={() => setModal({ kind: "decision", entry: null })}>+ Log decision</Btn>
-      </div>
-
-      {state.decisions.length === 0 && (
-        <div style={{ color: C.muted, fontSize: 14, padding: "24px 4px", textAlign: "center" }}>
-          No decisions logged. The floor only moves on a written, dated decision — never on a mood.
-        </div>
-      )}
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {state.decisions.map((d) => (
-          <SwipeRow
-            key={d.id}
-            showX={isDesktop}
-            onTap={() => setModal({ kind: "decision", entry: d })}
-            onDelete={() => mutate((s) => ({ ...s, decisions: s.decisions.filter((x) => x.id !== d.id) }), "Decision deleted")}
-          >
-            <div style={{ fontSize: 13, lineHeight: 1.5 }}>{d.note}</div>
-            <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 6 }}>{d.date}</div>
-          </SwipeRow>
+            {g.items.length === 0 ? (
+              <div style={{ fontSize: 12, color: C.muted, padding: "10px 2px", lineHeight: 1.5 }}>Nothing saved yet.</div>
+            ) : (
+              g.items.map((d) => (
+                <CopyDraftCard
+                  key={d.id}
+                  draft={d}
+                  onGrade={gradeCopyDraft}
+                  onEdit={() => setModal({ kind: "copyDraft", entry: d })}
+                  onDelete={() => deleteCopyDraft(d.id)}
+                  onUsed={() => markCopyUsed(d.id)}
+                />
+              ))
+            )}
+          </div>
         ))}
-      </div>
-    </>
-  );
+      </>
+    );
+  };
 
-  const SECTIONS = { DASHBOARD: renderDashboard, GOAL: renderGoal, PIPELINE: renderPipeline, CONTENT: renderContent, EMOTIONS: renderEmotions, RUNWAY: renderRunway, HISTORY: renderHistory };
+  /* the Runway section was retired; its numbers live on the dashboard card,
+     which opens the same editor. Nothing about the data changed. */
+  const SECTIONS = { DASHBOARD: renderDashboard, GOAL: renderGoal, PIPELINE: renderPipeline, CONTENT: renderContent, EMOTIONS: renderEmotions, COPY: renderCopy, HISTORY: renderHistory };
 
   if (!loaded)
     return (
@@ -8902,6 +9148,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           }}
           onDeleteCsvRows={() => mutate((s) => ({ ...s, archivedCsvRows: [] }), "Archive backup cleared")}
           onOpenApplication={openApplicationEntry}
+          onCopyDraft={copyFollowUpDraft}
         />
       )}
       {modal && modal.kind === "parseJobPost" && (
@@ -8968,6 +9215,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           proposals={housekeepingProposals}
           onArchive={(p) => (p.type === "application" ? archiveApplication(p.id) : archiveContact(p.accountId, p.contactId))}
           onArchiveAll={(list) => list.forEach((p) => (p.type === "application" ? archiveApplication(p.id) : archiveContact(p.accountId, p.contactId)))}
+          onSnooze={(keys) => snoozeHousekeeping(keys)}
         />
       )}
       {digestOpen && (
@@ -9051,7 +9299,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication }) {
+function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
     if (kind === "application") {
@@ -9185,6 +9433,18 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
           : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], followUpChannel: "", liStatus: "", liStatusAt: "", history: [], linkedApplicationId: null }],
       };
     }
+    if (kind === "copyDraft")
+      return {
+        id: entry?.id || uid(),
+        title: entry?.title || "",
+        body: entry?.body || "",
+        purpose: entry?.purpose || modal.prefill?.purpose || "outreach",
+        grade: entry?.grade || 0,
+        source: entry?.source || "user",
+        createdAt: entry?.createdAt || today(),
+        timesUsed: entry?.timesUsed || 0,
+        lastUsedAt: entry?.lastUsedAt || "",
+      };
     if (kind === "content")
       return {
         title: entry?.title || "",
@@ -9269,6 +9529,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     account: entry ? "Edit account" : "Track an account",
     content: entry ? "Edit content" : "Add content",
     runway: "Update runway numbers",
+    copyDraft: entry ? "Edit copy" : "New copy",
   };
 
   /* ---- dismiss without losing work ----
@@ -9291,6 +9552,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
   /* enough substance to be worth creating as a new record */
   const hasSubstance = () => {
     if (kind === "content") return !!(f.title || "").trim() || !!(f.notes || "").trim() || !!(f.draft || "").trim() || !!(f.outline || "").trim() || !!(f.hook || "").trim();
+    if (kind === "copyDraft") return !!(f.body || "").trim();
     if (kind === "application" || kind === "account") return !!(f.company || "").trim();
     return true;
   };
@@ -9675,6 +9937,17 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     {d || "—"}
                     {fu.done ? " ✓" : due ? " ⚑ DUE" : ""}
                   </div>
+                  {/* pulls the best-graded copy for THIS follow-up number,
+                      fills the placeholders from this lead, and puts it on the
+                      clipboard — the library is only useful if reaching it
+                      takes one tap from where you're actually working */}
+                  <button
+                    onClick={() => onCopyDraft && onCopyDraft(i, f)}
+                    title={`Copy your best "${copyPurposeLabel(purposeForFollowUp(i))}" draft, filled in for this lead`}
+                    style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.blue, borderRadius: 10, padding: "0 9px", height: 34, cursor: "pointer", flexShrink: 0, fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}
+                  >
+                    ⧉ Copy
+                  </button>
                   {/* which channel this follow-up goes out on — the touch point
                       it creates inherits it, so the log says how you reached them */}
                   <select
@@ -11402,6 +11675,35 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
           </>
         )}
 
+        {kind === "copyDraft" && (
+          <>
+            <Field label="Name it" value={f.title} onChange={set("title")} placeholder="e.g. Short nudge — value-first" />
+            <Label>Used for</Label>
+            <select value={f.purpose} onChange={(e) => set("purpose")(e.target.value)} style={{ ...selectStyle, marginBottom: 12 }}>
+              {COPY_PURPOSES.map((p) => (
+                <option key={p.key} value={p.key}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+            <Label>The copy</Label>
+            <textarea
+              value={f.body}
+              onChange={(e) => set("body")(e.target.value)}
+              placeholder={"Subject: …\n\nHi [First name], …"}
+              style={{ ...inputStyle, minHeight: 220, resize: "vertical", fontSize: 13, lineHeight: 1.6 }}
+            />
+            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.55, marginTop: 6 }}>
+              Write it as a template, not a one-off. These are swapped in when you use it:{" "}
+              {DRAFT_TOKENS.map((t) => (
+                <span key={t.token} style={{ fontFamily: mono, color: C.blue, marginRight: 6 }}>
+                  {t.label}
+                </span>
+              ))}
+            </div>
+          </>
+        )}
+
         {kind === "runway" && (
           <>
             <Field label="Emergency fund (₱)" type="number" value={f.fund} onChange={set("fund")} />
@@ -11922,6 +12224,82 @@ function ContactHistoryModal({ contact, company, onClose }) {
 
         <Btn ghost onClick={onClose} style={{ width: "100%", marginTop: 4 }}>
           Close
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+/* One saved piece of copy. Grading is the point of the whole section, so the
+   stars sit in the header rather than behind an edit screen — a grade you have
+   to open a modal to set is a grade that never gets set. */
+function CopyDraftCard({ draft, onGrade, onEdit, onDelete, onUsed }) {
+  const [copied, setCopied] = useState(false);
+  const [open, setOpen] = useState(false);
+  const copy = () => {
+    (navigator.clipboard?.writeText(draft.body) || Promise.reject()).then(
+      () => {
+        setCopied(true);
+        onUsed();
+        setTimeout(() => setCopied(false), 1600);
+      },
+      () => {}
+    );
+  };
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", marginBottom: 6 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {draft.title || "Untitled"}
+            {draft.source === "ai" && <span style={{ fontFamily: mono, fontSize: 9, color: C.blue, marginLeft: 6 }}>AI</span>}
+          </div>
+          <div style={{ display: "flex", gap: 2, marginTop: 3 }}>
+            {[1, 2, 3, 4, 5].map((n) => (
+              <button
+                key={n}
+                onClick={() => onGrade(draft.id, n)}
+                title={`Grade ${n}/5`}
+                style={{ background: "transparent", border: "none", padding: "0 1px", cursor: "pointer", fontSize: 13, lineHeight: 1, color: n <= draft.grade ? C.amber : C.panelEdge }}
+              >
+                ★
+              </button>
+            ))}
+            <span style={{ fontFamily: mono, fontSize: 9, color: C.muted, marginLeft: 6, alignSelf: "center" }}>
+              {draft.timesUsed ? `used ${draft.timesUsed}×` : "unused"}
+            </span>
+          </div>
+        </div>
+        <button
+          onClick={copy}
+          title="Copy to clipboard"
+          style={{ background: "transparent", border: `1px solid ${copied ? C.green : C.panelEdge}`, color: copied ? C.green : C.muted, borderRadius: 8, width: 34, height: 34, cursor: "pointer", fontSize: 13, flexShrink: 0 }}
+        >
+          {copied ? "✓" : "⧉"}
+        </button>
+      </div>
+
+      <div
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          fontSize: 12,
+          color: C.muted,
+          lineHeight: 1.55,
+          marginTop: 6,
+          cursor: "pointer",
+          whiteSpace: "pre-wrap",
+          ...(open ? {} : { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }),
+        }}
+      >
+        {draft.body || "Empty"}
+      </div>
+
+      <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+        <Btn ghost onClick={onEdit} style={{ padding: "5px 10px", fontSize: 11 }}>
+          Edit
+        </Btn>
+        <Btn ghost onClick={onDelete} style={{ padding: "5px 10px", fontSize: 11 }}>
+          Delete
         </Btn>
       </div>
     </div>
@@ -12569,7 +12947,9 @@ function ParseJobPostModal({ onClose, onParsed, onParse }) {
   );
 }
 
-function HousekeepingModal({ onClose, proposals, onArchive, onArchiveAll }) {
+function HousekeepingModal({ onClose, proposals, onArchive, onArchiveAll, onSnooze }) {
+  /* local set is only for hiding a row instantly after acting on it — the
+     durable record is onSnooze, which persists and syncs */
   const [skipped, setSkipped] = useState(() => new Set());
   const visible = proposals.filter((p) => !skipped.has(p.type + (p.id || p.contactId)));
   return (
@@ -12586,7 +12966,9 @@ function HousekeepingModal({ onClose, proposals, onArchive, onArchiveAll }) {
         <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
           <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 6 }}>🧹 CRM Housekeeping</div>
           <div style={{ fontSize: 11, color: C.muted, marginBottom: 14, lineHeight: 1.5 }}>
-            Nothing here changes your goal progress, funnel totals, or conversion % — archiving just tucks a stale entry out of your active view. It stays fully counted, and only gets stripped down to a bare record after another 30 untouched days.
+            Nothing here changes your goal progress, funnel totals, or conversion % — archiving just tucks a stale entry out of your active view. It stays fully counted, and only
+            gets stripped down to a bare record after another 30 untouched days. <strong style={{ color: C.ink }}>Keep</strong> hides an entry from this sweep for 30 days rather
+            than only until you close this box.
           </div>
         </div>
 
@@ -12613,8 +12995,15 @@ function HousekeepingModal({ onClose, proposals, onArchive, onArchiveAll }) {
                     >
                       🗄 Archive
                     </Btn>
-                    <Btn ghost onClick={() => setSkipped((s) => new Set(s).add(key))} style={{ padding: "6px 12px", fontSize: 11 }}>
-                      Skip
+                    <Btn
+                      ghost
+                      onClick={() => {
+                        onSnooze([key]);
+                        setSkipped((s) => new Set(s).add(key));
+                      }}
+                      style={{ padding: "6px 12px", fontSize: 11 }}
+                    >
+                      Keep · 30d
                     </Btn>
                   </div>
                 </div>
@@ -12628,6 +13017,8 @@ function HousekeepingModal({ onClose, proposals, onArchive, onArchiveAll }) {
             <Btn
               ghost
               onClick={() => {
+                /* no snooze needed — archiving removes them from the sweep
+                   on its own, and a snooze would linger pointlessly */
                 onArchiveAll(visible);
                 setSkipped((s) => {
                   const next = new Set(s);
