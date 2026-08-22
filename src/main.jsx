@@ -11543,13 +11543,13 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
 
                   {fus.length > 0 && (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
-                      <span style={{ fontSize: 10, color: C.muted }}>Follow-ups:</span>
+                      <span style={{ fontSize: 10, color: C.muted }}>⚑</span>
                       {/* one channel for this contact's follow-ups — the touch
                           point each tick creates inherits it */}
                       <select
                         value={c.followUpChannel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL}
                         onChange={(e) => setContact({ followUpChannel: e.target.value })}
-                        style={{ ...selectStyle, width: 96, fontSize: 10, padding: "3px 6px" }}
+                        style={{ ...selectStyle, width: 78, fontSize: 10, padding: "3px 4px" }}
                       >
                         {TOUCHPOINT_CHANNELS.map((ch) => (
                           <option key={ch} value={ch}>
@@ -11560,8 +11560,11 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       {fus.map((fu, fi) => {
                         const due = c.contacted ? followUpDueDate(c.contacted, fus, fi) : "";
                         return (
+                          /* the tick and its copy icon travel together — a
+                             separate row of icons makes you count positions to
+                             work out which follow-up each one belongs to */
+                          <span key={fi} style={{ display: "inline-flex", alignItems: "center" }}>
                           <button
-                            key={fi}
                             onClick={() => {
                               const wasDone = !!fu.done;
                               const ch = c.followUpChannel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL;
@@ -11587,8 +11590,19 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                           >
                             {fu.done ? "✓" : "○"} {fu.days}d
                           </button>
+                          {onCopyDraft && (
+                            <button
+                              onClick={() => onCopyDraft(fi, { company: f.company, contact: c.name, contactPosition: c.position, industry: f.industry })}
+                              title={`Copy your "${copyPurposeLabel(purposeForFollowUp(fi))}" draft for ${c.name || "this contact"}`}
+                              style={{ background: "transparent", border: "none", color: C.blue, fontSize: 11, cursor: "pointer", padding: "0 3px", lineHeight: 1 }}
+                            >
+                              ⧉
+                            </button>
+                          )}
+                          </span>
                         );
                       })}
+
                       <button
                         onClick={() => setContact({ followUps: [] })}
                         title="No follow-up needed — clear all"
