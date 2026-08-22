@@ -5667,10 +5667,19 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   const outreachStats = useMemo(() => {
     const leads = apps.filter((a) => !a.archivedAt && !a.tombstoned && a.contacted && !isBlankStatus(a));
     const contacts = (state.accounts || []).flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt && c.contacted && c.status));
-    const all = [...leads, ...contacts];
+    const everyone = [...leads, ...contacts];
+    /* "No follow-up needed" clears the schedule, so an empty followUps array is
+       a deliberate opt-out — not a lead you neglected. Counting those would
+       punish you for correctly deciding a lead doesn't need chasing, and would
+       make the average unfixable: no amount of follow-up work moves a
+       denominator full of leads that shouldn't be followed up. Every entry
+       starts with a seeded schedule, so empty only ever means cleared. */
+    const optedOut = everyone.filter((x) => (x.followUps || []).length === 0).length;
+    const all = everyone.filter((x) => (x.followUps || []).length > 0);
     const doneFus = all.reduce((n, x) => n + (x.followUps || []).filter((f) => f.done).length, 0);
     const avgFollowUps = all.length ? doneFus / all.length : 0;
-    /* a lead sitting at one touch with nothing scheduled is the leak */
+    /* a lead sitting at one touch with nothing done is the leak — but only
+       among leads that are actually meant to be followed up */
     const oneAndDone = all.filter((x) => (x.followUps || []).filter((f) => f.done).length === 0 && isOpenApp(x)).length;
 
     const liAll = [...apps, ...contacts].filter((x) => !x.archivedAt && (x.linkedin || x.contactLinkedin) && x.liStatus);
@@ -5679,7 +5688,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const pending = liAll.filter((x) => x.liStatus === "requested").length;
     const liRate = requested ? Math.round((accepted / requested) * 100) : null;
 
-    return { leads: all.length, avgFollowUps, oneAndDone, requested, accepted, pending, liRate };
+    return { leads: all.length, optedOut, avgFollowUps, oneAndDone, requested, accepted, pending, liRate };
   }, [apps, state.accounts]);
 
   const renderDashboard = () => {
@@ -5892,6 +5901,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           Sits above the funnel because it explains it: a low reply rate with
           0.4 follow-ups per lead is a persistence problem, not a copy problem,
           and those two get confused constantly. */}
+      {/* hidden when every lead opted out — a 0.0 average across an empty
+          denominator reads as failure rather than "nothing to measure" */}
       {outreachStats.leads > 0 && (
         <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
           <Label>Outreach discipline</Label>
@@ -5900,7 +5911,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: outreachStats.avgFollowUps >= 2 ? C.green : outreachStats.avgFollowUps >= 1 ? C.amber : C.red }}>
                 {outreachStats.avgFollowUps.toFixed(1)}
               </div>
-              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>follow-ups per lead</div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>
+                follow-ups per lead
+                <div style={{ fontFamily: mono, fontSize: 9 }}>across {outreachStats.leads}</div>
+              </div>
             </div>
             <div style={{ flex: "1 1 118px" }}>
               <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: outreachStats.oneAndDone > outreachStats.leads / 2 ? C.red : C.ink }}>{outreachStats.oneAndDone}</div>
@@ -5933,6 +5947,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               : outreachStats.avgFollowUps < 2
               ? "Roughly one follow-up each. Two or three is where reply rates usually move."
               : "Leads are being worked properly — a weak reply rate here points at the copy, not the persistence."}
+            {outreachStats.optedOut > 0 && (
+              <>
+                {" "}
+                <span style={{ color: C.muted }}>
+                  {outreachStats.optedOut} marked &ldquo;no follow-up needed&rdquo; {outreachStats.optedOut === 1 ? "is" : "are"} left out of these numbers.
+                </span>
+              </>
+            )}
           </div>
         </div>
       )}
