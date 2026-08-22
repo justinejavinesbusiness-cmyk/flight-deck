@@ -5011,7 +5011,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               )}
               {byReadiness.hooked.length ? (
             byReadiness.hooked.map((m) => (
-              <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} />
+              <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} onCopy={copyPoolOutreach} polishing={polishing} onRepolish={repolishHook} />
             ))
               ) : (
                 <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
@@ -8842,26 +8842,118 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   /* fills a library draft with THIS lead's details and puts it on the
      clipboard. Falls back to a clear message rather than copying an empty
      string, which would look like it worked. */
-  const copyFollowUpDraft = (index, formData) => {
-    const purpose = purposeForFollowUp(index);
-    const draft = bestCopyFor(state.copyDrafts, purpose);
-    if (!draft) return flash(`No "${copyPurposeLabel(purpose)}" copy saved yet — add one in Copy`);
-    const filled = fillTokens(draft.body, {
-      company: formData.company || "",
-      "first name": firstNameOf(formData.contact || ""),
-      name: (formData.contact || "").trim(),
-      position: (formData.contactPosition || "").trim(),
-      role: (formData.role || "").trim(),
-      hook: (formData.hook || "").trim(),
-      industry: (formData.industry || "").trim(),
-      me: (state.settings?.aiSenderName || "").trim(),
-    });
+  /* ---- copying library drafts onto a lead ----
+     One shared path for every entry point. With a single saved draft it copies
+     straight away; with several it opens a picker, because silently choosing
+     for you defeats the purpose of keeping variants — you can't A/B anything
+     if the app always picks the same one. */
+  const [copyPicker, setCopyPicker] = useState(null); /* { purpose, options, vars, label } */
+  const putOnClipboard = (draft, vars, purpose) => {
+    const filled = fillTokens(draft.body, vars);
     (navigator.clipboard?.writeText(filled) || Promise.reject()).then(
       () => {
         markCopyUsed(draft.id);
         flash(`⧉ Copied "${draft.title || copyPurposeLabel(purpose)}"`);
       },
       () => flash("Couldn't reach the clipboard")
+    );
+  };
+  const copyDraftFor = (purpose, vars, label) => {
+    const options = (state.copyDrafts || []).filter((d) => d.purpose === purpose).sort(rankCopy);
+    if (!options.length) return flash(`No "${copyPurposeLabel(purpose)}" copy saved yet — add one in Copy`);
+    if (options.length === 1) return putOnClipboard(options[0], vars, purpose);
+    setCopyPicker({ purpose, options, vars, label });
+  };
+  /* the token values a lead can supply, in one place so the follow-up row and
+     the pool row can't drift apart */
+  const copyVarsFrom = (o) => ({
+    company: o.company || "",
+    "first name": firstNameOf(o.contact || ""),
+    name: (o.contact || "").trim(),
+    position: (o.position || "").trim(),
+    role: (o.role || "").trim(),
+    hook: (o.hook || "").trim(),
+    industry: (o.industry || "").trim(),
+    me: (state.settings?.aiSenderName || "").trim(),
+  });
+  const copyFollowUpDraft = (index, formData) =>
+    copyDraftFor(
+      purposeForFollowUp(index),
+      copyVarsFrom({ ...formData, position: formData.contactPosition }),
+      `${formData.company || "this lead"} · follow-up ${index + 1}`
+    );
+  /* ---- hook refinement ----
+     The hook is written to be researched in five minutes, not to be read: "IT
+     audit post", "rebrand shipped". Dropping that raw into a [Hook] token
+     produces "I saw IT audit post", which is worse than no hook at all.
+
+     So it's polished into one natural sentence before use — and CACHED against
+     the exact hook text it came from. Re-copying the same company costs
+     nothing; editing the hook invalidates the cache and it re-polishes. Falls
+     back to the raw hook whenever AI isn't available, because a rough opening
+     still beats a failed copy. */
+  const [polishing, setPolishing] = useState("");
+  const polishedHookFor = async (member) => {
+    const raw = (member.hook || "").trim();
+    if (!raw || isGenericHook(raw) || isGenericPersonHook(raw)) return "";
+    const ref = member.refs[0];
+    const e = ref?.entry || {};
+    if (e.hookPolished && e.hookPolishedFrom === raw) return e.hookPolished;
+    try {
+      setPolishing(member.key);
+      const text = await callAI({
+        provider: state.settings?.aiProvider,
+        model: state.settings?.aiModel,
+        baseUrl: state.settings?.aiBaseUrl,
+        key: readAiKey(),
+        maxTokens: state.settings?.aiMaxTokens,
+        system: `You turn a researcher's shorthand note into ONE natural opening sentence for a cold email.
+
+Rules:
+- Output exactly one sentence. No greeting, no sign-off, no quotes, no preamble.
+- Use ONLY what the note says. Never add a date, a number, a product name, a person or any detail the note doesn't contain — you have no other knowledge of this company.
+- If the note is too vague to make a specific sentence, write a plainer one rather than inventing detail.
+- Write it so it can follow "Hi Ana," naturally.`,
+        user: `Company: ${member.company}\nResearch note: ${raw}`,
+      });
+      const line = String(text || "").split("\n").filter(Boolean)[0]?.replace(/^["']|["']$/g, "").trim() || "";
+      if (line) {
+        mutate((st) =>
+          ref.kind === "account"
+            ? { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, hookPolished: line, hookPolishedFrom: raw } : a)) }
+            : { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, hookPolished: line, hookPolishedFrom: raw } : a)) }
+        );
+      }
+      setPolishing("");
+      return line || raw;
+    } catch (err) {
+      setPolishing("");
+      /* a rough hook is still better than nothing landing on the clipboard */
+      return raw;
+    }
+  };
+
+  /* clears the cache and regenerates — used when the polished line missed */
+  const repolishHook = (member) => {
+    const ref = member.refs[0];
+    if (!ref) return;
+    mutate((st) =>
+      ref.kind === "account"
+        ? { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, hookPolished: "", hookPolishedFrom: "" } : a)) }
+        : { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, hookPolished: "", hookPolishedFrom: "" } : a)) }
+    );
+    setTimeout(() => polishedHookFor({ ...member, refs: [{ ...ref, entry: { ...ref.entry, hookPolished: "", hookPolishedFrom: "" } }] }), 60);
+  };
+
+  /* pool: first contact copy for a company that's hooked and unwritten */
+  const copyPoolOutreach = async (member) => {
+    const person = contactsOf(member)[0];
+    const e = member.refs[0]?.entry || {};
+    const hook = (await polishedHookFor(member)) || member.hook;
+    return copyDraftFor(
+      "outreach",
+      copyVarsFrom({ company: member.company, contact: person?.name, position: person?.position, role: e.role, hook, industry: e.industry }),
+      member.company
     );
   };
   const aiWriteCopy = async (purpose) => {
@@ -9271,6 +9363,18 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           onMerge={resolveDuplicateAsMerge}
           onKeepSeparate={resolveDuplicateAsSeparate}
           onClose={resolveDuplicateAsSeparate}
+        />
+      )}
+      {copyPicker && (
+        <CopyPickerModal
+          purpose={copyPicker.purpose}
+          options={copyPicker.options}
+          label={copyPicker.label}
+          onClose={() => setCopyPicker(null)}
+          onPick={(d) => {
+            putOnClipboard(d, copyPicker.vars, copyPicker.purpose);
+            setCopyPicker(null);
+          }}
         />
       )}
       {draftModal && (
@@ -12257,6 +12361,70 @@ function ContactHistoryModal({ contact, company, onClose }) {
 /* One saved piece of copy. Grading is the point of the whole section, so the
    stars sit in the header rather than behind an edit screen — a grade you have
    to open a modal to set is a grade that never gets set. */
+/* Shown when more than one draft fits the slot. Deliberately shows a preview
+   of each — a title alone doesn't tell you which variant you're sending, and
+   picking blind is how the wrong tone reaches the wrong lead. */
+function CopyPickerModal({ purpose, options, label, onPick, onClose }) {
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60, padding: 16 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 440, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 18, boxSizing: "border-box", maxHeight: "84vh", overflowY: "auto" }}
+      >
+        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink }}>⧉ Which draft?</div>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
+          {copyPurposeLabel(purpose)}
+          {label ? ` · ${label}` : ""}
+        </div>
+
+        {options.map((d, i) => (
+          <button
+            key={d.id}
+            onClick={() => onPick(d)}
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              textAlign: "left",
+              background: "transparent",
+              border: `1px solid ${i === 0 ? C.amber : C.panelEdge}`,
+              borderRadius: 10,
+              padding: "10px 12px",
+              marginBottom: 8,
+              cursor: "pointer",
+              color: C.ink,
+              fontFamily: sans,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {d.title || "Untitled"}
+                {d.source === "ai" && <span style={{ fontFamily: mono, fontSize: 9, color: C.blue, marginLeft: 6 }}>AI</span>}
+              </span>
+              <span style={{ fontSize: 11, color: C.amber, flexShrink: 0, letterSpacing: 1 }}>{d.grade ? "★".repeat(d.grade) : ""}</span>
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 4, lineHeight: 1.5, display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+              {d.body}
+            </div>
+            <div style={{ fontFamily: mono, fontSize: 9, color: C.muted, marginTop: 4 }}>
+              {i === 0 ? "best rated · " : ""}
+              {d.timesUsed ? `used ${d.timesUsed}×` : "unused"}
+            </div>
+          </button>
+        ))}
+
+        <Btn ghost onClick={onClose} style={{ width: "100%", marginTop: 4 }}>
+          Cancel
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
 function CopyDraftCard({ draft, onGrade, onEdit, onDelete, onUsed }) {
   const [copied, setCopied] = useState(false);
   const [open, setOpen] = useState(false);
@@ -12534,7 +12702,7 @@ function PoolAdd({ open, onAddApplication, onAddAccount, onPark }) {
 /* one pool member. The hook is editable inline because writing it IS the
    discovery event — making that a modal trip would be friction on the exact
    action the whole cycle is built around. */
-function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft }) {
+function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft, onCopy, polishing, onRepolish }) {
   const [draft, setDraft] = useState(member.hook || "");
   const dirty = draft !== (member.hook || "");
   const ref = member.refs[0];
@@ -12577,6 +12745,18 @@ function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft }) {
             Save
           </Btn>
         )}
+        {/* pull a saved first-contact template rather than generating one —
+            cheaper, instant, and uses copy you've already graded */}
+        {!dirty && onCopy && (
+          <Btn
+            ghost
+            onClick={() => onCopy(member)}
+            title="Copy your saved First contact template, filled in for this company"
+            style={{ padding: "7px 10px", fontSize: 12, flexShrink: 0 }}
+          >
+            ⧉
+          </Btn>
+        )}
         {/* drafting only makes sense once there's a hook to open with */}
         {!dirty && onDraft && (member.hook || "").trim() && (
           <Btn
@@ -12589,6 +12769,21 @@ function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft }) {
           </Btn>
         )}
       </div>
+      {/* the polished opening, shown so it can be checked and corrected — an
+          AI sentence that goes straight to the clipboard unseen is exactly how
+          a wrong claim reaches a stranger */}
+      {ref?.entry?.hookPolished && ref.entry.hookPolishedFrom === (member.hook || "").trim() && (
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 6, marginTop: 6, background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "7px 9px" }}>
+          <span style={{ fontFamily: mono, fontSize: 9, color: C.blue, flexShrink: 0, paddingTop: 2 }}>AI</span>
+          <span style={{ fontSize: 12, color: C.ink, lineHeight: 1.45, flex: 1, minWidth: 0 }}>{ref.entry.hookPolished}</span>
+          {onRepolish && (
+            <button onClick={() => onRepolish(member)} title="Rewrite this opening line" style={{ background: "transparent", border: "none", color: C.muted, fontSize: 13, cursor: "pointer", padding: 0, flexShrink: 0 }}>
+              ↻
+            </button>
+          )}
+        </div>
+      )}
+      {polishing === member.key && <div style={{ fontSize: 11, color: C.blue, marginTop: 6 }}>Polishing the opening line…</div>}
       {member.discoveredAt && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>researched {member.discoveredAt}</div>}
     </div>
   );
