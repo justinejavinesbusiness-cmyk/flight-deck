@@ -3600,10 +3600,38 @@ export default function FlightDeck() {
      the follow-up queue on purpose: commenting on someone's post is a
      different action from chasing a reply, and merging them would make the
      due count mean two things at once. */
+  /* same effect as the ✓ Engaged button inside the account modal: resets the
+     cadence clock and logs a touch point, so engaging also counts as real
+     activity and holds off the nurture badge */
+  const markEngaged = (accountId, contactId) =>
+    mutate(
+      (st) => ({
+        ...st,
+        accounts: (st.accounts || []).map((a) =>
+          a.id !== accountId
+            ? a
+            : {
+                ...a,
+                contacts: (a.contacts || []).map((c) =>
+                  c.id !== contactId
+                    ? c
+                    : {
+                        ...c,
+                        lastEngagedAt: today(),
+                        touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "LinkedIn", note: "Engaged with a post" }],
+                        history: withLog(c, [logEntry("touch", "Engaged with a post")]).history,
+                      }
+                ),
+              }
+        ),
+      }),
+      "✓ Engagement logged"
+    );
+
   const engageDueList = useMemo(
     () =>
       (state.accounts || [])
-        .flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt && isEngagementDue(c)).map((c) => ({ ...c, _company: a.company })))
+        .flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt && isEngagementDue(c)).map((c) => ({ ...c, _company: a.company, _accountId: a.id })))
         .sort((a, b) => (engagementDueDate(a) || "9999-12-31").localeCompare(engagementDueDate(b) || "9999-12-31")),
     [state.accounts]
   );
@@ -6045,18 +6073,25 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   <strong>{c.name || "Unnamed"}</strong>
                   <span style={{ color: C.muted }}> · {c._company}</span>
                 </span>
-                {c.linkedin ? (
-                  <a
-                    href={c.linkedin.startsWith("http") ? c.linkedin : "https://" + c.linkedin}
-                    target="_blank"
-                    rel="noreferrer"
-                    style={{ color: C.blue, fontSize: 12, textDecoration: "none", flexShrink: 0 }}
-                  >
-                    open →
-                  </a>
-                ) : (
-                  <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>{engagementOverdueDays(c)}d over</span>
-                )}
+                <span style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                  {engagementOverdueDays(c) > 0 && <span style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>{engagementOverdueDays(c)}d</span>}
+                  {c.linkedin && (
+                    <a
+                      href={c.linkedin.startsWith("http") ? c.linkedin : "https://" + c.linkedin}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ color: C.blue, fontSize: 12, textDecoration: "none" }}
+                    >
+                      open →
+                    </a>
+                  )}
+                  {/* clearing it from here is the point — going to their profile
+                      and then having to open the account to record it is the
+                      friction that leaves this list permanently full */}
+                  <Btn color={C.green} onClick={() => markEngaged(c._accountId, c.id)} style={{ padding: "4px 9px", fontSize: 11 }}>
+                    ✓ Engaged
+                  </Btn>
+                </span>
               </div>
             ))}
             {engageDueList.length > 5 && <div style={{ fontSize: 11, color: C.muted }}>+ {engageDueList.length - 5} more in Accounts → Engage</div>}
