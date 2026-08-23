@@ -203,6 +203,20 @@ const OUTREACH_KINDS = ["warm", "cold"];
    emailed July 3", each tagged to whichever application or contact it
    belongs to by simply living nested inside that entry. */
 const TOUCHPOINT_CHANNELS = ["Facebook", "Instagram", "LinkedIn", "Cold email", "Phone call", "Text/SMS", "In person", "Other"];
+/* One glyph per channel, for the narrow mobile row where the full name eats
+   the space the follow-up controls need. Monochrome to match the nav — a
+   coloured emoji here would out-shout the amber "done" tick beside it. */
+const CHANNEL_ICON = {
+  Facebook: "f",
+  Instagram: "◙",
+  LinkedIn: "in",
+  "Cold email": "✉",
+  "Phone call": "☎",
+  "Text/SMS": "▭",
+  "In person": "◇",
+  Other: "·",
+};
+const channelIcon = (c) => CHANNEL_ICON[c] || "·";
 const OUTREACH_CHANNELS = ["Email", "Call", "Text", "Other"];
 /* "bad fit" reasons — multi-select, for companies that don't align on comp/values/etc */
 const BAD_FIT_REASONS = ["Salary too low", "Values mismatch", "Culture concerns", "Red flags in process", "Scope creep", "Other"];
@@ -9296,6 +9310,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           onDeleteCsvRows={() => mutate((s) => ({ ...s, archivedCsvRows: [] }), "Archive backup cleared")}
           onOpenApplication={openApplicationEntry}
           onCopyDraft={copyFollowUpDraft}
+          isDesktop={isDesktop}
         />
       )}
       {modal && modal.kind === "parseJobPost" && (
@@ -9458,7 +9473,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft }) {
+function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft, isDesktop }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
     if (kind === "application") {
@@ -10086,7 +10101,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               const due = d && !fu.done && d <= today();
               return (
                 <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
-                  <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, width: 78, flexShrink: 0 }}>Follow-up {i + 1}</div>
+                  {/* the row order already says which follow-up this is, so the
+                      full label is desktop-only — it was pushing the delete
+                      button off the right edge on a phone */}
+                  <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, width: isDesktop ? 78 : 16, flexShrink: 0 }}>{isDesktop ? `Follow-up ${i + 1}` : i + 1}</div>
                   <input
                     type="number"
                     inputMode="numeric"
@@ -10094,7 +10112,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     onChange={(e) =>
                       setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, days: e.target.value } : x)) }))
                     }
-                    style={{ ...inputStyle, width: 72, fontFamily: mono, flexShrink: 0, padding: "8px 10px" }}
+                    style={{ ...inputStyle, width: isDesktop ? 72 : 56, fontFamily: mono, flexShrink: 0, padding: isDesktop ? "8px 10px" : "8px 6px" }}
                   />
                   <div style={{ fontFamily: mono, fontSize: 11, color: fu.done ? C.green : due ? C.red : C.muted, flex: 1, overflow: "hidden", whiteSpace: "nowrap" }}>
                     {d || "—"}
@@ -10107,23 +10125,60 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   <button
                     onClick={() => onCopyDraft && onCopyDraft(i, f)}
                     title={`Copy your best "${copyPurposeLabel(purposeForFollowUp(i))}" draft, filled in for this lead`}
-                    style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.blue, borderRadius: 10, padding: "0 9px", height: 34, cursor: "pointer", flexShrink: 0, fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}
+                    style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.blue, borderRadius: 10, padding: isDesktop ? "0 9px" : "0", width: isDesktop ? "auto" : 34, height: 34, cursor: "pointer", flexShrink: 0, fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}
                   >
-                    ⧉ Copy
+                    {isDesktop ? "⧉ Copy" : "⧉"}
                   </button>
                   {/* which channel this follow-up goes out on — the touch point
-                      it creates inherits it, so the log says how you reached them */}
-                  <select
-                    value={fu.channel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL}
-                    onChange={(e) => setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, channel: e.target.value } : x)) }))}
-                    style={{ ...selectStyle, width: 104, fontSize: 11, padding: "7px 6px", flexShrink: 0 }}
-                  >
-                    {TOUCHPOINT_CHANNELS.map((ch) => (
+                      it creates inherits it, so the log says how you reached them.
+
+                      On mobile the full name ate the row, so the select is made
+                      invisible and stretched over an icon instead. The native
+                      element still handles the interaction, which means iOS
+                      opens its usual picker showing the FULL channel names —
+                      only the collapsed state is an icon, so nothing about
+                      choosing gets harder. */}
+                  {(() => {
+                    const chVal = fu.channel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL;
+                    const onCh = (e) => setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, channel: e.target.value } : x)) }));
+                    const opts = TOUCHPOINT_CHANNELS.map((ch) => (
                       <option key={ch} value={ch}>
                         {ch}
                       </option>
-                    ))}
-                  </select>
+                    ));
+                    if (isDesktop)
+                      return (
+                        <select value={chVal} onChange={onCh} style={{ ...selectStyle, width: 104, fontSize: 11, padding: "7px 6px", flexShrink: 0 }}>
+                          {opts}
+                        </select>
+                      );
+                    return (
+                      <span style={{ position: "relative", width: 40, height: 34, flexShrink: 0 }} title={chVal}>
+                        <span
+                          aria-hidden
+                          style={{
+                            position: "absolute",
+                            inset: 0,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            border: `1px solid ${C.panelEdge}`,
+                            borderRadius: 10,
+                            background: C.bg,
+                            color: C.muted,
+                            fontFamily: mono,
+                            fontSize: 12,
+                            pointerEvents: "none",
+                          }}
+                        >
+                          {channelIcon(chVal)}
+                        </span>
+                        <select value={chVal} onChange={onCh} aria-label="Follow-up channel" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, appearance: "none", border: "none", background: "transparent" }}>
+                          {opts}
+                        </select>
+                      </span>
+                    );
+                  })()}
                   <button
                     onClick={() =>
                       setF((p) => {
@@ -11581,17 +11636,49 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       <span style={{ fontSize: 10, color: C.muted }}>⚑</span>
                       {/* one channel for this contact's follow-ups — the touch
                           point each tick creates inherits it */}
-                      <select
-                        value={c.followUpChannel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL}
-                        onChange={(e) => setContact({ followUpChannel: e.target.value })}
-                        style={{ ...selectStyle, width: 78, fontSize: 10, padding: "3px 4px" }}
-                      >
-                        {TOUCHPOINT_CHANNELS.map((ch) => (
+                      {(() => {
+                        /* same invisible-select-over-an-icon trick as the
+                           application row; this one is tighter still */
+                        const chVal = c.followUpChannel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL;
+                        const opts = TOUCHPOINT_CHANNELS.map((ch) => (
                           <option key={ch} value={ch}>
                             {ch}
                           </option>
-                        ))}
-                      </select>
+                        ));
+                        const onCh = (e) => setContact({ followUpChannel: e.target.value });
+                        if (isDesktop)
+                          return (
+                            <select value={chVal} onChange={onCh} style={{ ...selectStyle, width: 78, fontSize: 10, padding: "3px 4px" }}>
+                              {opts}
+                            </select>
+                          );
+                        return (
+                          <span style={{ position: "relative", width: 30, height: 24, flexShrink: 0 }} title={chVal}>
+                            <span
+                              aria-hidden
+                              style={{
+                                position: "absolute",
+                                inset: 0,
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                border: `1px solid ${C.panelEdge}`,
+                                borderRadius: 8,
+                                background: C.bg,
+                                color: C.muted,
+                                fontFamily: mono,
+                                fontSize: 10,
+                                pointerEvents: "none",
+                              }}
+                            >
+                              {channelIcon(chVal)}
+                            </span>
+                            <select value={chVal} onChange={onCh} aria-label="Follow-up channel" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, appearance: "none", border: "none", background: "transparent" }}>
+                              {opts}
+                            </select>
+                          </span>
+                        );
+                      })()}
                       {fus.map((fu, fi) => {
                         const due = c.contacted ? followUpDueDate(c.contacted, fus, fi) : "";
                         return (
