@@ -995,6 +995,108 @@ function poolMembers(state, apps) {
 
 const poolReadiness = (a) => (poolCompanyWorked(a) ? "contacted" : poolCompanyDiscovered(a) ? "hooked" : "parked");
 const memberReadiness = (m) => (m.worked ? "contacted" : m.discovered ? "hooked" : "parked");
+
+/* ---- work items: one row per PERSON ----
+   Coverage counts companies — that's what the pool is sized against. But a
+   hook is a line about a human ("I saw your post on IT audits"), so an account
+   with three contacts needs three hooks, not one shared one. Sharing it is how
+   personalisation quietly disappears from a method built on it.
+
+   So members expand into work items: one per live contact for accounts, one
+   for an application (it holds a single contact), and one for an account with
+   nobody in it yet so the hook has somewhere to live until someone is added.
+
+   Readiness is judged PER PERSON. Writing a hook for Ana moves Ana to "ready
+   to write" while her colleague Ben stays in "need a hook" — which is exactly
+   the behaviour asked for, and it falls out of the model rather than needing
+   special cases.
+
+   Accounts keep an account-level hook as a FALLBACK so nothing written before
+   this change vanishes; it simply stops being shared once a contact has its
+   own. */
+function poolWorkItems(members) {
+  const items = [];
+  (members || []).forEach((m) => {
+    const accRef = m.refs.find((r) => r.kind === "account");
+    if (accRef) {
+      const acc = accRef.entry;
+      const live = (acc.contacts || []).filter((c) => !c.archivedAt && !c.tombstoned);
+      if (live.length) {
+        live.forEach((c) => {
+          items.push({
+            key: `${m.key}::${c.id}`,
+            member: m,
+            company: m.company,
+            kind: "contact",
+            contactId: c.id,
+            contactName: c.name || "",
+            contactPosition: c.position || "",
+            hook: c.hook || acc.hook || "",
+            hookPolished: c.hookPolished || "",
+            hookPolishedFrom: c.hookPolishedFrom || "",
+            researchedAt: c.researchedAt || acc.researchedAt || "",
+            /* this person specifically — a colleague being contacted doesn't
+               mean this one has been */
+            worked: !!(c.status && c.contacted),
+            firstContact: c.status && c.contacted ? c.contacted : "",
+            entry: c,
+            ref: { kind: "contact", id: acc.id, contactId: c.id, entry: c, account: acc },
+          });
+        });
+        return;
+      }
+    }
+    const ref = m.refs[0];
+    const e = ref?.entry || {};
+    items.push({
+      key: m.key,
+      member: m,
+      company: m.company,
+      kind: ref?.kind || "application",
+      contactId: null,
+      contactName: e.contact || "",
+      contactPosition: e.contactPosition || "",
+      hook: e.hook || "",
+      hookPolished: e.hookPolished || "",
+      hookPolishedFrom: e.hookPolishedFrom || "",
+      researchedAt: e.researchedAt || "",
+      worked: m.worked,
+      firstContact: m.firstContact,
+      entry: e,
+      ref: { ...ref, contactId: null },
+    });
+  });
+  return items;
+}
+const workItemReadiness = (w) => (w.worked ? "contacted" : (w.hook || "").trim() ? "hooked" : "parked");
+/* ---- cold call outcomes ----
+   A call fails in ways an email can't: nobody picks up, a gatekeeper blocks
+   you, the number is wrong. Those aren't "no reply" — they mean try another
+   time, find another route, or fix the number, and flattening them into the
+   email vocabulary throws away the instruction.
+
+   `landed` is the load-bearing flag. It marks the outcomes where your message
+   actually reached them, and only those may tick a follow-up as done —
+   marking a follow-up complete after nobody answered would quietly convince
+   you you'd done work you hadn't. */
+const CALL_OUTCOMES = [
+  { key: "spoke", label: "Spoke with them", tone: "green", landed: true },
+  { key: "voicemail", label: "Left a voicemail", tone: "amber", landed: true },
+  { key: "callback", label: "Asked to call back", tone: "blue", landed: true },
+  { key: "noanswer", label: "No answer", tone: "muted", landed: false },
+  { key: "gatekeeper", label: "Blocked by gatekeeper", tone: "amber", landed: false },
+  { key: "wrongnumber", label: "Wrong number", tone: "red", landed: false },
+  { key: "notinterested", label: "Not interested", tone: "red", landed: true },
+  { key: "cannotcontact", label: "Can't be reached", tone: "red", landed: false },
+];
+const callOutcome = (k) => CALL_OUTCOMES.find((o) => o.key === k) || null;
+/* outcomes that end the pursuit — the contact closes so it drops out of due
+   lists and the nurture clock instead of sitting there looking live */
+const CALL_CLOSES = ["notinterested", "cannotcontact", "wrongnumber"];
+/* speaking to someone, or being asked to call back, means a human engaged —
+   that's the same signal the email side calls a reply */
+const CALL_IS_REPLY = ["spoke", "callback"];
+
 const POOL_READINESS_META = {
   parked: { label: "PARKED", color: "muted", hint: "no hook yet" },
   hooked: { label: "HOOKED", color: "amber", hint: "ready to write" },
@@ -4626,12 +4728,21 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
   const removeFromBench = (id) => mutate((s) => ({ ...s, poolBench: (s.poolBench || []).filter((b) => b.id !== id), deletedIds: tombstones(s, [id]) }), "Removed from bench");
   /* writing the hook IS the discovery event — stamping researchedAt is what
      makes it count toward discovery-week progress */
-  const setPoolHook = (id, hook, kind) =>
-    mutate((s) =>
-      kind === "account"
-        ? { ...s, accounts: (s.accounts || []).map((a) => (a.id === id ? { ...a, hook, researchedAt: hook.trim() ? a.researchedAt || today() : "" } : a)) }
-        : { ...s, applications: s.applications.map((a) => (a.id === id ? { ...a, hook, researchedAt: hook.trim() ? a.researchedAt || today() : "" } : a)) }
-    );
+  /* Writes the hook where the work item actually lives. A `contact` item writes
+     to that person, so saving Ana's hook moves Ana to "ready to write" and
+     leaves Ben in "need a hook". Everything else writes to the record itself. */
+  const setPoolHook = (ref, hook) => {
+    const stamp = (o) => ({ ...o, hook, researchedAt: hook.trim() ? o.researchedAt || today() : "" });
+    mutate((s) => {
+      if (ref.kind === "contact")
+        return {
+          ...s,
+          accounts: (s.accounts || []).map((a) => (a.id !== ref.id ? a : { ...a, contacts: (a.contacts || []).map((c) => (c.id === ref.contactId ? stamp(c) : c)) })),
+        };
+      if (ref.kind === "account") return { ...s, accounts: (s.accounts || []).map((a) => (a.id === ref.id ? stamp(a) : a)) };
+      return { ...s, applications: s.applications.map((a) => (a.id === ref.id ? stamp(a) : a)) };
+    });
+  };
 
   /* ============================================================
      POOL VIEW — the discovery half of the CRM.
@@ -4663,17 +4774,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      because of the pool, so it's deleted outright; anything with real history
      is merely untagged, because deleting recorded work would be the wrong
      kind of tidy. */
-  const removePoolMember = (member) => {
-    const ref = member.refs[0];
+  const removePoolMember = (item) => {
+    /* removal is company-level — the pool tracks companies, so pulling one
+       person out of a 3-contact account isn't a thing you can do here */
+    const member = item.member || item;
+    const ref = member.refs?.[0] || item.ref;
     if (!ref) return;
-    const e = ref.entry;
-    const untouched = ref.kind === "account" ? !(e.contacts || []).some((c) => c.status || c.contacted) && !e.notes : !e.status && !e.contacted && !e.notes;
+    /* a "contact" ref points at a person inside an account, so for removal
+       purposes it IS the account — collapse it before deciding */
+    const kind = ref.kind === "contact" ? "account" : ref.kind;
+    const e = ref.kind === "contact" ? ref.account : ref.entry;
+    const untouched = kind === "account" ? !(e.contacts || []).some((c) => c.status || c.contacted) && !e.notes : !e.status && !e.contacted && !e.notes;
     if (!untouched) {
-      togglePoolMembership(ref.kind, ref.id);
+      togglePoolMembership(kind, ref.id);
       return flash("Removed from pool — the record is kept");
     }
     mutate((s) =>
-      ref.kind === "account"
+      kind === "account"
         ? { ...s, accounts: (s.accounts || []).filter((a) => a.id !== ref.id), deletedIds: tombstones(s, [ref.id, ...((e.contacts || []).map((c) => c.id))]) }
         : { ...s, applications: s.applications.filter((a) => a.id !== ref.id), deletedIds: tombstones(s, [ref.id]) },
       "Removed from pool"
@@ -4692,24 +4809,26 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   /* One generator, used by both the single ✍ button and the bulk run, so a
      bulk draft is never a lower-grade version of a manual one. */
-  const generateDraft = async (member, chosenContact) => {
-    const ref = member.refs[0];
-    const hook = (member.hook || "").trim();
+  const generateDraft = async (item, chosenContact) => {
+    const ref = item.ref || item.refs?.[0];
+    const hook = (item.hook || "").trim();
     const personMode = isGenericPersonHook(hook);
     const generic = isGenericHook(hook) || personMode;
     const canSearch = state.settings?.aiProvider === "anthropic" && state.settings?.aiWebSearch !== false;
     const secs = normDraftSections(state.settings?.draftSections);
-    const e = ref.entry;
-    const contacts = ref.kind === "account" ? (e.contacts || []).filter((c) => !c.archivedAt) : [];
+    const e = item.entry || ref.entry;
+    /* the item already names one person, so the draft is addressed to them
+       rather than to a list of everyone at the company */
+    const contacts = item.contactName ? [{ name: item.contactName, position: item.contactPosition }] : [];
     const who = contacts.length ? contacts.map((c) => `${c.name || "unnamed"}${c.position ? ` (${c.position})` : ""}`).join(", ") : "";
-    const target = personMode ? chosenContact || contactsOf(member)[0] : null;
+    const target = personMode ? chosenContact || contacts[0] : null;
     const lines = [
-      `Company: ${member.company}`,
+      `Company: ${item.company}`,
       generic ? "" : `Hook (the specific thing you researched): ${hook}`,
       /* named explicitly so the model uses the real first name rather than a
          placeholder, and drops the role clause when there isn't one */
       target ? `Write to this person — first name: ${firstNameOf(target.name)}${target.position ? `, position: ${target.position}` : ", position: not known"}` : "",
-      ref.kind === "application" && e.role ? `Role being applied for: ${e.role}` : "",
+      item.kind === "application" && e.role ? `Role being applied for: ${e.role}` : "",
       who ? `Contact(s) at the company: ${who}` : "",
       e.industry ? `Industry: ${e.industry}` : "",
       e.notes ? `Other notes: ${String(e.notes).slice(0, 400)}` : "",
@@ -4734,10 +4853,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const m = raw.match(/^\s*Hook:\s*(.+)$/im);
     const foundHook = m && !/^none found$/i.test(m[1].trim()) ? m[1].trim() : "";
     const vars = {
-      company: member.company || "",
-      "first name": firstNameOf(target?.name || contactsOf(member)[0]?.name || ""),
-      name: (target?.name || contactsOf(member)[0]?.name || "").trim(),
-      position: (target?.position || contactsOf(member)[0]?.position || "").trim(),
+      company: item.company || "",
+      /* the work item already names one person, so tokens resolve to them */
+      "first name": firstNameOf(target?.name || item.contactName || ""),
+      name: (target?.name || item.contactName || "").trim(),
+      position: (target?.position || item.contactPosition || "").trim(),
       role: ref.kind === "application" ? (e.role || "").trim() : "",
       hook: generic ? "" : hook,
       industry: (e.industry || "").trim(),
@@ -4747,12 +4867,20 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     return { text, missing, echoWarnings, foundHook, generic, personMode, target, searched: generic && canSearch && !personMode };
   };
 
+  /* the draft belongs to the PERSON it was written for, so two contacts at the
+     same company each keep their own */
   const saveDraftToRecord = (ref, text) =>
-    mutate((st) =>
-      ref.kind === "account"
-        ? { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
-        : { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) }
-    );
+    mutate((st) => {
+      if (ref.kind === "contact")
+        return {
+          ...st,
+          accounts: (st.accounts || []).map((a) =>
+            a.id !== ref.id ? a : { ...a, contacts: (a.contacts || []).map((c) => (c.id === ref.contactId ? { ...c, outreachDraft: text } : c)) }
+          ),
+        };
+      if (ref.kind === "account") return { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) };
+      return { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, outreachDraft: text } : a)) };
+    });
 
   /* ---- bulk drafting ----
      Sequential on purpose. Parallel requests trip provider rate limits, and
@@ -4760,36 +4888,33 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      first two come back wrong — which is the actual failure mode of drafting
      forty emails at once. Skips anything already drafted so a re-run costs
      nothing, and never touches a company without a hook. */
-  const runBulkDraft = async (members, opts = {}) => {
+  const runBulkDraft = async (items, opts = {}) => {
     /* force: a retry pass over entries that already saved a bad draft, which
        the normal run deliberately skips */
-    const queue = members.filter((m) => (m.hook || "").trim() && (opts.force || !m.refs[0]?.entry?.outreachDraft));
+    const queue = items.filter((m) => (m.hook || "").trim() && (opts.force || !m.entry?.outreachDraft));
     if (!queue.length) return flash("Everything hooked already has a draft");
     bulkStop.current = false;
     setBulkDraft({ total: queue.length, done: 0, current: queue[0].company, errors: [], running: true });
     const errors = [];
     for (let i = 0; i < queue.length; i++) {
       if (bulkStop.current) break;
-      const member = queue[i];
-      setBulkDraft((b) => ({ ...b, done: i, current: member.company }));
+      const item = queue[i];
+      const who = item.contactName ? `${item.contactName} · ${item.company}` : item.company;
+      setBulkDraft((b) => ({ ...b, done: i, current: who }));
       try {
-        /* a batch can't stop to ask who — it addresses the first contact and
-           reports it, so anything worth re-aiming is visible afterwards */
-        const people = isGenericPersonHook(member.hook) ? contactsOf(member) : [];
-        if (isGenericPersonHook(member.hook) && !people.length) {
-          errors.push({ key: member.key, company: member.company, text: "skipped — no named contact to write to", retry: false });
+        /* each row is already one person, so there's no "which contact" guess
+           left for a batch to get wrong */
+        if (isGenericPersonHook(item.hook) && !item.contactName.trim()) {
+          errors.push({ key: item.key, company: who, text: "skipped — no named contact to write to", retry: false });
           continue;
         }
-        const { text, missing, echoWarnings } = await generateDraft(member, people[0]);
-        saveDraftToRecord(member.refs[0], text);
-        if (echoWarnings && echoWarnings.length) errors.push({ key: member.key, company: member.company, text: `${echoWarnings.join(", ")} may repeat your fixed text`, retry: true });
-        /* retry:true marks the ones a second attempt could actually fix. The
-           contact-choice note is information, not a fault — redrafting a good
-           email because it warned you would just cost money. */
-        if (missing.length) errors.push({ key: member.key, company: member.company, text: `missing ${missing.join(", ")}`, retry: true });
-        if (people.length > 1) errors.push({ key: member.key, company: member.company, text: `addressed ${people[0].name} of ${people.length} contacts — check it's the right one`, retry: false });
+        const { text, missing, echoWarnings } = await generateDraft(item, item.contactName ? { name: item.contactName, position: item.contactPosition } : null);
+        saveDraftToRecord(item.ref, text);
+        if (echoWarnings && echoWarnings.length) errors.push({ key: item.key, company: who, text: `${echoWarnings.join(", ")} may repeat your fixed text`, retry: true });
+        /* retry:true marks the ones a second attempt could actually fix */
+        if (missing.length) errors.push({ key: item.key, company: who, text: `missing ${missing.join(", ")}`, retry: true });
       } catch (err) {
-        errors.push({ key: member.key, company: member.company, text: err?.message || "failed", retry: true });
+        errors.push({ key: item.key, company: who, text: err?.message || "failed", retry: true });
       }
       /* a breath between calls keeps provider rate limits happy */
       if (i < queue.length - 1 && !bulkStop.current) await new Promise((r) => setTimeout(r, 700));
@@ -4797,37 +4922,39 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     setBulkDraft((b) => ({ ...b, done: b ? b.total : 0, current: "", errors, running: false, stopped: bulkStop.current }));
   };
 
-  const draftOutreach = async (member, opts = {}) => {
-    const ref = member.refs[0];
+  const draftOutreach = async (item, opts = {}) => {
+    const ref = item.ref || item.refs?.[0];
     if (!ref) return;
-    const hook = (member.hook || "").trim();
+    const hook = (item.hook || "").trim();
     if (!hook) return flash("Write the hook first, or type \u201cgeneric\u201d to let the AI handle it");
-    const existing = ref.entry?.outreachDraft;
-    if (existing && !opts.regenerate) return setDraftModal({ member, text: existing, loading: false, error: "" });
+    const existing = item.entry?.outreachDraft;
+    if (existing && !opts.regenerate) return setDraftModal({ member: item, text: existing, loading: false, error: "" });
 
-    /* "generic person" needs a human to address. Ask BEFORE calling the model
-       so picking the wrong one doesn't cost a request. */
+    /* "generic person" needs a human to address — and a work item already IS
+       one person, so there's nothing left to pick. The old contact chooser only
+       existed because a row could stand for a whole account. */
     if (isGenericPersonHook(hook) && !opts.contact) {
-      const people = contactsOf(member);
-      if (!people.length) return flash("Add a contact with a name first — this mode writes to a person");
-      if (people.length > 1) return setDraftModal({ member, text: "", loading: false, error: "", pickContacts: people });
-      opts = { ...opts, contact: people[0] };
+      if (!item.contactName.trim()) return flash("This row has no named contact — add one on the account first");
+      opts = { ...opts, contact: { name: item.contactName, position: item.contactPosition } };
     }
 
-    setDraftModal({ member, text: "", loading: true, error: "" });
+    setDraftModal({ member: item, text: "", loading: true, error: "" });
     try {
-      const { text, missing, echoWarnings, foundHook, generic, searched, personMode, target } = await generateDraft(member, opts.contact);
-      setDraftModal({ member, text, loading: false, error: "", foundHook, searched, generic, missing, echoWarnings, personMode, target });
+      const { text, missing, echoWarnings, foundHook, generic, searched, personMode, target } = await generateDraft(item, opts.contact);
+      setDraftModal({ member: item, text, loading: false, error: "", foundHook, searched, generic, missing, echoWarnings, personMode, target });
       saveDraftToRecord(ref, text);
     } catch (err) {
-      setDraftModal({ member, text: "", loading: false, error: err?.message || "Draft failed", generic: isGenericHook(hook) || isGenericPersonHook(hook) });
+      setDraftModal({ member: item, text: "", loading: false, error: err?.message || "Draft failed", generic: isGenericHook(hook) || isGenericPersonHook(hook) });
     }
   };
 
   /* opens whichever record backs this member — application or account */
   const openPoolMember = (m) => {
-    const ref = m.refs[0];
+    /* work items carry their own ref; a contact ref opens the parent ACCOUNT,
+       since that's where the contact is edited */
+    const ref = m.ref || m.refs?.[0];
     if (!ref) return;
+    if (ref.kind === "contact") return setModal({ kind: "account", entry: ref.account });
     setModal({ kind: ref.kind, entry: ref.entry });
   };
 
@@ -4846,17 +4973,22 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
        The chip COUNTS stay unfiltered on purpose: they're the state of the
        pool, and having them shrink as you type would hide how much is left. */
     const q = poolSearch.trim().toLowerCase();
-    const matches = (m) => {
+    /* the LISTS work per person, so search matches per person too — the company
+       name, that person's own hook, or their name and title */
+    const matches = (w) => {
       if (!q) return true;
-      if ((m.company || "").toLowerCase().includes(q)) return true;
-      if ((m.hook || "").toLowerCase().includes(q)) return true;
-      return contactsOf(m).some((c) => `${c.name} ${c.position}`.toLowerCase().includes(q));
+      if ((w.company || "").toLowerCase().includes(q)) return true;
+      if ((w.hook || "").toLowerCase().includes(q)) return true;
+      return `${w.contactName} ${w.contactPosition}`.toLowerCase().includes(q);
     };
-    const members = allMembers.filter(matches);
+    const allWork = poolWorkItems(allMembers);
+    const work = allWork.filter(matches);
+    /* coverage still counts COMPANIES; only the working lists are per person */
+    const members = allMembers.filter((m) => work.some((w) => w.member.key === m.key));
     const byReadiness = { parked: [], hooked: [], contacted: [] };
-    members.forEach((m) => byReadiness[memberReadiness(m)].push(m));
+    work.forEach((w) => byReadiness[workItemReadiness(w)].push(w));
     const byReadinessAll = { parked: [], hooked: [], contacted: [] };
-    allMembers.forEach((m) => byReadinessAll[memberReadiness(m)].push(m));
+    allWork.forEach((w) => byReadinessAll[workItemReadiness(w)].push(w));
     const allBench = state.poolBench || [];
     const bench = q ? allBench.filter((b) => (b.company || "").toLowerCase().includes(q)) : allBench;
 
@@ -4970,7 +5102,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         {view === "parked" &&
           (byReadiness.parked.length ? (
             byReadiness.parked.map((m) => (
-              <PoolRow key={m.key} member={m} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} />
+              <PoolRow key={m.key} item={m} badge={readinessBadge("parked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} />
             ))
           ) : (
             <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
@@ -4979,7 +5111,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ))}
 
         {view === "hooked" && (() => {
-          const undrafted = byReadiness.hooked.filter((m) => !m.refs[0]?.entry?.outreachDraft);
+          const undrafted = byReadiness.hooked.filter((m) => !m.entry?.outreachDraft);
           const b = bulkDraft;
           if (b && b.running)
             return (
@@ -5053,7 +5185,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               )}
               {byReadiness.hooked.length ? (
             byReadiness.hooked.map((m) => (
-              <PoolRow key={m.key} member={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} onCopy={copyPoolOutreach} polishing={polishing} onRepolish={repolishHook} />
+              <PoolRow key={m.key} item={m} badge={readinessBadge("hooked")} onHook={setPoolHook} onOpen={openPoolMember} onRemove={removePoolMember} onDraft={draftOutreach} onCopy={copyPoolOutreach} polishing={polishing} onRepolish={repolishHook} />
             ))
               ) : (
                 <div style={{ color: C.muted, fontSize: 13, padding: "16px 4px", textAlign: "center", lineHeight: 1.6 }}>
@@ -8942,14 +9074,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      back to the raw hook whenever AI isn't available, because a rough opening
      still beats a failed copy. */
   const [polishing, setPolishing] = useState("");
-  const polishedHookFor = async (member) => {
-    const raw = (member.hook || "").trim();
+  const polishedHookFor = async (item) => {
+    const raw = (item.hook || "").trim();
     if (!raw || isGenericHook(raw) || isGenericPersonHook(raw)) return "";
-    const ref = member.refs[0];
+    const ref = item.ref || item.refs?.[0];
     const e = ref?.entry || {};
     if (e.hookPolished && e.hookPolishedFrom === raw) return e.hookPolished;
     try {
-      setPolishing(member.key);
+      setPolishing(item.key);
       const text = await callAI({
         provider: state.settings?.aiProvider,
         model: state.settings?.aiModel,
@@ -8963,15 +9095,24 @@ Rules:
 - Use ONLY what the note says. Never add a date, a number, a product name, a person or any detail the note doesn't contain — you have no other knowledge of this company.
 - If the note is too vague to make a specific sentence, write a plainer one rather than inventing detail.
 - Write it so it can follow "Hi Ana," naturally.`,
-        user: `Company: ${member.company}\nResearch note: ${raw}`,
+        /* the person is named so the polished line can be about THEIR post
+           rather than a vague company-level observation */
+        user: `Company: ${item.company}${item.contactName ? `\nWriting to: ${item.contactName}${item.contactPosition ? `, ${item.contactPosition}` : ""}` : ""}\nResearch note: ${raw}`,
       });
       const line = String(text || "").split("\n").filter(Boolean)[0]?.replace(/^["']|["']$/g, "").trim() || "";
       if (line) {
-        mutate((st) =>
-          ref.kind === "account"
-            ? { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, hookPolished: line, hookPolishedFrom: raw } : a)) }
-            : { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, hookPolished: line, hookPolishedFrom: raw } : a)) }
-        );
+        const stampPolish = (o) => ({ ...o, hookPolished: line, hookPolishedFrom: raw });
+        mutate((st) => {
+          if (ref.kind === "contact")
+            return {
+              ...st,
+              accounts: (st.accounts || []).map((a) =>
+                a.id !== ref.id ? a : { ...a, contacts: (a.contacts || []).map((c) => (c.id === ref.contactId ? stampPolish(c) : c)) }
+              ),
+            };
+          if (ref.kind === "account") return { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? stampPolish(a) : a)) };
+          return { ...st, applications: st.applications.map((a) => (a.id === ref.id ? stampPolish(a) : a)) };
+        });
       }
       setPolishing("");
       return line || raw;
@@ -8983,26 +9124,36 @@ Rules:
   };
 
   /* clears the cache and regenerates — used when the polished line missed */
-  const repolishHook = (member) => {
-    const ref = member.refs[0];
+  const repolishHook = (item) => {
+    const ref = item.ref || item.refs?.[0];
     if (!ref) return;
-    mutate((st) =>
-      ref.kind === "account"
-        ? { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? { ...a, hookPolished: "", hookPolishedFrom: "" } : a)) }
-        : { ...st, applications: st.applications.map((a) => (a.id === ref.id ? { ...a, hookPolished: "", hookPolishedFrom: "" } : a)) }
-    );
-    setTimeout(() => polishedHookFor({ ...member, refs: [{ ...ref, entry: { ...ref.entry, hookPolished: "", hookPolishedFrom: "" } }] }), 60);
+    const clear = (o) => ({ ...o, hookPolished: "", hookPolishedFrom: "" });
+    mutate((st) => {
+      if (ref.kind === "contact")
+        return { ...st, accounts: (st.accounts || []).map((a) => (a.id !== ref.id ? a : { ...a, contacts: (a.contacts || []).map((c) => (c.id === ref.contactId ? clear(c) : c)) })) };
+      if (ref.kind === "account") return { ...st, accounts: (st.accounts || []).map((a) => (a.id === ref.id ? clear(a) : a)) };
+      return { ...st, applications: st.applications.map((a) => (a.id === ref.id ? clear(a) : a)) };
+    });
+    /* pass a copy with the cache already blanked so the regenerate doesn't
+       read the stale value it just cleared */
+    setTimeout(() => polishedHookFor({ ...item, hookPolished: "", hookPolishedFrom: "" }), 60);
   };
 
-  /* pool: first contact copy for a company that's hooked and unwritten */
-  const copyPoolOutreach = async (member) => {
-    const person = contactsOf(member)[0];
-    const e = member.refs[0]?.entry || {};
-    const hook = (await polishedHookFor(member)) || member.hook;
+  /* pool: first contact copy, addressed to THIS person */
+  const copyPoolOutreach = async (item) => {
+    const e = item.entry || {};
+    const hook = (await polishedHookFor(item)) || item.hook;
     return copyDraftFor(
       "outreach",
-      copyVarsFrom({ company: member.company, contact: person?.name, position: person?.position, role: e.role, hook, industry: e.industry }),
-      member.company
+      copyVarsFrom({
+        company: item.company,
+        contact: item.contactName,
+        position: item.contactPosition,
+        role: e.role,
+        hook,
+        industry: item.ref?.kind === "contact" ? item.ref.account?.industry : e.industry,
+      }),
+      item.contactName ? `${item.contactName} · ${item.company}` : item.company
     );
   };
   const aiWriteCopy = async (purpose) => {
@@ -9445,8 +9596,10 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           onClose={() => setDraftModal(null)}
           onRegenerate={() => draftOutreach(draftModal.member, { regenerate: true })}
           onSaveHook={(h) => {
-            const ref = draftModal.member.refs[0];
-            if (ref) setPoolHook(ref.id, h, ref.kind);
+            /* the modal now always carries a work item, so its own ref is the
+               right target — the found hook lands on that person */
+            const ref = draftModal.member.ref || draftModal.member.refs?.[0];
+            if (ref) setPoolHook(ref, h);
             setDraftModal((d) => (d ? { ...d, foundHook: "" } : d));
             flash("Hook saved");
           }}
@@ -9639,6 +9792,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
   const set = (k) => (v) => setF((p) => ({ ...p, [k]: v }));
   const [shotBusy, setShotBusy] = useState(false);
   const [historyContact, setHistoryContact] = useState(null);
+  const [callContact, setCallContact] = useState(null); /* { contact, index } */
   const [confirmClearCsv, setConfirmClearCsv] = useState(false);
   const [shotErr, setShotErr] = useState("");
   const [customBoard, setCustomBoard] = useState(
@@ -9768,6 +9922,45 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     >
       {/* sits above the account modal it was opened from */}
       {historyContact && <ContactHistoryModal contact={historyContact.contact} company={historyContact.company} onClose={() => setHistoryContact(null)} />}
+      {callContact && (
+        <ColdCallModal
+          contact={callContact.contact}
+          company={f.company}
+          onClose={() => setCallContact(null)}
+          onSave={({ outcome, notes, tickFollowUp, followUpIndex }) => {
+            const o = callOutcome(outcome);
+            const i = callContact.index;
+            const note = `${o?.label || "Call"}${notes.trim() ? ` — ${notes.trim()}` : ""}`;
+            setF((p) => ({
+              ...p,
+              contacts: p.contacts.map((c, j) => {
+                if (j !== i) return c;
+                const next = {
+                  ...c,
+                  /* a call is a touch point like any other, so it feeds the
+                     activity date, the nurture clock and the timeline */
+                  touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "Phone call", note }],
+                  history: withLog(c, [logEntry("touch", `☎ ${note}`)]).history,
+                  /* a call IS contact, so an untouched record starts here */
+                  contacted: c.contacted || today(),
+                  status: c.status || "outreach",
+                };
+                if (tickFollowUp && followUpIndex >= 0) {
+                  next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex ? { ...x, done: true, doneAt: today(), channel: "Phone call" } : x));
+                }
+                if (CALL_CLOSES.includes(outcome)) next.status = "closed";
+                if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
+                /* a wrong number shouldn't stay in the field inviting a redial */
+                if (outcome === "wrongnumber") next.phone = "";
+                return next;
+              }),
+            }));
+            /* no toast here: `flash` lives in the parent, and the logged call
+               is immediately visible in the contact's touch points and history */
+            setCallContact(null);
+          }}
+        />
+      )}
       <div
         onClick={(e) => e.stopPropagation()}
         style={{ width: "100%", maxWidth: ["application", "account"].includes(kind) ? 620 : kind === "content" ? 760 : 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
@@ -11377,6 +11570,13 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     />
                     <CopyButton text={c.email} title="Copy email" />
                     <button
+                      onClick={() => setCallContact({ contact: c, index: i })}
+                      title="Log a cold call"
+                      style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0, fontSize: 14 }}
+                    >
+                      ☎
+                    </button>
+                    <button
                       onClick={() => setHistoryContact({ contact: c, company: f.company })}
                       title="History — status changes, LinkedIn moves and touch points"
                       style={{ position: "relative", background: "transparent", border: `1px solid ${stale ? C.red : C.panelEdge}`, color: stale ? C.red : C.muted, borderRadius: 10, width: 40, cursor: "pointer", flexShrink: 0, fontSize: 14 }}
@@ -11546,6 +11746,28 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       </div>
                     );
                   })()}
+
+                  {/* the hook lives on the PERSON now, so it's editable here as
+                      well as in the Pool tab — whichever screen you're on when
+                      you find the angle */}
+                  {f.fromPool && (
+                    <div style={{ marginBottom: 6 }}>
+                      <input
+                        value={c.hook || ""}
+                        onChange={(e) => {
+                          const v = e.target.value.slice(0, 120);
+                          setContact({ hook: v, researchedAt: v.trim() ? c.researchedAt || today() : "" });
+                        }}
+                        placeholder='🎯 Their hook — one line, "generic", or "generic person"'
+                        style={{ ...inputStyle, fontSize: 12, padding: "7px 9px" }}
+                      />
+                      {c.hook && (c.hook || "").trim() && (
+                        <div style={{ fontFamily: mono, fontSize: 9, color: C.green, marginTop: 3 }}>
+                          ✓ ready to write{c.researchedAt ? ` · researched ${c.researchedAt}` : ""}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* engagement loop — a different rhythm from follow-ups,
                       set by how often THEY post rather than by your queue */}
@@ -12437,6 +12659,141 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    fighting the app. */
 /* Per-contact timeline. Read-only by design: it's a record of what happened,
    and a record you can edit after the fact isn't much of a record. */
+/* Logs a cold call. Everything it records feeds the systems that already
+   exist rather than sitting in its own silo: a touch point (so the activity
+   date, nurture clock and history timeline all move), optionally a ticked
+   follow-up, and a status change when the outcome ends the pursuit. */
+function ColdCallModal({ contact, company, onClose, onSave }) {
+  const [outcome, setOutcome] = useState("");
+  const [notes, setNotes] = useState("");
+  const [tickFollowUp, setTickFollowUp] = useState(true);
+  const picked = callOutcome(outcome);
+  const fus = Array.isArray(contact.followUps) ? contact.followUps : [];
+  const nextUnticked = fus.findIndex((x) => !x.done);
+  const toneCol = (t) => (t === "green" ? C.green : t === "red" ? C.red : t === "blue" ? C.blue : t === "amber" ? C.amber : C.muted);
+  const past = (contact.touchpoints || []).filter((t) => t.channel === "Phone call");
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60, padding: 16 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 440, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 18, boxSizing: "border-box", maxHeight: "86vh", overflowY: "auto" }}
+      >
+        <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink }}>☎ Log a call</div>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>
+          {contact.name || "Unnamed contact"}
+          {contact.position ? ` · ${contact.position}` : ""}
+          {company ? ` · ${company}` : ""}
+        </div>
+        {contact.phone ? (
+          <a href={`tel:${contact.phone}`} style={{ display: "inline-block", fontFamily: mono, fontSize: 13, color: C.blue, textDecoration: "none", marginBottom: 12 }}>
+            {contact.phone} →
+          </a>
+        ) : (
+          <div style={{ fontSize: 11, color: C.amber, marginBottom: 12 }}>No phone number saved for this contact.</div>
+        )}
+
+        {past.length > 0 && (
+          <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "8px 10px", marginBottom: 12 }}>
+            <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted, marginBottom: 4 }}>
+              {past.length} PREVIOUS CALL{past.length === 1 ? "" : "S"}
+            </div>
+            {past.slice(-3).reverse().map((t) => (
+              <div key={t.id} style={{ fontSize: 11, color: C.muted, lineHeight: 1.5 }}>
+                {t.date} — {t.note || "call"}
+              </div>
+            ))}
+          </div>
+        )}
+
+        <Label>How did it go?</Label>
+        <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 12 }}>
+          {CALL_OUTCOMES.map((o) => {
+            const col = toneCol(o.tone);
+            const on = outcome === o.key;
+            return (
+              <button
+                key={o.key}
+                onClick={() => setOutcome(o.key)}
+                style={{
+                  textAlign: "left",
+                  background: on ? `${col}1f` : "transparent",
+                  border: `1px solid ${on ? col : C.panelEdge}`,
+                  color: on ? col : C.muted,
+                  borderRadius: 10,
+                  padding: "8px 11px",
+                  fontSize: 13,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                {on ? "◉" : "○"} {o.label}
+              </button>
+            );
+          })}
+        </div>
+
+        <Label>Notes</Label>
+        <textarea
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+          placeholder="What was said, who to ask for, when to try again…"
+          style={{ ...inputStyle, minHeight: 84, resize: "vertical", fontSize: 13, marginBottom: 10 }}
+        />
+
+        {/* only offered when the call actually landed — see `landed` above */}
+        {picked && picked.landed && nextUnticked !== -1 && (
+          <button
+            onClick={() => setTickFollowUp((v) => !v)}
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              textAlign: "left",
+              background: tickFollowUp ? "rgba(74,222,128,0.09)" : "transparent",
+              border: `1px solid ${tickFollowUp ? C.green : C.panelEdge}`,
+              color: tickFollowUp ? C.green : C.muted,
+              borderRadius: 10,
+              padding: "9px 12px",
+              fontSize: 13,
+              cursor: "pointer",
+              marginBottom: 10,
+            }}
+          >
+            {tickFollowUp ? "☑" : "☐"} Also tick follow-up {nextUnticked + 1}
+          </button>
+        )}
+        {picked && !picked.landed && (
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+            You didn&apos;t reach them, so this logs as an attempt. It won&apos;t tick a follow-up — that would mark the message delivered when it never landed.
+          </div>
+        )}
+        {picked && CALL_CLOSES.includes(picked.key) && (
+          <div style={{ fontSize: 11, color: C.amber, lineHeight: 1.5, marginBottom: 10 }}>
+            This closes the contact, so it stops appearing in due lists and the nurture clock.
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn ghost onClick={onClose} style={{ flex: 1 }}>
+            Cancel
+          </Btn>
+          <Btn
+            disabled={!outcome}
+            onClick={() => onSave({ outcome, notes, tickFollowUp: tickFollowUp && !!picked?.landed, followUpIndex: nextUnticked })}
+            style={{ flex: 2 }}
+          >
+            Log call
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ContactHistoryModal({ contact, company, onClose }) {
   const events = contactTimeline(contact);
   const ICON = { status: "◑", linkedin: "in", touch: "✉", first: "●", followup: "⚑" };
@@ -12838,27 +13195,42 @@ function PoolAdd({ open, onAddApplication, onAddAccount, onPark }) {
 /* one pool member. The hook is editable inline because writing it IS the
    discovery event — making that a modal trip would be friction on the exact
    action the whole cycle is built around. */
-function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft, onCopy, polishing, onRepolish }) {
-  const [draft, setDraft] = useState(member.hook || "");
-  const dirty = draft !== (member.hook || "");
-  const ref = member.refs[0];
-  const save = () => ref && onHook(ref.id, draft, ref.kind);
-  const contactCount = member.kind === "account" ? (ref?.entry?.contacts || []).filter((c) => !c.archivedAt).length : 0;
+/* Renders one WORK ITEM — a person, not a company. An account with three
+   contacts produces three of these rows, each with its own hook, so a hook
+   written for Ana can't end up addressed to Ben. */
+function PoolRow({ item, badge, onHook, onOpen, onRemove, onDraft, onCopy, polishing, onRepolish }) {
+  const [draft, setDraft] = useState(item.hook || "");
+  const dirty = draft !== (item.hook || "");
+  const ref = item.ref;
+  const save = () => ref && onHook(ref, draft);
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", marginBottom: 6 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6 }}>
-        <span onClick={() => onOpen(member)} style={{ fontSize: 14, fontWeight: 700, cursor: "pointer", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          <span style={{ marginRight: 5, fontSize: 12 }} title={member.kind === "account" ? "Tracked as an account" : "Tracked as an application"}>
-            {member.kind === "account" ? "🏢" : "📋"}
+        <span onClick={() => onOpen(item)} style={{ fontSize: 14, fontWeight: 700, cursor: "pointer", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span style={{ marginRight: 5, fontSize: 12 }} title={item.kind === "contact" ? "A contact inside an account" : item.kind === "account" ? "Account with no contacts yet" : "Tracked as an application"}>
+            {item.kind === "application" ? "📋" : "🏢"}
           </span>
-          {member.company || "Unnamed"}
-          {contactCount > 0 && <span style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}> · {contactCount} contact{contactCount === 1 ? "" : "s"}</span>}
+          {/* the PERSON leads, because the hook is about them — the company is
+              context. On a company with no contacts yet it's the other way. */}
+          {item.contactName ? (
+            <>
+              {item.contactName}
+              <span style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}>
+                {item.contactPosition ? ` · ${item.contactPosition}` : ""} · {item.company}
+              </span>
+            </>
+          ) : (
+            <>
+              {item.company || "Unnamed"}
+              <span style={{ fontSize: 11, color: C.amber, fontWeight: 400 }}> · no contact yet</span>
+            </>
+          )}
         </span>
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
           {badge}
           {onRemove && (
             <button
-              onClick={() => onRemove(member)}
+              onClick={() => onRemove(item)}
               title="Remove from the pool"
               aria-label="Remove from the pool"
               style={{ background: "transparent", border: "none", color: C.muted, fontSize: 17, lineHeight: 1, cursor: "pointer", padding: "0 2px" }}
@@ -12886,7 +13258,7 @@ function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft, onCopy, pol
         {!dirty && onCopy && (
           <Btn
             ghost
-            onClick={() => onCopy(member)}
+            onClick={() => onCopy(item)}
             title="Copy your saved First contact template, filled in for this company"
             style={{ padding: "7px 10px", fontSize: 12, flexShrink: 0 }}
           >
@@ -12894,33 +13266,33 @@ function PoolRow({ member, badge, onHook, onOpen, onRemove, onDraft, onCopy, pol
           </Btn>
         )}
         {/* drafting only makes sense once there's a hook to open with */}
-        {!dirty && onDraft && (member.hook || "").trim() && (
+        {!dirty && onDraft && (item.hook || "").trim() && (
           <Btn
             ghost
-            onClick={() => onDraft(member)}
-            title={ref?.entry?.outreachDraft ? "View the saved draft" : "Draft an email from this hook"}
-            style={{ padding: "7px 10px", fontSize: 12, flexShrink: 0, color: ref?.entry?.outreachDraft ? C.blue : C.muted, borderColor: ref?.entry?.outreachDraft ? C.blue : C.panelEdge }}
+            onClick={() => onDraft(item)}
+            title={item.entry?.outreachDraft ? "View the saved draft" : "Draft an email from this hook"}
+            style={{ padding: "7px 10px", fontSize: 12, flexShrink: 0, color: item.entry?.outreachDraft ? C.blue : C.muted, borderColor: item.entry?.outreachDraft ? C.blue : C.panelEdge }}
           >
-            {ref?.entry?.outreachDraft ? "✍ Draft ✓" : "✍ Draft"}
+            {item.entry?.outreachDraft ? "✍ Draft ✓" : "✍ Draft"}
           </Btn>
         )}
       </div>
       {/* the polished opening, shown so it can be checked and corrected — an
           AI sentence that goes straight to the clipboard unseen is exactly how
           a wrong claim reaches a stranger */}
-      {ref?.entry?.hookPolished && ref.entry.hookPolishedFrom === (member.hook || "").trim() && (
+      {item.hookPolished && item.hookPolishedFrom === (item.hook || "").trim() && (
         <div style={{ display: "flex", alignItems: "flex-start", gap: 6, marginTop: 6, background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "7px 9px" }}>
           <span style={{ fontFamily: mono, fontSize: 9, color: C.blue, flexShrink: 0, paddingTop: 2 }}>AI</span>
-          <span style={{ fontSize: 12, color: C.ink, lineHeight: 1.45, flex: 1, minWidth: 0 }}>{ref.entry.hookPolished}</span>
+          <span style={{ fontSize: 12, color: C.ink, lineHeight: 1.45, flex: 1, minWidth: 0 }}>{item.hookPolished}</span>
           {onRepolish && (
-            <button onClick={() => onRepolish(member)} title="Rewrite this opening line" style={{ background: "transparent", border: "none", color: C.muted, fontSize: 13, cursor: "pointer", padding: 0, flexShrink: 0 }}>
+            <button onClick={() => onRepolish(item)} title="Rewrite this opening line" style={{ background: "transparent", border: "none", color: C.muted, fontSize: 13, cursor: "pointer", padding: 0, flexShrink: 0 }}>
               ↻
             </button>
           )}
         </div>
       )}
-      {polishing === member.key && <div style={{ fontSize: 11, color: C.blue, marginTop: 6 }}>Polishing the opening line…</div>}
-      {member.discoveredAt && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>researched {member.discoveredAt}</div>}
+      {polishing === item.key && <div style={{ fontSize: 11, color: C.blue, marginTop: 6 }}>Polishing the opening line…</div>}
+      {item.researchedAt && <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 4 }}>researched {item.researchedAt}</div>}
     </div>
   );
 }
