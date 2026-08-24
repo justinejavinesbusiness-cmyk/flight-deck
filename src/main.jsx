@@ -4511,14 +4511,18 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     mutate((s) => {
       const applications = s.applications.map((a) => (a.id === id ? { ...a, [field]: value } : a));
       let accounts = s.accounts;
-      if (field === "followUps") {
+      /* every field the contact also holds must ride along — ticking a
+         follow-up inline creates a touch point on the application, and if only
+         `followUps` syncs, that touch point never reaches the contact and gets
+         wiped the next time the account side saves */
+      const MIRRORED = ["followUps", "touchpoints", "gotReply", "liStatus", "liStatusAt", "history", "notes", "hook", "researchedAt"];
+      if (MIRRORED.includes(field)) {
         const app = s.applications.find((a) => a.id === id);
         if (app?.fromAccountContact) {
+          const copy = Array.isArray(value) ? value.map((x) => (x && typeof x === "object" ? { ...x } : x)) : value;
           accounts = s.accounts.map((acc) => ({
             ...acc,
-            contacts: (acc.contacts || []).map((c) =>
-              c.linkedApplicationId === id ? { ...c, followUps: Array.isArray(value) ? value.map((f) => ({ ...f })) : [] } : c
-            ),
+            contacts: (acc.contacts || []).map((c) => (c.linkedApplicationId === id ? { ...c, [field]: copy } : c)),
           }));
         }
       }
@@ -5548,11 +5552,33 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
              save doesn't silently revert whatever changed here (checking a
              follow-up done, adding/removing one, editing its day count) */
           let accounts = s.accounts;
-          if (entry?.fromAccountContact && Array.isArray(data.followUps)) {
-            const synced = data.followUps.map((f) => ({ ...f }));
+          /* ---- keep the linked contact in step ----
+             The contact→application direction already copied follow-ups AND
+             touch points, but coming back only follow-ups made the trip. So a
+             touch point logged from the pipeline never reached the contact —
+             its history timeline missed it, its last-activity date stayed
+             stale (starting the nurture clock early), and the next edit on the
+             account side copied the shorter list back over the top, deleting
+             it outright. Same fields both ways is the only version that
+             doesn't lose data. */
+          if (entry?.fromAccountContact) {
+            const syncedFollowUps = Array.isArray(data.followUps) ? data.followUps.map((f) => ({ ...f })) : null;
+            const syncedTouchpoints = Array.isArray(data.touchpoints) ? data.touchpoints.map((t) => ({ ...t })) : null;
             accounts = s.accounts.map((acc) => ({
               ...acc,
-              contacts: (acc.contacts || []).map((c) => (c.linkedApplicationId === entry.id ? { ...c, followUps: synced } : c)),
+              contacts: (acc.contacts || []).map((c) =>
+                c.linkedApplicationId !== entry.id
+                  ? c
+                  : {
+                      ...c,
+                      ...(syncedFollowUps ? { followUps: syncedFollowUps } : {}),
+                      ...(syncedTouchpoints ? { touchpoints: syncedTouchpoints } : {}),
+                      /* the person-level fields the pipeline can also change */
+                      ...(typeof data.gotReply === "boolean" ? { gotReply: data.gotReply } : {}),
+                      ...(data.liStatus !== undefined ? { liStatus: data.liStatus, liStatusAt: data.liStatusAt || c.liStatusAt } : {}),
+                      ...(Array.isArray(data.history) ? { history: data.history.map((h) => ({ ...h })) } : {}),
+                    }
+              ),
             }));
           }
           /* screening onward is a company-level event for that job title —
