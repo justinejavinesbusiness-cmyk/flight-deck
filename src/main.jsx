@@ -1075,10 +1075,12 @@ const workItemReadiness = (w) => (w.worked ? "contacted" : (w.hook || "").trim()
    time, find another route, or fix the number, and flattening them into the
    email vocabulary throws away the instruction.
 
-   `landed` is the load-bearing flag. It marks the outcomes where your message
-   actually reached them, and only those may tick a follow-up as done —
-   marking a follow-up complete after nobody answered would quietly convince
-   you you'd done work you hadn't. */
+   `landed` marks the outcomes where your message actually reached them. Every
+   logged call ticks a follow-up by default — dialling is the outreach work, and
+   the tick records that you did it — so this flag no longer gates that. It
+   drives the wording instead: after a no-answer the modal says plainly that the
+   slot is being used on an attempt that didn't connect, so burning a follow-up
+   is a choice you make rather than one made for you. */
 const CALL_OUTCOMES = [
   { key: "spoke", label: "Spoke with them", tone: "green", landed: true },
   { key: "voicemail", label: "Left a voicemail", tone: "amber", landed: true },
@@ -4567,11 +4569,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   /* jumps from a synced application's "Source: Accounts" badge straight to
      the linked account, in the Accounts tab, modal already open */
+  /* Opens the account's own modal WITHOUT moving you to the Accounts tab.
+     Switching views meant closing the modal dropped you somewhere you hadn't
+     asked to be, and you'd have to navigate back to the application list you
+     were working through. The modal is the destination; the tab isn't. */
   const openLinkedAccount = (app) => {
     const acc = state.accounts.find((a) => normCompanyName(a.company) === normCompanyName(app.company));
-    if (!acc) return;
-    setMode(2);
-    setCrmView("accounts");
+    if (!acc) return flash("No account tracked for this company yet");
     setModal({ kind: "account", entry: acc });
   };
 
@@ -4594,10 +4598,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   /* opens one specific application/outreach entry directly in its own modal —
      used by the related-applications list inside the account modal */
+  /* mirror of openLinkedAccount: opening ONE application from an account's
+     related list shouldn't relocate you either. Only the list-showing jumps
+     (openRelatedApplications) change the view, because a list has nowhere else
+     to appear. */
   const openApplicationEntry = (app) => {
     if (!app) return;
-    setMode(2);
-    setCrmView("applications");
     setModal({ kind: "application", entry: app });
   };
 
@@ -12745,8 +12751,11 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
           style={{ ...inputStyle, minHeight: 84, resize: "vertical", fontSize: 13, marginBottom: 10 }}
         />
 
-        {/* only offered when the call actually landed — see `landed` above */}
-        {picked && picked.landed && nextUnticked !== -1 && (
+        {/* Every logged call counts as follow-up work, not just the ones that
+            landed — dialling IS the outreach, and the tick records that you did
+            it. Still a toggle, because three no-answers in one afternoon would
+            otherwise burn the whole sequence without reaching anyone. */}
+        {picked && nextUnticked !== -1 && (
           <button
             onClick={() => setTickFollowUp((v) => !v)}
             style={{
@@ -12766,9 +12775,15 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
             {tickFollowUp ? "☑" : "☐"} Also tick follow-up {nextUnticked + 1}
           </button>
         )}
-        {picked && !picked.landed && (
+        {picked && !picked.landed && tickFollowUp && nextUnticked !== -1 && (
           <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
-            You didn&apos;t reach them, so this logs as an attempt. It won&apos;t tick a follow-up — that would mark the message delivered when it never landed.
+            You didn&apos;t reach them this time. The call still counts as follow-up {nextUnticked + 1} — untick above if you&apos;d rather keep that slot for an attempt that
+            actually connects.
+          </div>
+        )}
+        {picked && nextUnticked === -1 && (
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+            Every scheduled follow-up is already done, so this logs as a touch point only.
           </div>
         )}
         {picked && CALL_CLOSES.includes(picked.key) && (
@@ -12783,7 +12798,7 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
           </Btn>
           <Btn
             disabled={!outcome}
-            onClick={() => onSave({ outcome, notes, tickFollowUp: tickFollowUp && !!picked?.landed, followUpIndex: nextUnticked })}
+            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked })}
             style={{ flex: 2 }}
           >
             Log call
