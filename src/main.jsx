@@ -2110,6 +2110,58 @@ function rowsToCsv(rows) {
   const lines = [CSV_COLUMNS.join(","), ...rows.map((r) => CSV_COLUMNS.map((k) => esc(r[k])).join(","))];
   return lines.join("\n");
 }
+/* ============================================================
+   DAILY SNAPSHOTS
+
+   A rolling set of end-of-day copies kept in this browser, separate from both
+   the live state and the synced record. They exist for the failure modes the
+   sync can't help with: a bad edit propagating to every device, a corrupted
+   remote write, or a bulk action that turned out wrong — cases where "restore
+   from the server" restores the same damage.
+
+   One per day, taken the first time the app loads on a new day, which captures
+   the state as it stood at the END of the previous day. Kept for 14 days, and
+   stored under their own key so clearing the app's working state doesn't take
+   the history with it. Local-only by design: a snapshot that syncs is a
+   snapshot that inherits whatever went wrong remotely.
+   ============================================================ */
+const SNAP_KEY = "fd-snapshots";
+const SNAP_KEEP = 14;
+function readSnapshots() {
+  try {
+    const raw = localStorage.getItem(SNAP_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+function writeSnapshots(list) {
+  try {
+    localStorage.setItem(SNAP_KEY, JSON.stringify(list.slice(0, SNAP_KEEP)));
+    return true;
+  } catch (e) {
+    /* quota is the realistic failure — drop the oldest and try once more
+       rather than losing the whole history */
+    try {
+      localStorage.setItem(SNAP_KEY, JSON.stringify(list.slice(0, Math.max(3, Math.floor(SNAP_KEEP / 2)))));
+      return true;
+    } catch (e2) {
+      return false;
+    }
+  }
+}
+/* a snapshot is worth taking only if there's something in it — an empty state
+   would otherwise overwrite a good history on a fresh install or failed load */
+const snapshotWorthKeeping = (st) => !!st && ((st.applications || []).length > 0 || (st.accounts || []).length > 0 || (st.content || []).length > 0);
+const snapshotSummary = (st) => ({
+  applications: (st.applications || []).length,
+  accounts: (st.accounts || []).length,
+  contacts: (st.accounts || []).reduce((n, a) => n + (a.contacts || []).length, 0),
+  content: (st.content || []).length,
+  copy: (st.copyDrafts || []).length,
+});
+
 function triggerCsvDownload(rows, filename) {
   const csv = rowsToCsv(rows);
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
@@ -3566,6 +3618,89 @@ export default function FlightDeck() {
       }
     })();
   }, []);
+
+  /* ---- daily snapshot ----
+     Runs once per day on load, BEFORE the day's edits begin, so what it stores
+     is yesterday's finished state rather than a half-edited today. */
+  /* mirrored into state so the settings list re-renders after a capture,
+     restore or delete without needing the modal reopened */
+  const [snapshots, setSnapshots] = useState(() => readSnapshots());
+  const snapChecked = useRef(false);
+  useEffect(() => {
+    if (!loaded || snapChecked.current) return;
+    snapChecked.current = true;
+    if (!snapshotWorthKeeping(state)) return;
+    const list = readSnapshots();
+    if (list[0]?.date === today()) return; /* already have one for today */
+    const next = [{ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state }, ...list];
+    writeSnapshots(next);
+    setSnapshots(readSnapshots());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  /* Restoring replaces the working state and pushes it to the server, so every
+     device converges on the restored copy. A snapshot of the CURRENT state is
+     taken first under a separate marker — restoring the wrong day shouldn't be
+     the one action you can't undo. */
+  const restoreSnapshot = (snap) => {
+    if (!snap?.data) return;
+    const list = readSnapshots();
+    const withPre = [{ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state, preRestore: true }, ...list.filter((x) => !(x.date === today() && x.preRestore))];
+    writeSnapshots(withPre);
+    setSnapshots(readSnapshots());
+    setState(migrate(snap.data));
+    flash(`↺ Restored ${snap.date} — sync will push it to your other devices`);
+  };
+  const deleteSnapshot = (date) => {
+    writeSnapshots(readSnapshots().filter((x) => x.date !== date));
+    flash("Snapshot removed");
+  };
+  /* Restores from a file. Kept separate from the snapshot list because it's
+     the recovery path that still works when this browser has lost everything —
+     new device, cleared storage, or a machine that never had the app. */
+  const importBackupFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result));
+        /* refuse anything that isn't recognisably a Flight Deck export rather
+           than replacing your data with whatever JSON was selected */
+        if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.applications)) {
+          return flash("That doesn't look like a Flight Deck backup");
+        }
+        const list = readSnapshots();
+        writeSnapshots([{ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state, preRestore: true }, ...list.filter((x) => !(x.date === today() && x.preRestore))]);
+        setSnapshots(readSnapshots());
+        setState(migrate(parsed));
+        flash("↺ Backup imported — sync will push it to your other devices");
+      } catch (e) {
+        flash("Couldn't read that file");
+      }
+    };
+    reader.onerror = () => flash("Couldn't read that file");
+    reader.readAsText(file);
+  };
+
+  /* an off-device copy: the one thing that survives losing the browser */
+  const exportSnapshot = (snap) => {
+    try {
+      const blob = new Blob([JSON.stringify(snap.data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `flight-deck-${snap.date}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      flash("Couldn't export");
+    }
+  };
+
+  /* Export whatever is live right now. The daily snapshots only start
+     appearing tomorrow, so without this a fresh install has no way to take a
+     backup at the moment you most want one — before a risky change. */
+  const exportCurrent = () => exportSnapshot({ date: `${today()}-current`, data: state });
 
   /* save: local immediately, remote debounced */
   useEffect(() => {
@@ -9494,6 +9629,15 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           onOpenApplication={openApplicationEntry}
           onCopyDraft={copyFollowUpDraft}
           isDesktop={isDesktop}
+          snapshots={snapshots}
+          onRestoreSnapshot={restoreSnapshot}
+          onExportSnapshot={exportSnapshot}
+          onExportCurrent={exportCurrent}
+          onImportBackup={importBackupFile}
+          onDeleteSnapshot={(d) => {
+            deleteSnapshot(d);
+            setSnapshots(readSnapshots());
+          }}
         />
       )}
       {modal && modal.kind === "parseJobPost" && (
@@ -9658,7 +9802,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft, isDesktop }) {
+function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft, isDesktop, snapshots, onRestoreSnapshot, onExportSnapshot, onDeleteSnapshot, onExportCurrent, onImportBackup }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
     if (kind === "application") {
@@ -9903,6 +10047,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
      something identifying in it, so a stray tap can't litter the list with
      blank records. */
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [confirmRestore, setConfirmRestore] = useState("");
   const initialRef = useRef(null);
   useEffect(() => {
     if (initialRef.current === null) initialRef.current = JSON.stringify(f);
@@ -11084,6 +11229,108 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 </option>
               ))}
             </select>
+
+            {/* ---- daily snapshots ----
+                Deliberately above the destructive settings: if something has
+                gone wrong, this is what you want to find first. */}
+            <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <Label>↺ Daily backups</Label>
+              <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+                One copy per day, kept on this device for {SNAP_KEEP} days. Separate from sync on purpose — if a bad edit or a broken write reached the server, restoring from
+                the server would just restore the damage. Restoring takes a copy of today first, so it&apos;s reversible.
+              </div>
+              {/* Available with zero snapshots, which is exactly when you need
+                  it: a fresh install has no daily copies until tomorrow. */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                <Btn onClick={onExportCurrent} style={{ flex: 1, padding: "8px 10px", fontSize: 12 }}>
+                  ⬇ Export now
+                </Btn>
+                <label
+                  style={{
+                    flex: 1,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    border: `1px solid ${C.panelEdge}`,
+                    color: C.muted,
+                    borderRadius: 10,
+                    padding: "8px 10px",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    fontFamily: sans,
+                  }}
+                >
+                  ⬆ Import file
+                  <input
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = ""; /* so re-picking the same file fires again */
+                      if (file) onImportBackup(file);
+                    }}
+                    style={{ display: "none" }}
+                  />
+                </label>
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+                Export saves a JSON file of everything as it stands now. Import replaces your data with a file — it takes a copy of your current state first, so it&apos;s
+                reversible. This is the recovery path that still works on a new device.
+              </div>
+
+              {snapshots.length === 0 ? (
+                <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 16 }}>
+                  No daily snapshots yet — the first is taken the next time you open the app on a new day. Use Export now for an immediate copy.
+                </div>
+              ) : (
+                <div style={{ marginBottom: 16 }}>
+                  {snapshots.map((snap) => (
+                    <div key={snap.date + (snap.preRestore ? "-pre" : "")} style={{ background: C.bg, border: `1px solid ${snap.preRestore ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 6 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+                        <span style={{ fontFamily: mono, fontSize: 12, color: C.ink }}>
+                          {snap.date}
+                          {snap.preRestore && <span style={{ color: C.amber, fontSize: 10 }}> · before restore</span>}
+                        </span>
+                        <span style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>{daysSince(snap.date) === 0 ? "today" : `${daysSince(snap.date)}d ago`}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+                        {snap.summary.applications} applications · {snap.summary.accounts} accounts · {snap.summary.contacts} contacts · {snap.summary.content} content
+                        {snap.summary.copy ? ` · ${snap.summary.copy} copy` : ""}
+                      </div>
+                      <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                        <Btn
+                          color={confirmRestore === snap.date ? C.red : undefined}
+                          ghost={confirmRestore !== snap.date}
+                          onClick={() => {
+                            if (confirmRestore === snap.date) {
+                              onRestoreSnapshot(snap);
+                              setConfirmRestore("");
+                              return;
+                            }
+                            setConfirmRestore(snap.date);
+                            setTimeout(() => setConfirmRestore(""), 5000);
+                          }}
+                          style={{ padding: "5px 10px", fontSize: 11 }}
+                        >
+                          {confirmRestore === snap.date ? "Replace everything?" : "↺ Restore"}
+                        </Btn>
+                        <Btn ghost onClick={() => onExportSnapshot(snap)} style={{ padding: "5px 10px", fontSize: 11 }}>
+                          ⬇ File
+                        </Btn>
+                        <Btn ghost onClick={() => onDeleteSnapshot(snap.date)} style={{ padding: "5px 10px", fontSize: 11 }}>
+                          ×
+                        </Btn>
+                      </div>
+                    </div>
+                  ))}
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5 }}>
+                    Restoring overwrites everything on every device once it syncs. <strong style={{ color: C.ink }}>⬇ File</strong> saves a copy off-device — the only thing that
+                    survives losing this browser.
+                  </div>
+                </div>
+              )}
+            </div>
 
             <Label>🗄 File applications that never got an answer</Label>
             <button
