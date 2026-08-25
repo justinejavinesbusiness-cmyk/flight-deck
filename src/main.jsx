@@ -10048,6 +10048,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
      blank records. */
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmRestore, setConfirmRestore] = useState("");
+  /* settings sidebar: which section is highlighted, and the scroll container
+     it jumps within */
+  const [settingsSection, setSettingsSection] = useState("general");
+  const scrollRef = useRef(null);
   const initialRef = useRef(null);
   useEffect(() => {
     if (initialRef.current === null) initialRef.current = JSON.stringify(f);
@@ -10195,7 +10199,63 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
           </div>
         </div>
 
-        <div style={{ flex: 1, overflowY: "auto", padding: fullPage ? "16px 16px 24px" : "0 20px 16px", minHeight: 0, maxWidth: fullPage ? 620 : "none", width: "100%", margin: fullPage ? "0 auto" : 0, boxSizing: "border-box" }}>
+        {/* On a wide screen the settings page is a sidebar plus a content
+            column. The sidebar is navigation only — every section stays in one
+            scroll, so nothing is hidden behind a tab you didn't think to open,
+            and Cmd-F still finds everything. */}
+        <div style={{ flex: 1, minHeight: 0, display: "flex", justifyContent: "center", overflow: "hidden" }}>
+          {fullPage && isDesktop && (
+            <nav style={{ width: 208, flexShrink: 0, borderRight: `1px solid ${C.panelEdge}`, padding: "18px 12px", overflowY: "auto" }}>
+              {SETTINGS_SECTIONS.map((sec) => (
+                <button
+                  key={sec.key}
+                  onClick={() => {
+                    const el = scrollRef.current?.querySelector(`[data-sec="${sec.key}"]`);
+                    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+                    setSettingsSection(sec.key);
+                  }}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    textAlign: "left",
+                    background: settingsSection === sec.key ? "rgba(245,185,66,0.1)" : "transparent",
+                    border: `1px solid ${settingsSection === sec.key ? C.amber : "transparent"}`,
+                    color: settingsSection === sec.key ? C.amber : C.muted,
+                    borderRadius: 10,
+                    padding: "9px 11px",
+                    marginBottom: 4,
+                    cursor: "pointer",
+                    fontFamily: sans,
+                  }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>
+                    <span style={{ marginRight: 7, fontFamily: mono }}>{sec.icon}</span>
+                    {sec.label}
+                  </div>
+                  <div style={{ fontSize: 10, color: C.muted, marginTop: 1, marginLeft: 20 }}>{sec.hint}</div>
+                </button>
+              ))}
+            </nav>
+          )}
+          <div
+            ref={scrollRef}
+            /* keeps the sidebar highlight honest when you scroll rather than
+               click — a nav that lies about where you are is worse than none */
+            onScroll={
+              fullPage && isDesktop
+                ? (e) => {
+                    const top = e.currentTarget.getBoundingClientRect().top;
+                    let current = SETTINGS_SECTIONS[0].key;
+                    SETTINGS_SECTIONS.forEach((sec) => {
+                      const el = e.currentTarget.querySelector(`[data-sec="${sec.key}"]`);
+                      if (el && el.getBoundingClientRect().top - top <= 24) current = sec.key;
+                    });
+                    setSettingsSection((prev) => (prev === current ? prev : current));
+                  }
+                : undefined
+            }
+            style={{ flex: 1, overflowY: "auto", padding: fullPage ? (isDesktop ? "18px 28px 40px" : "16px 16px 24px") : "0 20px 16px", minHeight: 0, maxWidth: fullPage ? 720 : "none", width: "100%", margin: fullPage && !isDesktop ? "0 auto" : 0, boxSizing: "border-box" }}
+          >
 
         {kind === "application" && (
           <>
@@ -10992,6 +11052,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
 
         {kind === "checkinDay" && (
           <>
+            <div data-sec="general" style={{ scrollMarginTop: 12 }} />
             <Label>What determines your "day"?</Label>
             <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
               This decides when today flips to tomorrow — for goal targets, due follow-ups, and everything else the app treats as "today." Defaults to the Philippines. Fixed offset only, no daylight saving adjustment.
@@ -11011,6 +11072,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               On or after this day each month, the Dashboard will remind you to recalculate fund ÷ expenses. Saving new runway numbers marks the month as done.
             </div>
 
+            <div data-sec="followups" style={{ scrollMarginTop: 12 }} />
             <Label>Default follow-up schedule (days after contact)</Label>
             <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
               New applications start with this schedule. Existing applications keep their own.
@@ -11059,6 +11121,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             />
 
             <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <div data-sec="ai" style={{ scrollMarginTop: 12 }} />
               <Label>🤖 AI provider — outreach drafting</Label>
               <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
                 Drafts a first email from a pool company&apos;s hook. Built-in needs no key. Choosing your own provider keeps the key in this browser only — it is never
@@ -11248,18 +11311,6 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
 
             <Label>Default follow-up channel</Label>
             <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
-              Ticking a follow-up logs a touch point automatically. This is the channel it assumes — changeable per follow-up.
-            </div>
-            <select value={f.defaultTouchChannel} onChange={(e) => set("defaultTouchChannel")(e.target.value)} style={{ ...selectStyle, width: 160, marginBottom: 16 }}>
-              {TOUCHPOINT_CHANNELS.map((ch) => (
-                <option key={ch} value={ch}>
-                  {ch}
-                </option>
-              ))}
-            </select>
-
-            <Label>Default follow-up channel</Label>
-            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
               Ticking a follow-up logs a touch point automatically, and this is the channel it assumes. Each contact and each individual follow-up can still override it.
             </div>
             <select value={f.defaultTouchChannel} onChange={(e) => set("defaultTouchChannel")(e.target.value)} style={{ ...selectStyle, width: 160, marginBottom: 16 }}>
@@ -11274,6 +11325,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 Deliberately above the destructive settings: if something has
                 gone wrong, this is what you want to find first. */}
             <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <div data-sec="data" style={{ scrollMarginTop: 12 }} />
               <Label>↺ Daily backups</Label>
               <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
                 One copy per day, kept on this device for {SNAP_KEEP} days. Separate from sync on purpose — if a bad edit or a broken write reached the server, restoring from
@@ -11409,6 +11461,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             </div>
 
             <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <div data-sec="goal" style={{ scrollMarginTop: 12 }} />
               <Label>🎯 Goal model</Label>
               <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
                 Standard is the original target-over-days quota — unbounded, so you can only ever be behind. Pool pacing replaces it with coverage of the closed company set
@@ -11504,6 +11557,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             </div>
 
             <div style={{ marginTop: 8, paddingTop: 16, borderTop: `1px solid ${C.panelEdge}` }}>
+              <div data-sec="content" style={{ scrollMarginTop: 12 }} />
               <Label>📦 Content commitment targets</Label>
               <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
                 The weekly count only tells you you've missed after the week is gone. These two tell you beforehand: how many finished pieces to keep banked, and the minimum
@@ -12516,6 +12570,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
           </>
         )}
 
+          </div>
         </div>
 
         <div
@@ -13136,6 +13191,20 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
     </div>
   );
 }
+
+/* ---- settings sections ----
+   Settings had grown to a dozen unrelated groups in one vertical scroll, which
+   on a wide screen is a phone layout with empty space either side. These give
+   it structure: a sidebar on desktop showing one group at a time, and the same
+   groups stacked with headings on mobile, where a sidebar would steal width. */
+const SETTINGS_SECTIONS = [
+  { key: "general", label: "General", icon: "⚙", hint: "Your day and timezone" },
+  { key: "followups", label: "Follow-ups", icon: "⚑", hint: "Schedule, cap, channel" },
+  { key: "goal", label: "Goal model", icon: "◎", hint: "Standard or pool pacing" },
+  { key: "content", label: "Content", icon: "✎", hint: "Targets and schedule" },
+  { key: "ai", label: "AI drafting", icon: "✉", hint: "Provider, key, sections" },
+  { key: "data", label: "Backups & data", icon: "↺", hint: "Snapshots, export, archive" },
+];
 
 function ContactHistoryModal({ contact, company, onClose }) {
   const events = contactTimeline(contact);
