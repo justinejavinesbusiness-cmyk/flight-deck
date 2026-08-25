@@ -10090,12 +10090,23 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     }
   };
 
+  /* Settings is long — timezone, follow-up rules, AI provider and key, draft
+     sections, content targets, backups — and a centred box with its own scroll
+     inside the page's scroll is the wrong container for that. It renders as a
+     full page instead: edge to edge, one scroll, its own header. Everything
+     else stays a modal, which is right for editing one record. */
+  const fullPage = kind === "checkinDay";
+
   return (
     <div
-      onClick={dismiss}
+      onClick={fullPage ? undefined : dismiss}
       onTouchStart={(e) => e.stopPropagation()}
       onTouchEnd={(e) => e.stopPropagation()}
-      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}
+      style={
+        fullPage
+          ? { position: "fixed", inset: 0, background: C.bg, zIndex: 50, display: "flex", flexDirection: "column" }
+          : { position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }
+      }
     >
       {/* sits above the account modal it was opened from */}
       {historyContact && <ContactHistoryModal contact={historyContact.contact} company={historyContact.company} onClose={() => setHistoryContact(null)} />}
@@ -10140,22 +10151,51 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
       )}
       <div
         onClick={(e) => e.stopPropagation()}
-        style={{ width: "100%", maxWidth: ["application", "account"].includes(kind) ? 620 : kind === "content" ? 760 : 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }}
+        style={
+          fullPage
+            ? {
+                width: "100%",
+                height: "100%",
+                background: C.bg,
+                boxSizing: "border-box",
+                display: "flex",
+                flexDirection: "column",
+                overflow: "hidden",
+                /* keeps the header clear of a notch and the footer clear of the
+                   home indicator when installed as a PWA */
+                paddingTop: "env(safe-area-inset-top, 0px)",
+                paddingBottom: "env(safe-area-inset-bottom, 0px)",
+              }
+            : { width: "100%", maxWidth: ["application", "account"].includes(kind) ? 620 : kind === "content" ? 760 : 420, maxHeight: "80vh", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, boxSizing: "border-box", display: "flex", flexDirection: "column", overflow: "hidden" }
+        }
       >
-        <div style={{ padding: "20px 20px 0", flexShrink: 0 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, marginBottom: 14 }}>
-            <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink }}>{titles[kind]}</div>
+        <div style={{ padding: fullPage ? "14px 16px" : "20px 20px 0", flexShrink: 0, borderBottom: fullPage ? `1px solid ${C.panelEdge}` : "none" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: fullPage ? 0 : 14 }}>
+            {/* A full page needs a way back; a modal is dismissed by tapping out.
+                Back COMMITS, exactly like tapping outside a modal — it's the only
+                non-explicit exit on a page, so it must not silently discard. */}
+            {fullPage && (
+              <button onClick={dismiss} aria-label="Back" style={{ background: "transparent", border: "none", color: C.muted, fontSize: 20, cursor: "pointer", padding: "0 8px 0 0", lineHeight: 1, flexShrink: 0 }}>
+                ‹
+              </button>
+            )}
+            <div style={{ fontFamily: sans, fontSize: 16, fontWeight: 800, color: C.ink, flex: 1, minWidth: 0 }}>{titles[kind]}</div>
             {/* makes the commit-on-dismiss behaviour legible rather than magic */}
-            {isDirty() && (
+            {isDirty() && !fullPage && (
               <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: 0.4, color: C.amber, flexShrink: 0, textAlign: "right", lineHeight: 1.4 }}>
                 UNSAVED
                 <div style={{ color: C.muted, letterSpacing: 0 }}>tap outside to save</div>
               </div>
             )}
+            {isDirty() && fullPage && (
+              <span style={{ fontFamily: mono, fontSize: 9, letterSpacing: 0.4, color: C.amber, flexShrink: 0 }} title="Back or Save will keep these changes">
+                UNSAVED
+              </span>
+            )}
           </div>
         </div>
 
-        <div style={{ flex: 1, overflowY: "auto", padding: "0 20px 16px", minHeight: 0 }}>
+        <div style={{ flex: 1, overflowY: "auto", padding: fullPage ? "16px 16px 24px" : "0 20px 16px", minHeight: 0, maxWidth: fullPage ? 620 : "none", width: "100%", margin: fullPage ? "0 auto" : 0, boxSizing: "border-box" }}>
 
         {kind === "application" && (
           <>
@@ -12478,7 +12518,22 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
 
         </div>
 
-        <div style={{ display: "flex", gap: 10, padding: "14px 20px", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0, background: C.panel }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 10,
+            padding: "14px 20px",
+            borderTop: `1px solid ${C.panelEdge}`,
+            flexShrink: 0,
+            background: fullPage ? C.bg : C.panel,
+            /* the footer spans the screen but its buttons stay with the
+               content column, so Save isn't stranded at the far edge */
+            maxWidth: fullPage ? 620 : "none",
+            width: "100%",
+            margin: fullPage ? "0 auto" : 0,
+            boxSizing: "border-box",
+          }}
+        >
           {kind === "session" ? (
             <Btn ghost onClick={onClose} style={{ flex: 1 }}>Close</Btn>
           ) : (
