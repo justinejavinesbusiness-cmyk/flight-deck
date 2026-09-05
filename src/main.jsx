@@ -328,6 +328,25 @@ const LI_STATUSES = [
 ];
 const LI_META = (k) => LI_STATUSES.find((x) => x.key === (k || "")) || LI_STATUSES[0];
 const LI_STALE_DAYS = 7;
+/* LinkedIn blocks re-sending to someone whose request you withdrew for about
+   three weeks. Before that a retry silently fails; after it, the person is
+   reachable again — and that reopening is invisible unless something tracks
+   it, so a withdrawn request otherwise just becomes a lead you quietly gave
+   up on. Same clock applied to a declined request, where the wait is manners
+   rather than a platform rule. */
+const LI_RETRY_DAYS = 21;
+const LI_RETRY_STATUSES = ["withdrawn", "declined"];
+const liRetryDays = (c) => {
+  if (!c?.linkedin || !LI_RETRY_STATUSES.includes(c.liStatus) || !c.liStatusAt) return 0;
+  const d = daysSince(c.liStatusAt);
+  return d >= LI_RETRY_DAYS ? d : 0;
+};
+/* how long until it reopens, for the ones still inside the window */
+const liRetryIn = (c) => {
+  if (!c?.linkedin || !LI_RETRY_STATUSES.includes(c.liStatus) || !c.liStatusAt) return 0;
+  const left = LI_RETRY_DAYS - daysSince(c.liStatusAt);
+  return left > 0 ? left : 0;
+};
 const DEFAULT_TOUCH_CHANNEL = "LinkedIn";
 
 /* Ticking a follow-up means you actually sent something, so it should leave a
@@ -8023,11 +8042,22 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {
         group: "Relationship",
         items: [
-          { key: "connected", label: `● Connected (${allContacts.filter((c) => c.liStatus === "connected").length})` },
-          { key: "liPending", label: `in Pending (${allContacts.filter((c) => liStaleDays(c) > 0).length})` },
           { key: "outreachedContacts", label: `Outreached (${accounts.filter((a) => (a.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)).length})` },
           { key: "nurture", label: `🌱 Nurture (${allContacts.filter((c) => nurtureState(c) === "nurture").length})` },
           { key: "coldGone", label: `❄ Gone cold (${allContacts.filter((c) => nurtureState(c) === "stale").length})` },
+        ],
+      },
+      {
+        /* LinkedIn gets its own row because it's a pipeline in itself — not
+           sent, waiting, connected, or blocked-but-reopening — and each state
+           implies a different next move. */
+        group: "LinkedIn",
+        items: [
+          { key: "liNone", label: `○ Not sent (${allContacts.filter((c) => (c.linkedin || "").trim() && !c.liStatus).length})` },
+          { key: "liPending", label: `⏳ Pending 7d+ (${allContacts.filter((c) => liStaleDays(c) > 0).length})` },
+          { key: "connected", label: `● Connected (${allContacts.filter((c) => c.liStatus === "connected").length})` },
+          { key: "liRetry", label: `↻ Can retry (${allContacts.filter((c) => liRetryDays(c) > 0).length})` },
+          { key: "liWaiting", label: `⌛ Wait (${allContacts.filter((c) => liRetryIn(c) > 0).length})` },
         ],
       },
     ];
@@ -8048,6 +8078,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? liveContacts(acc).some((c) => c.liStatus === "connected")
           : accFilter === "liPending"
           ? liveContacts(acc).some((c) => liStaleDays(c) > 0)
+          : accFilter === "liNone"
+          ? liveContacts(acc).some((c) => (c.linkedin || "").trim() && !c.liStatus)
+          : accFilter === "liRetry"
+          ? liveContacts(acc).some((c) => liRetryDays(c) > 0)
+          : accFilter === "liWaiting"
+          ? liveContacts(acc).some((c) => liRetryIn(c) > 0)
           : accFilter === "callable"
           ? liveContacts(acc).some((c) => (c.phone || "").trim() && c.status !== "closed")
           : accFilter === "nurture"
@@ -8087,7 +8123,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
-    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable"].includes(accFilter);
+    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable", "liNone", "liRetry", "liWaiting"].includes(accFilter);
 
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
@@ -8104,6 +8140,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               ? c.liStatus === "connected"
               : accFilter === "liPending"
               ? liStaleDays(c) > 0
+              : accFilter === "liNone"
+              ? (c.linkedin || "").trim() && !c.liStatus
+              : accFilter === "liRetry"
+              ? liRetryDays(c) > 0
+              : accFilter === "liWaiting"
+              ? liRetryIn(c) > 0
               : accFilter === "callable"
               ? (c.phone || "").trim() && c.status !== "closed"
               : accFilter === "nurture"
@@ -10260,8 +10302,16 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         history: Array.isArray(entry?.history) ? entry.history.map((h) => ({ ...h })) : [],
         fromPool: entry?.fromPool ?? pre.fromPool ?? false,
         poolName: entry?.poolName ?? pre.poolName ?? "",
+        /* Spread the contact FIRST, then normalise the fields the form edits.
+           This used to be an explicit allowlist, which silently dropped every
+           field it didn't name — the hook, its polish, the reply flag, pool
+           membership and the archive stamp all vanished the moment an account
+           was saved. An allowlist here has to be updated every time a contact
+           gains a field, and it never was; spreading means new fields survive
+           by default and only the ones this form actually owns are reset. */
         contacts: entry?.contacts
           ? entry.contacts.map((c) => ({
+              ...c,
               id: c.id || uid(),
               name: c.name || "",
               position: c.position || "",
@@ -10284,7 +10334,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               history: Array.isArray(c.history) ? c.history.map((h) => ({ ...h })) : [],
               linkedApplicationId: c.linkedApplicationId || null,
             }))
-          : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], followUpChannel: "", liStatus: "", liStatusAt: "", history: [], linkedApplicationId: null }],
+          : [{ id: uid(), name: "", position: "", email: "", phone: "", linkedin: "", notes: "", status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], followUpChannel: "", liStatus: "", liStatusAt: "", hook: "", researchedAt: "", history: [], linkedApplicationId: null }],
       };
     }
     if (kind === "copyDraft")
@@ -12386,6 +12436,16 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                           </span>
                         )}
                       </div>
+                      {liRetryDays(c) > 0 && (
+                        <div style={{ fontSize: 11, color: C.green, lineHeight: 1.5, marginTop: 4 }}>
+                          ↻ Reachable again — {liRetryDays(c)}d since you {c.liStatus === "withdrawn" ? "withdrew" : "were declined"}. Safe to send a new request.
+                        </div>
+                      )}
+                      {liRetryIn(c) > 0 && (
+                        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
+                          ⌛ {liRetryIn(c)}d until you can send another request.
+                        </div>
+                      )}
                       {stale > 0 && (
                         <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginTop: 4 }}>
                           ⚠ Request pending {stale} days. LinkedIn won't tell you it was ignored — either reach them another way or mark it declined so it stops looking live.
@@ -13577,22 +13637,37 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
   const c = contact || {};
   const stale = liStaleDays(c);
   const nurture = nurtureState(c);
-  /* `copyText` is what lands on the clipboard, which isn't always what's shown
-     — the LinkedIn row displays a status word but should copy the URL. */
-  const line = (label, value, href, copyText) => {
+  /* Rows carry an action that suits their content. Email and phone are values
+     you paste somewhere, so they copy. A LinkedIn row shows a connection STATUS
+     — "Not sent" as a blue hyperlink reads like a broken label, and copying the
+     word "Not sent" is useless — so it gets a link icon that opens the profile
+     instead. `opts.open` swaps the copy button for that. */
+  const line = (label, value, href, opts = {}) => {
     if (!value) return null;
+    const isLink = !!href && !opts.open;
     return (
       <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", padding: "7px 0", borderBottom: `1px solid ${C.panelEdge}` }}>
         <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>{label}</span>
         <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-          {href ? (
+          {isLink ? (
             <a href={href} target={href.startsWith("http") ? "_blank" : undefined} rel="noreferrer" style={{ fontSize: 13, color: C.blue, textDecoration: "none", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {value}
             </a>
           ) : (
-            <span style={{ fontSize: 13, color: C.ink, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</span>
+            <span style={{ fontSize: 13, color: opts.tone || C.ink, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</span>
           )}
-          {copyText && <CopyButton text={copyText} title={`Copy ${label.toLowerCase()}`} />}
+          {opts.open && (
+            <a
+              href={opts.open}
+              target="_blank"
+              rel="noreferrer"
+              title={`Open ${label.toLowerCase()} in a new tab`}
+              style={{ color: C.blue, fontSize: 13, textDecoration: "none", lineHeight: 1, flexShrink: 0 }}
+            >
+              🔗
+            </a>
+          )}
+          {opts.copy && <CopyButton text={opts.copy} title={`Copy ${label.toLowerCase()}`} />}
         </span>
       </div>
     );
@@ -13626,9 +13701,13 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
 
         <div style={{ marginBottom: 12 }}>
           {line("STATUS", contactStatusLabel(c.status) + (c.outreachKind ? ` · ${c.outreachKind}` : ""))}
-          {line("EMAIL", c.email, c.email ? `mailto:${c.email}` : null, c.email)}
-          {line("PHONE", c.phone, c.phone ? `tel:${c.phone}` : null, c.phone)}
-          {line("LINKEDIN", c.linkedin ? LI_META(c.liStatus).label : "", c.linkedin ? (c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`) : null, c.linkedin)}
+          {line("EMAIL", c.email, c.email ? `mailto:${c.email}` : null, { copy: c.email })}
+          {line("PHONE", c.phone, c.phone ? `tel:${c.phone}` : null, { copy: c.phone })}
+          {/* status stays plain text and coloured by state; the icon is the link */}
+          {line("LINKEDIN", c.linkedin ? LI_META(c.liStatus).label : "", null, {
+            open: c.linkedin ? (c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`) : null,
+            tone: LI_META(c.liStatus).color === "muted" ? C.muted : C[LI_META(c.liStatus).color],
+          })}
           {line("CONTACTED", c.contacted || "not yet")}
           {c.notes ? line("NOTES", c.notes) : null}
         </div>
@@ -13656,6 +13735,16 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
         )}
 
         {stale > 0 && <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginBottom: 10 }}>⚠ LinkedIn request pending {stale} days.</div>}
+        {liRetryDays(c) > 0 && (
+          <div style={{ fontSize: 11, color: C.green, lineHeight: 1.5, marginBottom: 10 }}>
+            ↻ {LI_META(c.liStatus).label} {liRetryDays(c)} days ago — the {LI_RETRY_DAYS}-day window has passed, so you can send a fresh request.
+          </div>
+        )}
+        {liRetryIn(c) > 0 && (
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
+            ⌛ {LI_META(c.liStatus).label} — LinkedIn won&apos;t accept a new request for another {liRetryIn(c)} day{liRetryIn(c) === 1 ? "" : "s"}.
+          </div>
+        )}
         {nurture && <div style={{ fontSize: 11, color: nurture === "nurture" ? C.amber : C.muted, lineHeight: 1.5, marginBottom: 10 }}>🌱 {NURTURE_META[nurture].hint}</div>}
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
