@@ -3337,6 +3337,12 @@ function Pagination({ page, setPage, total, pageSize = PAGE_SIZE }) {
   );
 }
 
+/* lives beside inputStyle at module scope because selects appear outside the
+   modal too — the CRM filter row, the pool add control. It was previously
+   declared inside Modal, so using it anywhere else compiled fine and then blew
+   up at runtime with a blank screen. */
+const selectStyleOf = (base) => ({ ...base, appearance: "none" });
+
 const inputStyle = {
   width: "100%",
   minWidth: 0,
@@ -3350,6 +3356,8 @@ const inputStyle = {
   padding: "10px 12px",
   outline: "none",
 };
+const selectStyle = selectStyleOf(inputStyle);
+
 
 function Field({ label, value, onChange, type = "text", placeholder }) {
   return (
@@ -10459,7 +10467,6 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
   });
 
 
-  const selectStyle = { ...inputStyle, appearance: "none" };
 
   const titles = {
     application: entry ? "Edit application" : "Track an application",
