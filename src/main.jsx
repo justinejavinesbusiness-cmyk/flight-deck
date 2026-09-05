@@ -601,6 +601,18 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
       lastEngagedAt: c.lastEngagedAt || "",
       gotReply: !!c.gotReply,
       history: Array.isArray(c.history) ? c.history.map((h) => ({ ...h })) : [],
+      /* The hook is the researched line about this person, and graduating is
+         exactly when it stops being visible in the Pool tab — so if it doesn't
+         travel to the linked application, the five minutes that produced it are
+         lost at the moment you'd want to reuse it in a follow-up. The polished
+         version rides along too, or it would be regenerated (and re-billed) for
+         a hook that hadn't changed. */
+      hook: c.hook || "",
+      researchedAt: c.researchedAt || "",
+      hookPolished: c.hookPolished || "",
+      hookPolishedFrom: c.hookPolishedFrom || "",
+      fromPool: !!c.fromPool,
+      poolName: c.poolName || "",
       notes: c.notes,
       fromAccountContact: true,
     };
@@ -3510,6 +3522,49 @@ export default function FlightDeck() {
   const [poolView, setPoolView] = useState(null);
   const [poolSearch, setPoolSearch] = useState("");
   const [copyFilter, setCopyFilter] = useState("all");
+  /* one person's card, opened from the pool or the call queue — app-level so
+     both can reach it */
+  const [contactCard, setContactCard] = useState(null); /* { contact, company, accountId } */
+  const [callQueueContact, setCallQueueContact] = useState(null); /* { contact, accountId, company } */
+  const [standaloneHistory, setStandaloneHistory] = useState(null); /* opened outside the account modal */
+
+  /* Writes a call straight to state. The account modal has its own copy that
+     works on unsaved form data; this is for the call queue and contact card,
+     which act on the saved record directly. Same effects either way. */
+  const logCallOnContact = (accountId, contactId, { outcome, notes, tickFollowUp, followUpIndex }) => {
+    const o = callOutcome(outcome);
+    const note = `${o?.label || "Call"}${notes.trim() ? ` — ${notes.trim()}` : ""}`;
+    mutate(
+      (st) => ({
+        ...st,
+        accounts: (st.accounts || []).map((a) =>
+          a.id !== accountId
+            ? a
+            : {
+                ...a,
+                contacts: (a.contacts || []).map((c) => {
+                  if (c.id !== contactId) return c;
+                  const next = {
+                    ...c,
+                    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "Phone call", note }],
+                    history: withLog(c, [logEntry("touch", `☎ ${note}`)]).history,
+                    contacted: c.contacted || today(),
+                    status: c.status || "outreach",
+                  };
+                  if (tickFollowUp && followUpIndex >= 0) {
+                    next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex ? { ...x, done: true, doneAt: today(), channel: "Phone call" } : x));
+                  }
+                  if (CALL_CLOSES.includes(outcome)) next.status = "closed";
+                  if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
+                  if (outcome === "wrongnumber") next.phone = "";
+                  return next;
+                }),
+              }
+        ),
+      }),
+      `☎ ${o?.label || "Call"} logged`
+    );
+  };
   useEffect(() => setPipePage(0), [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
   /* bulk selection for converting applications to accounts */
   const [selectMode, setSelectMode] = useState(false);
@@ -3880,6 +3935,19 @@ export default function FlightDeck() {
       }),
       "✓ Engagement logged"
     );
+
+  /* Nurture had no home on the dashboard — it existed only as a filter you had
+     to go looking for, which for a "these have gone quiet" signal is the same
+     as not existing. Gone-cold entries are shown separately because the action
+     differs: a nurture lead gets a light touch on the old thread, a cold one
+     is better restarted from scratch. */
+  const nurtureList = useMemo(
+    () =>
+      (state.accounts || [])
+        .flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt && nurtureState(c)).map((c) => ({ ...c, _company: a.company, _accountId: a.id, _state: nurtureState(c) })))
+        .sort((a, b) => (lastActivityDate(a) || "9999").localeCompare(lastActivityDate(b) || "9999")),
+    [state.accounts]
+  );
 
   const engageDueList = useMemo(
     () =>
@@ -4650,7 +4718,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
          follow-up inline creates a touch point on the application, and if only
          `followUps` syncs, that touch point never reaches the contact and gets
          wiped the next time the account side saves */
-      const MIRRORED = ["followUps", "touchpoints", "gotReply", "liStatus", "liStatusAt", "history", "notes", "hook", "researchedAt"];
+      const MIRRORED = ["followUps", "touchpoints", "gotReply", "liStatus", "liStatusAt", "history", "notes", "hook", "researchedAt", "hookPolished", "hookPolishedFrom"];
       if (MIRRORED.includes(field)) {
         const app = s.applications.find((a) => a.id === id);
         if (app?.fromAccountContact) {
@@ -5095,11 +5163,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   /* opens whichever record backs this member — application or account */
   const openPoolMember = (m) => {
-    /* work items carry their own ref; a contact ref opens the parent ACCOUNT,
-       since that's where the contact is edited */
     const ref = m.ref || m.refs?.[0];
     if (!ref) return;
-    if (ref.kind === "contact") return setModal({ kind: "account", entry: ref.account });
+    /* a pool row IS one person, so clicking it shows that person — opening the
+       whole account buries them among colleagues, which is exactly the problem
+       on an account with three contacts */
+    if (ref.kind === "contact") return setContactCard({ contact: ref.entry, company: ref.account?.company || m.company, accountId: ref.id });
     setModal({ kind: ref.kind, entry: ref.entry });
   };
 
@@ -5354,13 +5423,41 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "10px 12px", marginBottom: 6, cursor: "pointer", display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}
                 >
                   <div style={{ minWidth: 0 }}>
+                    {/* the PERSON graduated, not the company — on an account
+                        with three contacts, "Stanfield IT" three times told you
+                        nothing about which of them you'd actually written to */}
                     <div style={{ fontSize: 14, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      <span style={{ marginRight: 5, fontSize: 12 }}>{m.kind === "account" ? "🏢" : "📋"}</span>
-                      {m.company}
+                      <ConnDot contact={m.entry} />
+                      {m.contactName || m.company}
+                      {m.contactName && (
+                        <span style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}>
+                          {m.contactPosition ? ` · ${m.contactPosition}` : ""} · {m.company}
+                        </span>
+                      )}
                     </div>
-                    {m.hook && <div style={{ fontSize: 12, color: C.muted, marginTop: 2, lineHeight: 1.4 }}>{m.hook}</div>}
+                    {m.hook && <div style={{ fontSize: 12, color: C.muted, marginTop: 2, lineHeight: 1.4 }}>🎯 {m.hook}</div>}
+                    {m.hookPolished && m.hookPolishedFrom === (m.hook || "").trim() && (
+                      <div style={{ fontSize: 12, color: C.blue, marginTop: 2, lineHeight: 1.4 }}>✍ {m.hookPolished}</div>
+                    )}
                   </div>
-                  <span style={{ fontFamily: mono, fontSize: 10, color: C.green, flexShrink: 0 }}>{m.firstContact || "contacted"}</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                    <span style={{ fontFamily: mono, fontSize: 10, color: C.green }}>{m.firstContact || "contacted"}</span>
+                    {/* the hook survives graduation, so it stays usable — a
+                        follow-up to someone you've already written to is
+                        exactly when you want the original angle back */}
+                    {(m.hook || "").trim() && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          copyPoolOutreach(m);
+                        }}
+                        title="Copy a message using this hook"
+                        style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.blue, borderRadius: 8, padding: "3px 8px", fontSize: 12, cursor: "pointer" }}
+                      >
+                        ⧉
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
               <Btn
@@ -5712,6 +5809,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       ...(typeof data.gotReply === "boolean" ? { gotReply: data.gotReply } : {}),
                       ...(data.liStatus !== undefined ? { liStatus: data.liStatus, liStatusAt: data.liStatusAt || c.liStatusAt } : {}),
                       ...(Array.isArray(data.history) ? { history: data.history.map((h) => ({ ...h })) } : {}),
+                      /* keep the hook in step both ways, or an edit on the
+                         pipeline side would blank it on the contact */
+                      ...(data.hook !== undefined ? { hook: data.hook, researchedAt: data.researchedAt || c.researchedAt } : {}),
+                      ...(data.hookPolished !== undefined ? { hookPolished: data.hookPolished, hookPolishedFrom: data.hookPolishedFrom || "" } : {}),
                     }
               ),
             }));
@@ -6373,6 +6474,37 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       </div>
 
       {/* due follow-ups queue */}
+      {nurtureList.length > 0 && (
+        <div style={{ background: "rgba(245,185,66,0.06)", border: `1px solid ${C.amber}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
+          <Label>
+            🌱 Going quiet — {nurtureList.filter((c) => c._state === "nurture").length} nurture
+            {nurtureList.filter((c) => c._state === "stale").length > 0 ? `, ${nurtureList.filter((c) => c._state === "stale").length} gone cold` : ""}
+          </Label>
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+            No movement in 60+ days. These aren&apos;t dead — they&apos;re the cheapest leads you have, because someone already knows who you are.
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {nurtureList.slice(0, 5).map((c) => (
+              <div
+                key={c.id}
+                onClick={() => setContactCard({ contact: c, company: c._company, accountId: c._accountId })}
+                style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 13, alignItems: "center", cursor: "pointer" }}
+              >
+                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <ConnDot contact={c} />
+                  <strong>{c.name || "Unnamed"}</strong>
+                  <span style={{ color: C.muted }}> · {c._company}</span>
+                </span>
+                <span style={{ fontFamily: mono, fontSize: 10, color: c._state === "stale" ? C.muted : C.amber, flexShrink: 0 }}>
+                  {daysSince(lastActivityDate(c))}d{c._state === "stale" ? " cold" : ""}
+                </span>
+              </div>
+            ))}
+            {nurtureList.length > 5 && <div style={{ fontSize: 11, color: C.muted }}>+ {nurtureList.length - 5} more in Accounts → Nurture</div>}
+          </div>
+        </div>
+      )}
+
       {engageDueList.length > 0 && (
         <div style={{ background: "rgba(96,165,250,0.07)", border: `1px solid ${C.blue}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
           <Label>💬 Engage — {engageDueList.length} due</Label>
@@ -6846,6 +6978,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                  off there is no closed set to work through, so an empty tab
                  would just be noise */
               ...(state.settings?.goalMode === "pool" ? [["pool", `🎯 Pool (${poolMembers(state, apps).length})`]] : []),
+              ["calls", `☎ Calls (${callQueue.length})`],
             ].map(([k, l]) => (
               <button
                 key={k}
@@ -6973,7 +7106,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         </div>
 
-        {crmView === "pool" && state.settings?.goalMode === "pool" ? (
+        {crmView === "calls" ? (
+          renderCalls()
+        ) : crmView === "pool" && state.settings?.goalMode === "pool" ? (
           renderPool()
         ) : crmView === "accounts" ? (
           renderAccounts()
@@ -7827,20 +7962,44 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
   const renderAccounts = () => {
     const accounts = state.accounts || [];
-    const accFilters = [
-      { key: "active", label: `Active (${accounts.filter(isAccountOpen).length})` },
-      { key: "highConfidence", label: `⭐ High confidence (${accounts.filter((a) => a.highConfidence).length})` },
-      { key: "notContacted", label: `◻ Not contacted yet (${accounts.flatMap(liveContacts).filter(isContactBlankStatus).length})` },
-      { key: "untouched", label: `🕳 No one reached (${accounts.filter((a) => isAccountOpen(a) && isAccountUntouched(a)).length})` },
-      { key: "engageDue", label: `💬 Engage (${accounts.flatMap(liveContacts).filter(isEngagementDue).length})` },
-      { key: "nurture", label: `🌱 Nurture (${accounts.flatMap(liveContacts).filter((c) => nurtureState(c) === "nurture").length})` },
-      { key: "coldGone", label: `❄ Gone cold (${accounts.flatMap(liveContacts).filter((c) => nurtureState(c) === "stale").length})` },
-      { key: "outreachedContacts", label: `Outreached contacts (${accounts.filter((a) => (a.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)).length})` },
-      { key: "dueContacts", label: `⚑ Due contacts (${accounts.filter((a) => (a.contacts || []).some((c) => isContactDue(c) && !c.archivedAt)).length})` },
-      { key: "closed", label: `Closed (${accounts.filter((a) => a.status === "closed").length})` },
-      { key: "badFit", label: `🚫 Bad fit (${accounts.filter((a) => a.status === "bad fit").length})` },
-      { key: "all", label: `All (${accounts.length})` },
+    /* Twelve filters in a flat row read as a wall. Grouped by the question
+       they answer — what am I looking at, what needs doing, where does the
+       relationship stand — so the one you want is findable rather than
+       remembered by position. */
+    const allContacts = accounts.flatMap(liveContacts);
+    const accFilterGroups = [
+      {
+        group: "View",
+        items: [
+          { key: "active", label: `Active (${accounts.filter(isAccountOpen).length})` },
+          { key: "all", label: `All (${accounts.length})` },
+          { key: "highConfidence", label: `⭐ High confidence (${accounts.filter((a) => a.highConfidence).length})` },
+          { key: "closed", label: `Closed (${accounts.filter((a) => a.status === "closed").length})` },
+          { key: "badFit", label: `🚫 Bad fit (${accounts.filter((a) => a.status === "bad fit").length})` },
+        ],
+      },
+      {
+        group: "Needs action",
+        items: [
+          { key: "dueContacts", label: `⚑ Due (${accounts.filter((a) => (a.contacts || []).some((c) => isContactDue(c) && !c.archivedAt)).length})` },
+          { key: "engageDue", label: `💬 Engage (${allContacts.filter(isEngagementDue).length})` },
+          { key: "callable", label: `☎ Callable (${allContacts.filter((c) => (c.phone || "").trim() && c.status !== "closed").length})` },
+          { key: "untouched", label: `🕳 No one reached (${accounts.filter((a) => isAccountOpen(a) && isAccountUntouched(a)).length})` },
+          { key: "notContacted", label: `◻ Not contacted (${allContacts.filter(isContactBlankStatus).length})` },
+        ],
+      },
+      {
+        group: "Relationship",
+        items: [
+          { key: "connected", label: `● Connected (${allContacts.filter((c) => c.liStatus === "connected").length})` },
+          { key: "liPending", label: `in Pending (${allContacts.filter((c) => liStaleDays(c) > 0).length})` },
+          { key: "outreachedContacts", label: `Outreached (${accounts.filter((a) => (a.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)).length})` },
+          { key: "nurture", label: `🌱 Nurture (${allContacts.filter((c) => nurtureState(c) === "nurture").length})` },
+          { key: "coldGone", label: `❄ Gone cold (${allContacts.filter((c) => nurtureState(c) === "stale").length})` },
+        ],
+      },
     ];
+    const accFilters = accFilterGroups.flatMap((g) => g.items);
     const shownAccounts = accounts
       .filter((acc) =>
         accFilter === "active"
@@ -7853,6 +8012,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? isAccountOpen(acc) && isAccountUntouched(acc)
           : accFilter === "engageDue"
           ? liveContacts(acc).some(isEngagementDue)
+          : accFilter === "connected"
+          ? liveContacts(acc).some((c) => c.liStatus === "connected")
+          : accFilter === "liPending"
+          ? liveContacts(acc).some((c) => liStaleDays(c) > 0)
+          : accFilter === "callable"
+          ? liveContacts(acc).some((c) => (c.phone || "").trim() && c.status !== "closed")
           : accFilter === "nurture"
           ? liveContacts(acc).some((c) => nurtureState(c) === "nurture")
           : accFilter === "coldGone"
@@ -7890,7 +8055,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
-    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue"].includes(accFilter);
+    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable"].includes(accFilter);
 
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
@@ -7903,6 +8068,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               ? isContactBlankStatus(c)
               : accFilter === "engageDue"
               ? isEngagementDue(c)
+              : accFilter === "connected"
+              ? c.liStatus === "connected"
+              : accFilter === "liPending"
+              ? liStaleDays(c) > 0
+              : accFilter === "callable"
+              ? (c.phone || "").trim() && c.status !== "closed"
               : accFilter === "nurture"
               ? nurtureState(c) === "nurture"
               : accFilter === "coldGone"
@@ -7944,15 +8115,20 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         </div>
 
         {isDesktop ? (
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
-            {accFilters.map((f) => (
-              <button
-                key={f.key}
-                onClick={() => setAccFilter(f.key)}
-                style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${accFilter === f.key ? C.amber : C.panelEdge}`, background: accFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: accFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
-              >
-                {f.label}
-              </button>
+          <div style={{ marginBottom: 12 }}>
+            {accFilterGroups.map((g) => (
+              <div key={g.group} style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 6 }}>
+                <span style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, width: 92, flexShrink: 0, textTransform: "uppercase" }}>{g.group}</span>
+                {g.items.map((f) => (
+                  <button
+                    key={f.key}
+                    onClick={() => setAccFilter(f.key)}
+                    style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${accFilter === f.key ? C.amber : C.panelEdge}`, background: accFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: accFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
             ))}
           </div>
         ) : (
@@ -8171,7 +8347,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         {contacts.map((c) => (
                           <div key={c.id} style={{ fontSize: 11, color: C.muted, marginTop: 3, display: "flex", alignItems: "center", gap: 4 }}>
                             <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              {c.name || "Unnamed"}{c.position ? ` · ${c.position}` : ""}
+                              <ConnDot contact={c} />
+                        {c.name || "Unnamed"}{c.position ? ` · ${c.position}` : ""}
                               {c.status && <span style={{ color: contactStatusColor(c.status), marginLeft: 4 }}>· {c.status}</span>}
                             </span>
                             <CopyButton text={c.email} title="Copy email" />
@@ -8276,6 +8453,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   {contacts.map((c) => (
                     <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.ink, marginTop: 4 }}>
                       <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <ConnDot contact={c} />
                         {c.name || "Unnamed"}{c.position ? ` · ${c.position}` : ""}
                         {c.status && <span style={{ color: contactStatusColor(c.status), marginLeft: 4 }}>· {c.status}</span>}
                       </span>
@@ -9359,6 +9537,106 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     setCopyBusy("");
   };
 
+  /* ---- call queue ----
+     Calling is a batch activity done in one sitting, and the CRM's other views
+     are built for reading one record at a time. This is a worklist: only people
+     you can actually dial, ordered so the ones most worth calling come first,
+     each row one tap from the phone and one tap from logging the result. */
+  const callQueue = useMemo(() => {
+    const rows = (state.accounts || []).flatMap((acc) =>
+      (acc.contacts || [])
+        .filter((c) => !c.archivedAt && !c.tombstoned && (c.phone || "").trim() && c.status !== "closed")
+        .map((c) => ({ contact: c, accountId: acc.id, company: acc.company }))
+    );
+    const calls = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").length;
+    const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
+    return rows
+      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact) }))
+      .sort(
+        (a, b) =>
+          /* never called first — those are the ones the queue exists for.
+             Then whoever is due. Then longest since the last attempt. */
+          a.calls - b.calls ||
+          (b.due ? 1 : 0) - (a.due ? 1 : 0) ||
+          (a.lastCall || "0000").localeCompare(b.lastCall || "0000") ||
+          (a.company || "").localeCompare(b.company || "")
+      );
+  }, [state.accounts]);
+
+  const renderCalls = () => {
+    const uncalled = callQueue.filter((r) => r.calls === 0).length;
+    return (
+      <>
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 12 }}>
+          Everyone with a phone number, ordered by who&apos;s most worth calling — never-called first, then due, then longest since the last attempt. Closed contacts are left out.
+        </div>
+        {callQueue.length === 0 ? (
+          <div style={{ color: C.muted, fontSize: 13, padding: "20px 4px", textAlign: "center", lineHeight: 1.6 }}>
+            No contacts have a phone number yet. Add one on a contact and they&apos;ll appear here.
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
+              <div style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
+                <div style={{ fontSize: 9, letterSpacing: "0.16em", color: C.muted }}>IN QUEUE</div>
+                <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 700, color: C.ink }}>{callQueue.length}</div>
+              </div>
+              <div style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
+                <div style={{ fontSize: 9, letterSpacing: "0.16em", color: C.muted }}>NEVER CALLED</div>
+                <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 700, color: uncalled ? C.amber : C.green }}>{uncalled}</div>
+              </div>
+            </div>
+
+            {callQueue.map((r, i) => (
+              <div
+                key={r.contact.id}
+                style={{
+                  background: C.panel,
+                  border: `1px solid ${r.calls === 0 ? C.amber : C.panelEdge}`,
+                  borderRadius: 12,
+                  padding: "11px 13px",
+                  marginBottom: 6,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  alignItems: "center",
+                }}
+              >
+                <div style={{ minWidth: 0, flex: 1, cursor: "pointer" }} onClick={() => setContactCard({ contact: r.contact, company: r.company, accountId: r.accountId })}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginRight: 7 }}>{i + 1}</span>
+                    <ConnDot contact={r.contact} />
+                    {r.contact.name || "Unnamed"}
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {[r.contact.position, r.company].filter(Boolean).join(" · ")}
+                  </div>
+                  <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 3 }}>
+                    {r.contact.phone}
+                    {r.calls === 0 ? " · never called" : ` · ${r.calls} call${r.calls === 1 ? "" : "s"}, last ${r.lastCall}`}
+                    {r.due ? " · ⚑ due" : ""}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  <a
+                    href={`tel:${r.contact.phone}`}
+                    style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 42, height: 42, border: `1px solid ${C.green}`, color: C.green, borderRadius: 10, textDecoration: "none", fontSize: 16 }}
+                    title={`Call ${r.contact.phone}`}
+                  >
+                    ☎
+                  </a>
+                  <Btn ghost onClick={() => setCallQueueContact(r)} style={{ padding: "0 10px", height: 42, fontSize: 12, flexShrink: 0 }}>
+                    Log
+                  </Btn>
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+      </>
+    );
+  };
+
   const renderCopy = () => {
     const drafts = (state.copyDrafts || []).slice().sort(rankCopy);
     const byPurpose = COPY_PURPOSES.map((p) => ({ ...p, items: drafts.filter((d) => d.purpose === p.key) }));
@@ -9742,6 +10020,39 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           onClose={resolveDuplicateAsSeparate}
         />
       )}
+      {contactCard && (
+        <ContactCardModal
+          contact={contactCard.contact}
+          company={contactCard.company}
+          accountId={contactCard.accountId}
+          onClose={() => setContactCard(null)}
+          onOpenAccount={(id) => {
+            const acc = (state.accounts || []).find((a) => a.id === id);
+            setContactCard(null);
+            if (acc) setModal({ kind: "account", entry: acc });
+          }}
+          onCall={(c, accountId) => {
+            setContactCard(null);
+            setCallQueueContact({ contact: c, accountId, company: contactCard.company });
+          }}
+          onHistory={(c, company) => {
+            setContactCard(null);
+            setStandaloneHistory({ contact: c, company });
+          }}
+        />
+      )}
+      {standaloneHistory && <ContactHistoryModal contact={standaloneHistory.contact} company={standaloneHistory.company} onClose={() => setStandaloneHistory(null)} />}
+      {callQueueContact && (
+        <ColdCallModal
+          contact={callQueueContact.contact}
+          company={callQueueContact.company}
+          onClose={() => setCallQueueContact(null)}
+          onSave={(payload) => {
+            logCallOnContact(callQueueContact.accountId, callQueueContact.contact.id, payload);
+            setCallQueueContact(null);
+          }}
+        />
+      )}
       {copyPicker && (
         <CopyPickerModal
           purpose={copyPicker.purpose}
@@ -9841,6 +10152,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         poolName: entry?.poolName ?? pre.poolName ?? "",
         hook: entry?.hook ?? pre.hook ?? "",
         researchedAt: entry?.researchedAt ?? pre.researchedAt ?? "",
+        /* carried through the form or every save would drop the polished line
+           and the next copy action would regenerate it from scratch */
+        hookPolished: entry?.hookPolished ?? "",
+        hookPolishedFrom: entry?.hookPolishedFrom ?? "",
         attempt: attemptOf(entry || {}),
         notes: entry?.notes || pre.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
@@ -13206,6 +13521,96 @@ const SETTINGS_SECTIONS = [
   { key: "data", label: "Backups & data", icon: "↺", hint: "Snapshots, export, archive" },
 ];
 
+/* A LinkedIn connection is the one relationship state worth seeing at a
+   glance from anywhere — it changes whether you can message someone directly.
+   Small enough to sit beside a name without competing with it. */
+function ConnDot({ contact, style }) {
+  if (contact?.liStatus !== "connected") return null;
+  return (
+    <span
+      title="Connected on LinkedIn"
+      style={{ display: "inline-block", width: 7, height: 7, borderRadius: 4, background: C.green, flexShrink: 0, marginRight: 6, verticalAlign: "middle", ...style }}
+    />
+  );
+}
+
+/* One person, on their own. Opening a whole account to reach one contact
+   buries them among colleagues — this shows just the card for the person you
+   clicked, with the actions that belong to them. */
+function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount, onCall, onHistory }) {
+  const c = contact || {};
+  const stale = liStaleDays(c);
+  const nurture = nurtureState(c);
+  const line = (label, value, href) => {
+    if (!value) return null;
+    return (
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", padding: "7px 0", borderBottom: `1px solid ${C.panelEdge}` }}>
+        <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>{label}</span>
+        {href ? (
+          <a href={href} target={href.startsWith("http") ? "_blank" : undefined} rel="noreferrer" style={{ fontSize: 13, color: C.blue, textDecoration: "none", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {value}
+          </a>
+        ) : (
+          <span style={{ fontSize: 13, color: C.ink, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</span>
+        )}
+      </div>
+    );
+  };
+  return (
+    <div
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60, padding: 16 }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 400, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 18, boxSizing: "border-box", maxHeight: "86vh", overflowY: "auto" }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+          <ConnDot contact={c} style={{ marginRight: 0 }} />
+          <div style={{ fontFamily: sans, fontSize: 17, fontWeight: 800, color: C.ink, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {c.name || "Unnamed contact"}
+          </div>
+        </div>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>{[c.position, company].filter(Boolean).join(" · ") || "—"}</div>
+
+        {c.hook && (
+          <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 10, padding: "9px 11px", marginBottom: 12 }}>
+            <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted, marginBottom: 3 }}>HOOK</div>
+            <div style={{ fontSize: 13, color: C.ink, lineHeight: 1.45 }}>{c.hook}</div>
+            {c.hookPolished && c.hookPolishedFrom === c.hook && <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.45, marginTop: 6 }}>✍ {c.hookPolished}</div>}
+          </div>
+        )}
+
+        <div style={{ marginBottom: 12 }}>
+          {line("STATUS", contactStatusLabel(c.status))}
+          {line("EMAIL", c.email, c.email ? `mailto:${c.email}` : null)}
+          {line("PHONE", c.phone, c.phone ? `tel:${c.phone}` : null)}
+          {line("LINKEDIN", c.linkedin ? LI_META(c.liStatus).label : "", c.linkedin ? (c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`) : null)}
+          {line("CONTACTED", c.contacted || "not yet")}
+          {c.notes ? line("NOTES", c.notes) : null}
+        </div>
+
+        {stale > 0 && <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginBottom: 10 }}>⚠ LinkedIn request pending {stale} days.</div>}
+        {nurture && <div style={{ fontSize: 11, color: nurture === "nurture" ? C.amber : C.muted, lineHeight: 1.5, marginBottom: 10 }}>🌱 {NURTURE_META[nurture].hint}</div>}
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <Btn ghost onClick={() => onCall(c, accountId)} style={{ flex: "1 1 90px", padding: "8px 10px", fontSize: 12 }}>
+            ☎ Log call
+          </Btn>
+          <Btn ghost onClick={() => onHistory(c, company)} style={{ flex: "1 1 90px", padding: "8px 10px", fontSize: 12 }}>
+            🕘 History
+          </Btn>
+          <Btn onClick={() => onOpenAccount(accountId)} style={{ flex: "1 1 120px", padding: "8px 10px", fontSize: 12 }}>
+            Edit in account →
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ContactHistoryModal({ contact, company, onClose }) {
   const events = contactTimeline(contact);
   const ICON = { status: "◑", linkedin: "in", touch: "✉", first: "●", followup: "⚑" };
@@ -13626,6 +14031,7 @@ function PoolRow({ item, badge, onHook, onOpen, onRemove, onDraft, onCopy, polis
               context. On a company with no contacts yet it's the other way. */}
           {item.contactName ? (
             <>
+              <ConnDot contact={item.entry} />
               {item.contactName}
               <span style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}>
                 {item.contactPosition ? ` · ${item.contactPosition}` : ""} · {item.company}
