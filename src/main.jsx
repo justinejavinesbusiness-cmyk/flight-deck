@@ -3528,6 +3528,38 @@ export default function FlightDeck() {
   const [callQueueContact, setCallQueueContact] = useState(null); /* { contact, accountId, company } */
   const [standaloneHistory, setStandaloneHistory] = useState(null); /* opened outside the account modal */
 
+  /* Marks a contact as contacted from the card. Mirrors what the account
+     modal's status control does — stamps the date and seeds the follow-up
+     schedule — so a contact graduated from here behaves identically to one
+     graduated from the account, rather than landing in the pipeline with no
+     follow-ups and never reappearing in the due queue. */
+  const graduateContact = (accountId, contactId, kind) =>
+    mutate(
+      (st) => ({
+        ...st,
+        accounts: (st.accounts || []).map((a) =>
+          a.id !== accountId
+            ? a
+            : {
+                ...a,
+                contacts: (a.contacts || []).map((c) => {
+                  if (c.id !== contactId) return c;
+                  const fus = Array.isArray(c.followUps) ? c.followUps : [];
+                  return {
+                    ...c,
+                    status: "outreach",
+                    outreachKind: kind,
+                    contacted: c.contacted || today(),
+                    followUps: fus.length ? fus : (st.settings?.followUpDefaults || DEFAULT_FOLLOWUPS).map((d) => ({ days: d, done: false, doneAt: "" })),
+                    history: withLog(c, [logEntry("status", `Status → outreach (${kind})`)]).history,
+                  };
+                }),
+              }
+        ),
+      }),
+      `Marked ${kind} — follow-ups scheduled`
+    );
+
   /* Writes a call straight to state. The account modal has its own copy that
      works on unsaved form data; this is for the call queue and contact card,
      which act on the saved record directly. Same effects either way. */
@@ -10039,6 +10071,10 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             setContactCard(null);
             setStandaloneHistory({ contact: c, company });
           }}
+          onGraduate={(accountId, contactId, kind) => {
+            graduateContact(accountId, contactId, kind);
+            setContactCard(null);
+          }}
         />
       )}
       {standaloneHistory && <ContactHistoryModal contact={standaloneHistory.contact} company={standaloneHistory.company} onClose={() => setStandaloneHistory(null)} />}
@@ -13537,22 +13573,27 @@ function ConnDot({ contact, style }) {
 /* One person, on their own. Opening a whole account to reach one contact
    buries them among colleagues — this shows just the card for the person you
    clicked, with the actions that belong to them. */
-function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount, onCall, onHistory }) {
+function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount, onCall, onHistory, onGraduate }) {
   const c = contact || {};
   const stale = liStaleDays(c);
   const nurture = nurtureState(c);
-  const line = (label, value, href) => {
+  /* `copyText` is what lands on the clipboard, which isn't always what's shown
+     — the LinkedIn row displays a status word but should copy the URL. */
+  const line = (label, value, href, copyText) => {
     if (!value) return null;
     return (
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", padding: "7px 0", borderBottom: `1px solid ${C.panelEdge}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center", padding: "7px 0", borderBottom: `1px solid ${C.panelEdge}` }}>
         <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>{label}</span>
-        {href ? (
-          <a href={href} target={href.startsWith("http") ? "_blank" : undefined} rel="noreferrer" style={{ fontSize: 13, color: C.blue, textDecoration: "none", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {value}
-          </a>
-        ) : (
-          <span style={{ fontSize: 13, color: C.ink, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</span>
-        )}
+        <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          {href ? (
+            <a href={href} target={href.startsWith("http") ? "_blank" : undefined} rel="noreferrer" style={{ fontSize: 13, color: C.blue, textDecoration: "none", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {value}
+            </a>
+          ) : (
+            <span style={{ fontSize: 13, color: C.ink, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{value}</span>
+          )}
+          {copyText && <CopyButton text={copyText} title={`Copy ${label.toLowerCase()}`} />}
+        </span>
       </div>
     );
   };
@@ -13584,13 +13625,35 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
         )}
 
         <div style={{ marginBottom: 12 }}>
-          {line("STATUS", contactStatusLabel(c.status))}
-          {line("EMAIL", c.email, c.email ? `mailto:${c.email}` : null)}
-          {line("PHONE", c.phone, c.phone ? `tel:${c.phone}` : null)}
-          {line("LINKEDIN", c.linkedin ? LI_META(c.liStatus).label : "", c.linkedin ? (c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`) : null)}
+          {line("STATUS", contactStatusLabel(c.status) + (c.outreachKind ? ` · ${c.outreachKind}` : ""))}
+          {line("EMAIL", c.email, c.email ? `mailto:${c.email}` : null, c.email)}
+          {line("PHONE", c.phone, c.phone ? `tel:${c.phone}` : null, c.phone)}
+          {line("LINKEDIN", c.linkedin ? LI_META(c.liStatus).label : "", c.linkedin ? (c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`) : null, c.linkedin)}
           {line("CONTACTED", c.contacted || "not yet")}
           {c.notes ? line("NOTES", c.notes) : null}
         </div>
+
+        {/* Graduating from here matters because this card is where you land
+            from the pool — having to open the whole account just to record
+            "I wrote to them" is the friction that leaves contacts sitting in
+            Ready to write after you've already sent the message. Picking warm
+            or cold stamps the date and moves them in one tap. */}
+        {!c.status && (
+          <div style={{ marginTop: 12, marginBottom: 12 }}>
+            <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginBottom: 6 }}>MARK AS CONTACTED</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Btn color={C.amber} onClick={() => onGraduate(accountId, c.id, "warm")} style={{ flex: 1, padding: "9px 10px", fontSize: 13 }}>
+                Warm
+              </Btn>
+              <Btn color={C.blue} onClick={() => onGraduate(accountId, c.id, "cold")} style={{ flex: 1, padding: "9px 10px", fontSize: 13 }}>
+                Cold
+              </Btn>
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 5 }}>
+              Stamps today, starts the follow-up schedule, and graduates them out of the pool.
+            </div>
+          </div>
+        )}
 
         {stale > 0 && <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginBottom: 10 }}>⚠ LinkedIn request pending {stale} days.</div>}
         {nurture && <div style={{ fontSize: 11, color: nurture === "nurture" ? C.amber : C.muted, lineHeight: 1.5, marginBottom: 10 }}>🌱 {NURTURE_META[nurture].hint}</div>}
