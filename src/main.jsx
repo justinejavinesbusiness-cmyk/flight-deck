@@ -8190,20 +8190,58 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
         {isDesktop ? (
           <div style={{ marginBottom: 12 }}>
-            {accFilterGroups.map((g) => (
-              <div key={g.group} style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 6 }}>
-                <span style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, width: 92, flexShrink: 0, textTransform: "uppercase" }}>{g.group}</span>
-                {g.items.map((f) => (
-                  <button
-                    key={f.key}
-                    onClick={() => setAccFilter(f.key)}
-                    style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 10px", borderRadius: 20, border: `1px solid ${accFilter === f.key ? C.amber : C.panelEdge}`, background: accFilter === f.key ? "rgba(245,185,66,0.12)" : "transparent", color: accFilter === f.key ? C.amber : C.muted, cursor: "pointer" }}
-                  >
-                    {f.label}
-                  </button>
-                ))}
-              </div>
-            ))}
+            {/* One dropdown per group on a single row. Four rows of chips took
+                a quarter of the screen before any data appeared, and only one
+                of the twenty could be active at a time — a set of mutually
+                exclusive options is what a select is for.
+
+                The group holding the active filter is highlighted, so which
+                dimension you're filtering on is visible without opening
+                anything. Selecting from one clears the others by definition,
+                since they all write to the same accFilter. */}
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              {accFilterGroups.map((g) => {
+                const activeHere = g.items.some((f) => f.key === accFilter);
+                return (
+                  <div key={g.group} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    <span style={{ fontFamily: mono, fontSize: 8, letterSpacing: "0.14em", color: activeHere ? C.amber : C.muted, textTransform: "uppercase" }}>{g.group}</span>
+                    <select
+                      value={activeHere ? accFilter : ""}
+                      onChange={(e) => e.target.value && setAccFilter(e.target.value)}
+                      style={{
+                        ...selectStyle,
+                        width: "auto",
+                        minWidth: 150,
+                        fontSize: 12,
+                        fontWeight: 700,
+                        padding: "7px 9px",
+                        border: `1px solid ${activeHere ? C.amber : C.panelEdge}`,
+                        background: activeHere ? "rgba(245,185,66,0.1)" : "transparent",
+                        color: activeHere ? C.amber : C.muted,
+                      }}
+                    >
+                      {/* the placeholder is what "not filtering on this" looks
+                          like — without it a select always appears to have a
+                          value, implying a filter that isn't applied */}
+                      <option value="">{g.group}…</option>
+                      {g.items.map((f) => (
+                        <option key={f.key} value={f.key}>
+                          {f.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })}
+              {accFilter !== "active" && (
+                <button
+                  onClick={() => setAccFilter("active")}
+                  style={{ alignSelf: "flex-end", background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 20, padding: "7px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: sans }}
+                >
+                  ✕ Clear
+                </button>
+              )}
+            </div>
           </div>
         ) : (
           <div style={{ marginBottom: 12 }}>
