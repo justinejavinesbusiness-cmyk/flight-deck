@@ -376,12 +376,42 @@ const logEntry = (kind, text) => ({ id: uid(), at: today(), kind, text });
 
 const withLog = (c, entries) => ({ ...c, history: [...(entries || []), ...(c.history || [])].slice(0, 200) });
 /* merges the change log and the touch points into one ordered timeline */
+/* Which lane an event belongs to. Everything used to collapse into one "touch"
+   kind, so a phone call and a cold email rendered with the same envelope icon
+   and couldn't be told apart or filtered. The channel already says what it was
+   — this just reads it. */
+const CHANNEL_LANE = { "Phone call": "call", "Cold email": "email", LinkedIn: "linkedin", Facebook: "social", Instagram: "social", "Text/SMS": "text", "In person": "meeting" };
+const laneOf = (channel) => CHANNEL_LANE[channel] || "other";
+const TIMELINE_LANES = [
+  { key: "all", label: "All" },
+  { key: "call", label: "☎ Calls" },
+  { key: "email", label: "✉ Email" },
+  { key: "linkedin", label: "in LinkedIn" },
+  { key: "status", label: "◑ Status" },
+];
+const LANE_ICON = { call: "☎", email: "✉", linkedin: "in", social: "◙", text: "▭", meeting: "◇", other: "·", status: "◑", first: "●", followup: "⚑" };
+
 function contactTimeline(c) {
   const events = [
-    ...(c?.history || []).map((h) => ({ id: h.id, at: h.at, kind: h.kind, text: h.text })),
-    ...(c?.touchpoints || []).map((t) => ({ id: t.id, at: t.date, kind: "touch", text: `${t.channel || "Touch point"}${t.note ? ` — ${t.note}` : ""}` })),
+    ...(c?.history || []).map((h) => ({
+      id: h.id,
+      at: h.at,
+      /* a logged status or LinkedIn move has no touch point behind it, so it
+         keeps its own lane */
+      kind: h.kind === "linkedin" ? "linkedin" : "status",
+      lane: h.kind === "linkedin" ? "linkedin" : "status",
+      text: h.text,
+    })),
+    ...(c?.touchpoints || []).map((t) => ({
+      id: t.id,
+      at: t.date,
+      kind: "touch",
+      lane: laneOf(t.channel),
+      channel: t.channel || "",
+      text: `${t.channel || "Touch point"}${t.note ? ` — ${t.note}` : ""}`,
+    })),
   ];
-  if (c?.contacted) events.push({ id: "first", at: c.contacted, kind: "first", text: "First contacted" });
+  if (c?.contacted) events.push({ id: "first", at: c.contacted, kind: "first", lane: "first", text: "First contacted" });
   return events.filter((e) => e.at).sort((a, b) => b.at.localeCompare(a.at) || String(b.id).localeCompare(String(a.id)));
 }
 
@@ -3605,8 +3635,10 @@ export default function FlightDeck() {
                   if (c.id !== contactId) return c;
                   const next = {
                     ...c,
+                    /* the touch point IS the record of this call — writing a
+                        history entry too rendered the same event twice in the
+                        timeline, once with the wrong icon */
                     touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "Phone call", note }],
-                    history: withLog(c, [logEntry("touch", `☎ ${note}`)]).history,
                     contacted: c.contacted || today(),
                     status: c.status || "outreach",
                   };
@@ -3986,7 +4018,6 @@ export default function FlightDeck() {
                         ...c,
                         lastEngagedAt: today(),
                         touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "LinkedIn", note: "Engaged with a post" }],
-                        history: withLog(c, [logEntry("touch", "Engaged with a post")]).history,
                       }
                 ),
               }
@@ -10578,7 +10609,6 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   /* a call is a touch point like any other, so it feeds the
                      activity date, the nurture clock and the timeline */
                   touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "Phone call", note }],
-                  history: withLog(c, [logEntry("touch", `☎ ${note}`)]).history,
                   /* a call IS contact, so an untouched record starts here */
                   contacted: c.contacted || today(),
                   status: c.status || "outreach",
@@ -12652,7 +12682,6 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                                 setContact({
                                   lastEngagedAt: today(),
                                   touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "LinkedIn", note: "Engaged with a post" }],
-                                  history: withLog(c, [logEntry("touch", "Engaged with a post")]).history,
                                 })
                               }
                               style={{ padding: "6px 10px", fontSize: 12, flexShrink: 0 }}
@@ -13809,9 +13838,13 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
 }
 
 function ContactHistoryModal({ contact, company, onClose }) {
-  const events = contactTimeline(contact);
-  const ICON = { status: "◑", linkedin: "in", touch: "✉", first: "●", followup: "⚑" };
-  const COLOR = { status: C.amber, linkedin: C.blue, touch: C.ink, first: C.green, followup: C.red };
+  const [lane, setLane] = useState("all");
+  const all = contactTimeline(contact);
+  /* icon and colour come from the LANE, so a call reads as a call. Everything
+     used to share one "touch" kind and render an envelope regardless. */
+  const COLOR = { status: C.amber, linkedin: C.blue, call: C.green, email: C.ink, social: C.blue, text: C.ink, meeting: C.ink, other: C.muted, first: C.green, followup: C.red };
+  const counts = TIMELINE_LANES.reduce((acc, l) => ({ ...acc, [l.key]: l.key === "all" ? all.length : all.filter((e) => e.lane === l.key).length }), {});
+  const events = lane === "all" ? all : all.filter((e) => e.lane === lane);
   return (
     <div
       onClick={onClose}
@@ -13839,6 +13872,32 @@ function ContactHistoryModal({ contact, company, onClose }) {
           </div>
         )}
 
+        {/* only lanes with something in them — a filter for a channel you've
+            never used is noise */}
+        {all.length > 0 && (
+          <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 12 }}>
+            {TIMELINE_LANES.filter((l) => counts[l.key] > 0).map((l) => (
+              <button
+                key={l.key}
+                onClick={() => setLane(l.key)}
+                style={{
+                  fontFamily: sans,
+                  fontSize: 11,
+                  fontWeight: 700,
+                  padding: "5px 9px",
+                  borderRadius: 14,
+                  cursor: "pointer",
+                  border: `1px solid ${lane === l.key ? C.amber : C.panelEdge}`,
+                  background: lane === l.key ? "rgba(245,185,66,0.12)" : "transparent",
+                  color: lane === l.key ? C.amber : C.muted,
+                }}
+              >
+                {l.label} {counts[l.key]}
+              </button>
+            ))}
+          </div>
+        )}
+
         {events.length === 0 ? (
           <div style={{ color: C.muted, fontSize: 13, padding: "14px 2px", textAlign: "center", lineHeight: 1.6 }}>
             Nothing logged yet. Status changes, LinkedIn moves and touch points all land here automatically.
@@ -13846,7 +13905,7 @@ function ContactHistoryModal({ contact, company, onClose }) {
         ) : (
           events.map((e) => (
             <div key={e.id} style={{ display: "flex", gap: 10, alignItems: "flex-start", paddingBottom: 10, marginBottom: 10, borderBottom: `1px solid ${C.panelEdge}` }}>
-              <span style={{ fontFamily: mono, fontSize: 10, color: COLOR[e.kind] || C.muted, flexShrink: 0, width: 18, textAlign: "center", paddingTop: 2 }}>{ICON[e.kind] || "·"}</span>
+              <span style={{ fontFamily: mono, fontSize: 10, color: COLOR[e.lane] || C.muted, flexShrink: 0, width: 18, textAlign: "center", paddingTop: 2 }}>{LANE_ICON[e.lane] || "·"}</span>
               <div style={{ minWidth: 0, flex: 1 }}>
                 <div style={{ fontSize: 13, color: C.ink, lineHeight: 1.45 }}>{e.text}</div>
                 <div style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginTop: 2 }}>
