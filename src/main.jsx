@@ -3687,6 +3687,17 @@ export default function FlightDeck() {
   const [voiceScript, setVoiceScript] = useState("");
   const voiceUrlRef = useRef(null);
   const [canAutoGen, setCanAutoGen] = useState(false);
+  /* three columns only past 1500px — at 1280 a third column makes each card
+     too narrow for its own numbers to sit on one line */
+  const [isWide, setIsWide] = useState(() => typeof window !== "undefined" && window.matchMedia("(min-width: 1500px)").matches);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(min-width: 1500px)");
+    const on = (e) => setIsWide(e.matches);
+    mq.addEventListener ? mq.addEventListener("change", on) : mq.addListener(on);
+    return () => (mq.removeEventListener ? mq.removeEventListener("change", on) : mq.removeListener(on));
+  }, []);
+
   const [isDesktop, setIsDesktop] = useState(
     () => typeof window !== "undefined" && window.matchMedia("(min-width: 1024px)").matches
   );
@@ -6232,7 +6243,21 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const advisoryPhase = !poolMode && state.settings?.cycleStart ? cyclePhase(state.settings) : null;
     const isRestDay = new Date(today() + "T00:00:00").getDay() === 0;
     return (
-    <>
+    <div
+      className={isDesktop ? "fd-cols" : undefined}
+      /* CSS columns rather than a grid, because the cards are independent and
+         vary wildly in height — a grid would leave a short card's row half
+         empty next to a tall one. `breakInside: avoid` on the children keeps
+         a card from being sliced across the column gap.
+
+         Two columns at desktop widths, three on a very wide screen; one on
+         mobile, where the existing stacked order already reads correctly. */
+      style={
+        isDesktop
+          ? { columnCount: isWide ? 3 : 2, columnGap: 14, paddingBottom: 8 }
+          : undefined
+      }
+    >
       {/* today's goal — featured front and center, not buried in the Goal tab.
           Sundays are a rest day with no quota at all, so this takes priority
           over both the active-goal and no-goal states — it's not something
@@ -6669,7 +6694,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           {coachError}
         </div>
       )}
-    </>
+    </div>
     );
   };
 
@@ -9889,6 +9914,9 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     >
       <style>{`
         ::-webkit-scrollbar { display: none; }
+        /* the dashboard uses CSS columns on desktop; without this a tall card
+           gets sliced in half across the gap */
+        .fd-cols > * { break-inside: avoid; -webkit-column-break-inside: avoid; page-break-inside: avoid; }
         * { scrollbar-width: none; -ms-overflow-style: none; }
         input, textarea, select { font-size: 16px !important; max-width: 100%; box-sizing: border-box; }
         input[type="date"] { width: auto; }
@@ -9910,7 +9938,20 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
         }
       `}</style>
 
-      <div style={{ width: "100%", maxWidth: isDesktop ? (["PIPELINE", "CONTENT"].includes(MODES[mode]) ? 1800 : 900) : 560, margin: "0 auto", flex: 1, display: "flex", flexDirection: "column", transition: "max-width 0.2s ease" }}>
+      {/* The dashboard is a set of independent cards, so on a wide screen it
+          belongs in columns rather than one 900px ribbon with empty space
+          either side. Pipeline and Content are tables and already run wide. */}
+      <div
+        style={{
+          width: "100%",
+          maxWidth: isDesktop ? (["PIPELINE", "CONTENT", "DASHBOARD"].includes(MODES[mode]) ? 1800 : 900) : 560,
+          margin: "0 auto",
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          transition: "max-width 0.2s ease",
+        }}
+      >
         {/* header */}
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
           <div>
