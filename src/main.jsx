@@ -3585,6 +3585,27 @@ export default function FlightDeck() {
   const [callQueueContact, setCallQueueContact] = useState(null); /* { contact, accountId, company } */
   const [standaloneHistory, setStandaloneHistory] = useState(null); /* opened outside the account modal */
 
+  /* ---- keep the pipeline in step ----
+     Setting a contact's status is what puts it in the funnel, but only the
+     account modal ran the sync that creates the linked pipeline row. Anything
+     that set a status directly — the card's Warm/Cold buttons, a logged call —
+     moved the contact without ever reaching analytics, so that outreach was
+     invisible to the funnel, the conversion rate and the goal count.
+
+     This wraps the sync so every status-setting path goes through it. Takes the
+     already-updated accounts array and reconciles applications against it. */
+  const reconcileAccountApplications = (st, accountId, oldContacts) => {
+    const acc = (st.accounts || []).find((a) => a.id === accountId);
+    if (!acc) return st;
+    const synced = syncContactsToApplications(acc.company, acc.website, oldContacts || [], acc.contacts || [], st.applications);
+    return {
+      ...st,
+      applications: synced.applications,
+      accounts: (st.accounts || []).map((a) => (a.id === accountId ? { ...a, contacts: synced.contacts } : a)),
+      deletedIds: synced.removedIds?.length ? tombstones(st, synced.removedIds) : st.deletedIds,
+    };
+  };
+
   /* Marks a contact as contacted from the card. Mirrors what the account
      modal's status control does — stamps the date and seeds the follow-up
      schedule — so a contact graduated from here behaves identically to one
@@ -3592,7 +3613,9 @@ export default function FlightDeck() {
      follow-ups and never reappearing in the due queue. */
   const graduateContact = (accountId, contactId, kind) =>
     mutate(
-      (st) => ({
+      (st) => {
+        const oldContacts = (st.accounts || []).find((a) => a.id === accountId)?.contacts || [];
+        const next = {
         ...st,
         accounts: (st.accounts || []).map((a) =>
           a.id !== accountId
@@ -3613,7 +3636,10 @@ export default function FlightDeck() {
                 }),
               }
         ),
-      }),
+        };
+        /* the contact now has a status, so it needs its pipeline row */
+        return reconcileAccountApplications(next, accountId, oldContacts);
+      },
       `Marked ${kind} — follow-ups scheduled`
     );
 
@@ -3624,7 +3650,9 @@ export default function FlightDeck() {
     const o = callOutcome(outcome);
     const note = `${o?.label || "Call"}${notes.trim() ? ` — ${notes.trim()}` : ""}`;
     mutate(
-      (st) => ({
+      (st) => {
+        const oldContacts = (st.accounts || []).find((a) => a.id === accountId)?.contacts || [];
+        const next = {
         ...st,
         accounts: (st.accounts || []).map((a) =>
           a.id !== accountId
@@ -3652,7 +3680,11 @@ export default function FlightDeck() {
                 }),
               }
         ),
-      }),
+        };
+        /* a call can start a contact (status → outreach) or close one, and
+           both belong in the funnel */
+        return reconcileAccountApplications(next, accountId, oldContacts);
+      },
       `☎ ${o?.label || "Call"} logged`
     );
   };
