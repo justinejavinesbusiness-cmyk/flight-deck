@@ -3476,13 +3476,18 @@ const STATUS_DONUT_HUE = {
   replied: 324,
 };
 const statusDonutColor = (s) => (s ? `hsl(${STATUS_DONUT_HUE[s]}, 65%, 58%)` : C.muted);
-function Donut({ data, centerLabel }) {
+/* `size` scales the whole chart. The geometry was hardcoded to a 140px box
+   sized for a phone, so on desktop it sat as a small circle with a lot of
+   empty card around it. The viewBox stays 140 and the rendered box grows —
+   everything inside scales with it and no coordinates change. */
+function Donut({ data, centerLabel, size = 140 }) {
   const total = data.reduce((a, d) => a + d.value, 0);
   const R = 52, SW = 22, CIRC = 2 * Math.PI * R;
   let offset = 0;
+  const big = size >= 200;
   return (
-    <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
-      <svg width="140" height="140" viewBox="0 0 140 140" style={{ flexShrink: 0 }}>
+    <div style={{ display: "flex", gap: big ? 28 : 16, alignItems: "center", flexWrap: "wrap" }}>
+      <svg width={size} height={size} viewBox="0 0 140 140" style={{ flexShrink: 0 }}>
         <circle cx="70" cy="70" r={R} fill="none" stroke={C.bg} strokeWidth={SW} />
         {total > 0 &&
           data.map((d, i) => {
@@ -3512,17 +3517,24 @@ function Donut({ data, centerLabel }) {
           {centerLabel}
         </text>
       </svg>
-      <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0, flex: 1 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: big ? 7 : 4, minWidth: 0, flex: 1 }}>
         {total === 0 && <div style={{ fontSize: 12, color: C.muted }}>No applications yet — the donut fills as the pipeline grows.</div>}
         {data
           .filter((d) => d.value > 0)
           .map((d) => {
             const i = data.indexOf(d);
             return (
-              <div key={d.label} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
-                <span style={{ width: 10, height: 10, borderRadius: 5, background: d.color || donutColor(i), flexShrink: 0 }} />
+              <div key={d.label} style={{ display: "flex", alignItems: "center", gap: big ? 11 : 8, fontSize: big ? 14 : 12 }}>
+                <span style={{ width: big ? 12 : 10, height: big ? 12 : 10, borderRadius: 6, background: d.color || donutColor(i), flexShrink: 0 }} />
                 <span style={{ color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.label}</span>
-                <span style={{ fontFamily: mono, color: C.muted, marginLeft: "auto" }}>
+                {/* a bar makes the proportions readable across rows — at this
+                    size the numbers alone waste the space they're given */}
+                {big && (
+                  <span style={{ flex: 1, height: 5, background: C.bg, borderRadius: 3, overflow: "hidden", minWidth: 40, marginLeft: 4 }}>
+                    <span style={{ display: "block", height: "100%", width: `${Math.round((d.value / total) * 100)}%`, background: d.color || donutColor(i), borderRadius: 3 }} />
+                  </span>
+                )}
+                <span style={{ fontFamily: mono, color: C.muted, marginLeft: big ? 0 : "auto", flexShrink: 0 }}>
                   {d.value} · {Math.round((d.value / total) * 100)}%
                 </span>
               </div>
@@ -6569,6 +6581,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         </div>
         <Donut
+          /* the analytics card spans a full column on desktop, so the chart
+             should use it rather than floating in the corner */
+          size={isDesktop ? 220 : 140}
           centerLabel={donutMode === "status" ? "BY STATUS" : donutMode === "source" ? "BY SOURCE" : "OUTREACH"}
           data={
             donutMode === "status"
@@ -6661,7 +6676,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {engageDueList.slice(0, 5).map((c) => (
               <div key={c.id} style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 13, alignItems: "center" }}>
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <span
+                  onClick={() => setContactCard({ contact: c, company: c._company, accountId: c._accountId })}
+                  title="Open contact"
+                  style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", cursor: "pointer" }}
+                >
+                  <ConnDot contact={c} />
                   <strong>{c.name || "Unnamed"}</strong>
                   <span style={{ color: C.muted }}> · {c._company}</span>
                 </span>
@@ -13880,6 +13900,40 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
             </div>
           </div>
         )}
+
+        {/* Recent activity, inline. The card used to answer "who is this" but
+            not "what have I already done with them" — and that second question
+            is the one you have before writing anything. Five is enough to see
+            the shape; the full timeline is one tap away. */}
+        {(() => {
+          const recent = contactTimeline(c).filter((e) => e.kind === "touch");
+          const fusDone = (c.followUps || []).filter((x) => x.done).length;
+          const fusTotal = (c.followUps || []).length;
+          if (!recent.length && !fusTotal) return null;
+          return (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 5 }}>
+                <span style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>ACTIVITY</span>
+                <span style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>
+                  {recent.length} touch{recent.length === 1 ? "" : "es"}
+                  {fusTotal ? ` · follow-ups ${fusDone}/${fusTotal}` : ""}
+                </span>
+              </div>
+              {recent.length === 0 ? (
+                <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5 }}>Nothing sent yet.</div>
+              ) : (
+                recent.slice(0, 5).map((e) => (
+                  <div key={e.id} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "4px 0" }}>
+                    <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0, width: 16, textAlign: "center", paddingTop: 2 }}>{LANE_ICON[e.lane] || "·"}</span>
+                    <span style={{ fontSize: 12, color: C.ink, lineHeight: 1.4, flex: 1, minWidth: 0 }}>{e.text}</span>
+                    <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>{daysSince(e.at)}d</span>
+                  </div>
+                ))
+              )}
+              {recent.length > 5 && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>+ {recent.length - 5} more in History</div>}
+            </div>
+          );
+        })()}
 
         {stale > 0 && <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginBottom: 10 }}>⚠ LinkedIn request pending {stale} days.</div>}
         {liRetryDays(c) > 0 && (
