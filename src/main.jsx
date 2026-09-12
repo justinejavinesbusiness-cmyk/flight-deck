@@ -13835,12 +13835,18 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
           </>
         )}
 
-        {/* a call-back promise only becomes real when it has a date */}
-        {picked && picked.landed && !CALL_CLOSES.includes(picked.key) && (
+        {/* Offered for every outcome that leaves the lead alive — a no-answer
+            or a gatekeeper block is precisely when you want to schedule the
+            retry, and gating this on `landed` meant the outcomes that most
+            need a next attempt were the only ones that couldn't book one.
+            Only the closing outcomes are excluded. */}
+        {picked && !CALL_CLOSES.includes(picked.key) && (
           <>
-            <Label>Call back in…</Label>
+            <Label>{picked.landed ? "Call back in…" : "Try again in…"}</Label>
             <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 4 }}>
-              {[0, ...CALLBACK_DAYS].map((d) => {
+              {/* an unanswered call is often worth retrying tomorrow at a
+                  different time of day, which a 3-day minimum can't express */}
+              {[0, ...(picked.landed ? CALLBACK_DAYS : [1, 2, ...CALLBACK_DAYS])].map((d) => {
                 const on = callbackDays === d;
                 return (
                   <button
@@ -13864,7 +13870,11 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
               })}
             </div>
             <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
-              {callbackDays ? `Adds a follow-up due ${addDays(today(), callbackDays)} so it comes back in your due queue.` : "No call-back scheduled — this call just gets logged."}
+              {callbackDays
+                ? `Adds a follow-up due ${addDays(today(), callbackDays)} so it comes back in your due queue.`
+                : picked.landed
+                ? "No call-back scheduled — this call just gets logged."
+                : "No retry scheduled — without a date this attempt is easy to forget about."}
             </div>
           </>
         )}
