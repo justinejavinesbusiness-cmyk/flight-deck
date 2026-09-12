@@ -1153,6 +1153,28 @@ const CALL_OUTCOMES = [
   { key: "cannotcontact", label: "Can't be reached", tone: "red", landed: false },
 ];
 const callOutcome = (k) => CALL_OUTCOMES.find((o) => o.key === k) || null;
+
+/* ---- how far the call got ----
+   The outcome says what happened to the call; the stage says how far you got
+   through it. Those are different questions, and only the second one tells you
+   where to practise: dying at the opener every time is a script problem, while
+   losing people at objections is a rehearsal problem. Tracked in order so the
+   furthest stage reached is comparable across calls. */
+const CALL_STAGES = [
+  { key: "nostart", label: "Didn't get started", hint: "Hung up or cut off immediately" },
+  { key: "opener", label: "Opener", hint: "Got your opening line out" },
+  { key: "pitch", label: "Pitch", hint: "Explained what you do" },
+  { key: "objection", label: "Objection handling", hint: "They pushed back, you answered" },
+  { key: "interest", label: "Real interest", hint: "They asked questions" },
+  { key: "booked", label: "Meeting booked", hint: "The point of the call" },
+];
+const callStage = (k) => CALL_STAGES.find((x) => x.key === k) || null;
+const callStageIdx = (k) => CALL_STAGES.findIndex((x) => x.key === k);
+
+/* Call-back intervals. A caller who asked for "next week" needs a date, not a
+   note buried in the log — this turns the answer into a scheduled follow-up so
+   it reappears in the due queue on the right day. */
+const CALLBACK_DAYS = [3, 5, 7, 14, 30, 60];
 /* outcomes that end the pursuit — the contact closes so it drops out of due
    lists and the nurture clock instead of sitting there looking live */
 const CALL_CLOSES = ["notinterested", "cannotcontact", "wrongnumber"];
@@ -3667,9 +3689,12 @@ export default function FlightDeck() {
   /* Writes a call straight to state. The account modal has its own copy that
      works on unsaved form data; this is for the call queue and contact card,
      which act on the saved record directly. Same effects either way. */
-  const logCallOnContact = (accountId, contactId, { outcome, notes, tickFollowUp, followUpIndex }) => {
+  const logCallOnContact = (accountId, contactId, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays }) => {
     const o = callOutcome(outcome);
-    const note = `${o?.label || "Call"}${notes.trim() ? ` — ${notes.trim()}` : ""}`;
+    const st = callStage(stage);
+    /* the stage rides in the note so it shows in the timeline without needing
+       its own row, and stays on the contact for the reach-analysis below */
+    const note = `${o?.label || "Call"}${st ? ` · ${st.label}` : ""}${notes.trim() ? ` — ${notes.trim()}` : ""}`;
     mutate(
       (st) => {
         const oldContacts = (st.accounts || []).find((a) => a.id === accountId)?.contacts || [];
@@ -3693,6 +3718,14 @@ export default function FlightDeck() {
                   };
                   if (tickFollowUp && followUpIndex >= 0) {
                     next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex ? { ...x, done: true, doneAt: today(), channel: "Phone call" } : x));
+                  }
+                  /* furthest stage ever reached on this contact, so a weaker
+                     later call doesn't erase a better earlier one */
+                  if (stage && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
+                  /* the call-back becomes a real dated follow-up rather than a
+                     promise buried in a note */
+                  if (callbackDays > 0) {
+                    next.followUps = [...(next.followUps || c.followUps || []), { days: callbackDays, done: false, doneAt: "", channel: "Phone call", fromCallback: true }];
                   }
                   if (CALL_CLOSES.includes(outcome)) next.status = "closed";
                   if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
@@ -9896,6 +9929,11 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                     {r.contact.phone}
                     {r.calls === 0 ? " · never called" : ` · ${r.calls} call${r.calls === 1 ? "" : "s"}, last ${r.lastCall}`}
                     {r.due ? " · ⚑ due" : ""}
+                    {/* knowing you last died at the opener changes how you open
+                        this one — that's the whole point of tracking it */}
+                    {r.contact.callStage && (
+                      <span style={{ color: r.contact.callStage === "booked" ? C.green : C.blue }}> · best: {callStage(r.contact.callStage)?.label}</span>
+                    )}
                   </div>
                 </div>
                 <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
@@ -10742,10 +10780,11 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
           contact={callContact.contact}
           company={f.company}
           onClose={() => setCallContact(null)}
-          onSave={({ outcome, notes, tickFollowUp, followUpIndex }) => {
+          onSave={({ outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays }) => {
             const o = callOutcome(outcome);
+            const st = callStage(stage);
             const i = callContact.index;
-            const note = `${o?.label || "Call"}${notes.trim() ? ` — ${notes.trim()}` : ""}`;
+            const note = `${o?.label || "Call"}${st ? ` · ${st.label}` : ""}${notes.trim() ? ` — ${notes.trim()}` : ""}`;
             setF((p) => ({
               ...p,
               contacts: p.contacts.map((c, j) => {
@@ -10761,6 +10800,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 };
                 if (tickFollowUp && followUpIndex >= 0) {
                   next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex ? { ...x, done: true, doneAt: today(), channel: "Phone call" } : x));
+                }
+                if (stage && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
+                if (callbackDays > 0) {
+                  next.followUps = [...(next.followUps || c.followUps || []), { days: callbackDays, done: false, doneAt: "", channel: "Phone call", fromCallback: true }];
                 }
                 if (CALL_CLOSES.includes(outcome)) next.status = "closed";
                 if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
@@ -13687,6 +13730,8 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
   const [outcome, setOutcome] = useState("");
   const [notes, setNotes] = useState("");
   const [tickFollowUp, setTickFollowUp] = useState(true);
+  const [stage, setStage] = useState("");
+  const [callbackDays, setCallbackDays] = useState(0);
   const picked = callOutcome(outcome);
   const fus = Array.isArray(contact.followUps) ? contact.followUps : [];
   const nextUnticked = fus.findIndex((x) => !x.done);
@@ -13757,6 +13802,73 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
           })}
         </div>
 
+        {/* only meaningful once you actually spoke — a voicemail or a
+            no-answer has no stages to have passed through */}
+        {picked && ["spoke", "callback", "notinterested"].includes(picked.key) && (
+          <>
+            <Label>How far did the call get?</Label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
+              {CALL_STAGES.map((st) => {
+                const on = stage === st.key;
+                return (
+                  <button
+                    key={st.key}
+                    onClick={() => setStage(st.key)}
+                    style={{
+                      textAlign: "left",
+                      background: on ? "rgba(96,165,250,0.12)" : "transparent",
+                      border: `1px solid ${on ? C.blue : C.panelEdge}`,
+                      color: on ? C.blue : C.muted,
+                      borderRadius: 10,
+                      padding: "7px 11px",
+                      fontSize: 13,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {on ? "◉" : "○"} {st.label}
+                    <span style={{ fontSize: 11, fontWeight: 400, color: C.muted, marginLeft: 6 }}>{st.hint}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {/* a call-back promise only becomes real when it has a date */}
+        {picked && picked.landed && !CALL_CLOSES.includes(picked.key) && (
+          <>
+            <Label>Call back in…</Label>
+            <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 4 }}>
+              {[0, ...CALLBACK_DAYS].map((d) => {
+                const on = callbackDays === d;
+                return (
+                  <button
+                    key={d}
+                    onClick={() => setCallbackDays(d)}
+                    style={{
+                      fontFamily: sans,
+                      fontSize: 12,
+                      fontWeight: 700,
+                      padding: "6px 11px",
+                      borderRadius: 16,
+                      cursor: "pointer",
+                      border: `1px solid ${on ? C.amber : C.panelEdge}`,
+                      background: on ? "rgba(245,185,66,0.12)" : "transparent",
+                      color: on ? C.amber : C.muted,
+                    }}
+                  >
+                    {d === 0 ? "No date" : `${d}d`}
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+              {callbackDays ? `Adds a follow-up due ${addDays(today(), callbackDays)} so it comes back in your due queue.` : "No call-back scheduled — this call just gets logged."}
+            </div>
+          </>
+        )}
+
         <Label>Notes</Label>
         <textarea
           value={notes}
@@ -13812,7 +13924,7 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
           </Btn>
           <Btn
             disabled={!outcome}
-            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked })}
+            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked, stage, callbackDays })}
             style={{ flex: 2 }}
           >
             Log call
@@ -13921,6 +14033,7 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
 
         <div style={{ marginBottom: 12 }}>
           {line("STATUS", contactStatusLabel(c.status) + (c.outreachKind ? ` · ${c.outreachKind}` : ""))}
+          {c.callStage ? line("BEST CALL", callStage(c.callStage)?.label || c.callStage, null, { tone: c.callStage === "booked" ? C.green : C.ink }) : null}
           {line("EMAIL", c.email, c.email ? `mailto:${c.email}` : null, { copy: c.email })}
           {line("PHONE", c.phone, c.phone ? `tel:${c.phone}` : null, { copy: c.phone })}
           {/* status stays plain text and coloured by state; the icon is the link */}
