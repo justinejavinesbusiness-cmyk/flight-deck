@@ -347,7 +347,7 @@ const liRetryIn = (c) => {
   const left = LI_RETRY_DAYS - daysSince(c.liStatusAt);
   return left > 0 ? left : 0;
 };
-const DEFAULT_TOUCH_CHANNEL = "LinkedIn";
+const DEFAULT_TOUCH_CHANNEL = "Cold email";
 
 /* Ticking a follow-up means you actually sent something, so it should leave a
    trace in the log rather than only moving the next due date. The channel is
@@ -2560,6 +2560,15 @@ function migrate(saved) {
   if (typeof s.settings.aiWebSearch !== "boolean") s.settings.aiWebSearch = true;
   if (typeof s.settings.aiMaxTokens !== "number") s.settings.aiMaxTokens = AI_MAX_TOKENS_DEFAULT;
   if (!s.settings.defaultTouchChannel) s.settings.defaultTouchChannel = DEFAULT_TOUCH_CHANNEL;
+  /* The old default was seeded automatically before Settings had a control for
+     it, so a stored "LinkedIn" is almost certainly never-chosen rather than
+     preferred. Flip it once to the new default and mark it done, so this can't
+     keep overriding a deliberate choice on every load. Changeable in Settings
+     either way — the flag only guarantees it's asked once. */
+  if (!s.settings.touchChannelDefaultMigrated) {
+    if (s.settings.defaultTouchChannel === "LinkedIn") s.settings.defaultTouchChannel = DEFAULT_TOUCH_CHANNEL;
+    s.settings.touchChannelDefaultMigrated = true;
+  }
   s.settings.draftSections = normDraftSections(s.settings.draftSections);
   if (typeof s.settings.autoArchiveDays !== "number") s.settings.autoArchiveDays = HOUSEKEEPING_STALE_DAYS;
   /* "standard" = the original N-over-N-days quota. "pool" = coverage pacing
@@ -4876,6 +4885,23 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       }
       return { ...s, applications, accounts };
     });
+  /* Changing LinkedIn state has to stamp the date too, or both clocks that
+     depend on it — the 7-day pending warning and the 21-day retry window —
+     would keep measuring from the previous status. updateAppField already
+     mirrors these to a linked contact. */
+  const setAppLiStatus = (id, value) =>
+    mutate(
+      (st) => ({
+        ...st,
+        applications: st.applications.map((a) => (a.id === id ? { ...a, liStatus: value, liStatusAt: value ? today() : "" } : a)),
+        accounts: (st.accounts || []).map((acc) => ({
+          ...acc,
+          contacts: (acc.contacts || []).map((c) => (c.linkedApplicationId === id ? { ...c, liStatus: value, liStatusAt: value ? today() : "" } : c)),
+        })),
+      }),
+      `LinkedIn → ${LI_META(value).label}`
+    );
+
   const updateAccountField = (id, field, value) =>
     mutate((s) => ({ ...s, accounts: s.accounts.map((a) => (a.id === id ? { ...a, [field]: value } : a)) }));
   const updateContentField = (id, field, value) => {
@@ -7548,7 +7574,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   <th style={th}>Source / Board</th>
                   <th style={th}>Contact</th>
                   <th style={th}>Email</th>
-                  <th style={th}>Post link</th>
+                  {/* in the pending view the job-post column is dead weight —
+                      these are LinkedIn requests, not job applications — so it
+                      becomes the control you actually came here to use */}
+                  <th style={th}>{pipeFilter === "liPending" ? "LinkedIn" : "Post link"}</th>
                   <th style={th}>Screenshot / Link</th>
                   <th style={th}>Salary / offer</th>
                   <th style={th}>Status</th>
@@ -7721,7 +7750,30 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {a.email && openLink(a.email, { mailto: true, icon: "✉", title: "Email" })}
                         </div>
                       </td>
-                      <td style={{ ...td, minWidth: 140 }}>
+                      <td style={{ ...td, minWidth: 140 }} onClick={pipeFilter === "liPending" ? (e) => e.stopPropagation() : undefined}>
+                        {pipeFilter === "liPending" ? (
+                          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                            <select
+                              value={a.liStatus || ""}
+                              onChange={(e) => setAppLiStatus(a.id, e.target.value)}
+                              style={{
+                                ...selectStyle,
+                                width: "auto",
+                                minWidth: 118,
+                                fontSize: 11,
+                                padding: "5px 7px",
+                                color: LI_META(a.liStatus).color === "muted" ? C.muted : C[LI_META(a.liStatus).color],
+                              }}
+                            >
+                              {LI_STATUSES.map((x) => (
+                                <option key={x.key || "none"} value={x.key}>
+                                  {x.label}
+                                </option>
+                              ))}
+                            </select>
+                            {a.contactLinkedin && openLink(a.contactLinkedin.startsWith("http") ? a.contactLinkedin : `https://${a.contactLinkedin}`, { title: "Open profile" })}
+                          </div>
+                        ) : (
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           {cellInput(a, "postLink", { ph: "https://…" })}
                           {a.postLink && openLink(a.postLink, { title: "Open job post" })}
@@ -7739,6 +7791,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           </button>
                         )}
                         </div>
+                        )}
                       </td>
                       <td style={{ ...td, minWidth: 150 }} onClick={(e) => e.stopPropagation()}>
                         {a.postShot ? (
