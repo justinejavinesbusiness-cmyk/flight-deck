@@ -2492,6 +2492,13 @@ const DEFAULT_STATE = {
   cycleCount: 0,
   runway: { fund: 1200000, expenses: 50000 },
   copyDrafts: [],
+  /* ---- call session ----
+     The queue's automatic order answers "who is most worth calling"; this
+     answers "who am I calling in the next twenty minutes". Kept as an ORDERED
+     list of contact ids rather than a flag, because the sequence you choose is
+     the sequence you work through — and kept in state so it survives a reload
+     mid-session. */
+  callSession: [],
   settings: { checkinDay: 1, timezoneOffset: 8 },
   lastCheckinMonth: null,
   lastDigestShownDate: null,
@@ -2538,6 +2545,7 @@ function migrate(saved) {
   if (!Array.isArray(s.poolBench)) s.poolBench = [];
   if (!Array.isArray(s.housekeepingSnoozes)) s.housekeepingSnoozes = [];
   s.copyDrafts = Array.isArray(s.copyDrafts) ? s.copyDrafts.map(normCopyDraft) : [];
+  if (!Array.isArray(s.callSession)) s.callSession = [];
   /* drop expired snoozes so the list can't grow forever */
   s.housekeepingSnoozes = s.housekeepingSnoozes.filter((x) => x && x.key && x.until && x.until > today());
   if (!Array.isArray(s.deletedIds)) s.deletedIds = [];
@@ -9856,6 +9864,15 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
      are built for reading one record at a time. This is a worklist: only people
      you can actually dial, ordered so the ones most worth calling come first,
      each row one tap from the phone and one tap from logging the result. */
+  /* toggling keeps pick order: appending puts a new pick at the end of the
+     run, which is what "call these next, in this order" means */
+  const toggleCallSession = (contactId) =>
+    mutate((st) => {
+      const cur = st.callSession || [];
+      return { ...st, callSession: cur.includes(contactId) ? cur.filter((x) => x !== contactId) : [...cur, contactId] };
+    });
+  const clearCallSession = () => mutate((st) => ({ ...st, callSession: [] }), "Run cleared");
+
   const callQueue = useMemo(() => {
     const rows = (state.accounts || []).flatMap((acc) =>
       (acc.contacts || [])
@@ -9864,21 +9881,27 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     );
     const calls = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").length;
     const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
+    const session = state.callSession || [];
     return rows
-      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact) }))
+      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact), pick: session.indexOf(r.contact.id) }))
       .sort(
         (a, b) =>
-          /* never called first — those are the ones the queue exists for.
+          /* anything you picked leads, in the order you picked it — a manual
+             choice should always beat the automatic ranking */
+          (a.pick === -1 ? 1 : 0) - (b.pick === -1 ? 1 : 0) ||
+          (a.pick !== -1 && b.pick !== -1 ? a.pick - b.pick : 0) ||
+          /* then: never called first — those are what the queue exists for.
              Then whoever is due. Then longest since the last attempt. */
           a.calls - b.calls ||
           (b.due ? 1 : 0) - (a.due ? 1 : 0) ||
           (a.lastCall || "0000").localeCompare(b.lastCall || "0000") ||
           (a.company || "").localeCompare(b.company || "")
       );
-  }, [state.accounts]);
+  }, [state.accounts, state.callSession]);
 
   const renderCalls = () => {
     const uncalled = callQueue.filter((r) => r.calls === 0).length;
+    const picked = callQueue.filter((r) => r.pick !== -1).length;
     return (
       <>
         <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 12 }}>
@@ -9890,6 +9913,21 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           </div>
         ) : (
           <>
+            {/* the run you've built, when you've built one */}
+            {picked > 0 && (
+              <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 12, padding: "10px 13px", marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.amber }}>
+                    ▶ This run — {picked} {picked === 1 ? "call" : "calls"}
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.45, marginTop: 1 }}>Work down from the top. Numbers are the order you picked.</div>
+                </div>
+                <Btn ghost onClick={clearCallSession} style={{ padding: "6px 11px", fontSize: 11, flexShrink: 0 }}>
+                  Clear
+                </Btn>
+              </div>
+            )}
+
             <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
               <div style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
                 <div style={{ fontSize: 9, letterSpacing: "0.16em", color: C.muted }}>IN QUEUE</div>
@@ -9902,11 +9940,19 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             </div>
 
             {callQueue.map((r, i) => (
+              /* keyed fragment via the long form would need a React import
+                 that this file doesn't have — a keyed <div> wrapper is simpler
+                 and carries the key without one */
+              <div key={r.contact.id}>
+              {/* where the chosen run ends and the ranked queue resumes */}
+              {picked > 0 && i === picked && (
+                <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, margin: "14px 0 6px" }}>REST OF QUEUE</div>
+              )}
               <div
-                key={r.contact.id}
                 style={{
                   background: C.panel,
-                  border: `1px solid ${r.calls === 0 ? C.amber : C.panelEdge}`,
+                  border: `1px solid ${r.pick !== -1 ? C.amber : r.calls === 0 ? C.amber : C.panelEdge}`,
+                  opacity: picked > 0 && r.pick === -1 ? 0.72 : 1,
                   borderRadius: 12,
                   padding: "11px 13px",
                   marginBottom: 6,
@@ -9936,7 +9982,26 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                     )}
                   </div>
                 </div>
-                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
+                  <button
+                    onClick={() => toggleCallSession(r.contact.id)}
+                    title={r.pick !== -1 ? `#${r.pick + 1} in this run — tap to remove` : "Add to this run"}
+                    style={{
+                      width: 34,
+                      height: 42,
+                      background: "transparent",
+                      border: `1px solid ${r.pick !== -1 ? C.amber : C.panelEdge}`,
+                      color: r.pick !== -1 ? C.amber : C.muted,
+                      borderRadius: 10,
+                      cursor: "pointer",
+                      fontFamily: mono,
+                      fontSize: 12,
+                      fontWeight: 800,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {r.pick !== -1 ? r.pick + 1 : "+"}
+                  </button>
                   <a
                     href={`tel:${r.contact.phone}`}
                     style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 42, height: 42, border: `1px solid ${C.green}`, color: C.green, borderRadius: 10, textDecoration: "none", fontSize: 16 }}
@@ -9948,6 +10013,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                     Log
                   </Btn>
                 </div>
+              </div>
               </div>
             ))}
           </>
