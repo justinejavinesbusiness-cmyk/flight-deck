@@ -262,6 +262,19 @@ const nurtureState = (c) => {
   if (d >= NURTURE_FROM_DAYS) return "nurture";
   return "";
 };
+/* ---- restarting a nurtured lead ----
+   A lead that's gone quiet for months isn't mid-conversation any more — the
+   next message is a fresh approach, not a fourth chase. Restarting resets the
+   outreach cycle so it behaves like a new lead: status back to blank so you
+   pick cold or warm again, and follow-ups un-ticked so the schedule runs from
+   the next contact rather than from a date months ago.
+
+   `nurturedAt` is kept SEPARATE from `contacted`. The original first-contact
+   date is history worth keeping — it's what tells you this is a re-approach
+   rather than a first touch — so the restart stamps its own date and leaves
+   `contacted` alone. Each subsequent restart moves nurturedAt forward. */
+const nurtureCycle = (c) => Math.max(0, +c?.nurtureCycle || 0);
+
 const NURTURE_META = {
   nurture: { label: "NURTURE", color: "amber", hint: "quiet 60+ days — worth a light touch, not a hard pitch" },
   stale: { label: "GONE COLD", color: "muted", hint: "quiet 90+ days — restart cold rather than follow up again" },
@@ -2082,6 +2095,9 @@ function lastActivityDate(a) {
     bump(f.doneAt || (a.contacted ? followUpDueDate(a.contacted, fus, i) : ""));
   });
   (a.touchpoints || []).forEach((t) => bump(t?.date));
+  /* restarting a nurtured lead IS activity — without this the contact stays
+     flagged "gone cold" straight after you deliberately reset it */
+  bump(a.nurturedAt);
   return latest;
 }
 
@@ -3630,6 +3646,7 @@ export default function FlightDeck() {
   const [poolView, setPoolView] = useState(null);
   const [poolSearch, setPoolSearch] = useState("");
   const [copyFilter, setCopyFilter] = useState("all");
+  const [callSearch, setCallSearch] = useState("");
   /* one person's card, opened from the pool or the call queue — app-level so
      both can reach it */
   const [contactCard, setContactCard] = useState(null); /* { contact, company, accountId } */
@@ -3656,6 +3673,48 @@ export default function FlightDeck() {
       deletedIds: synced.removedIds?.length ? tombstones(st, synced.removedIds) : st.deletedIds,
     };
   };
+
+  /* Resets a nurtured lead to an un-contacted state so the next message is a
+     fresh approach. Deliberately an explicit action rather than something that
+     fires automatically at 60 days: clearing a status removes the contact from
+     the funnel, and doing that on a timer would quietly rewrite your outreach
+     numbers without you asking. */
+  const restartNurture = (accountId, contactId) =>
+    mutate(
+      (st) => {
+        const oldContacts = (st.accounts || []).find((a) => a.id === accountId)?.contacts || [];
+        const next = {
+          ...st,
+          accounts: (st.accounts || []).map((a) =>
+            a.id !== accountId
+              ? a
+              : {
+                  ...a,
+                  contacts: (a.contacts || []).map((c) =>
+                    c.id !== contactId
+                      ? c
+                      : {
+                          ...c,
+                          status: "",
+                          outreachKind: "",
+                          /* the schedule reruns from the NEXT contact, not from
+                             a date months back */
+                          followUps: (c.followUps || []).map((x) => ({ ...x, done: false, doneAt: "" })),
+                          nurturedAt: today(),
+                          nurtureCycle: nurtureCycle(c) + 1,
+                          /* `contacted` is deliberately untouched — it's what
+                             marks this as a re-approach rather than a first touch */
+                          history: withLog(c, [logEntry("status", `↻ Restarted as nurture (cycle ${nurtureCycle(c) + 1})`)]).history,
+                        }
+                  ),
+                }
+          ),
+        };
+        /* status cleared means the linked pipeline row must go too */
+        return reconcileAccountApplications(next, accountId, oldContacts);
+      },
+      "↻ Reset — pick cold or warm when you write"
+    );
 
   /* Marks a contact as contacted from the card. Mirrors what the account
      modal's status control does — stamps the date and seeds the follow-up
@@ -9902,6 +9961,18 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
   const renderCalls = () => {
     const uncalled = callQueue.filter((r) => r.calls === 0).length;
     const picked = callQueue.filter((r) => r.pick !== -1).length;
+    /* Search only narrows the UNPICKED remainder. Filtering the run you've
+       already built would hide calls you're part-way through making, and the
+       point of searching here is to find someone to ADD — so the run stays
+       whole and visible while you look. */
+    const q = callSearch.trim().toLowerCase();
+    const matches = (r) =>
+      !q ||
+      `${r.contact.name || ""} ${r.contact.position || ""} ${r.company || ""} ${r.contact.phone || ""}`.toLowerCase().includes(q);
+    const run = callQueue.filter((r) => r.pick !== -1);
+    const rest = callQueue.filter((r) => r.pick === -1 && matches(r));
+    const hiddenBySearch = callQueue.filter((r) => r.pick === -1).length - rest.length;
+    const visible = [...run, ...rest];
     return (
       <>
         <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 12 }}>
@@ -9939,14 +10010,39 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
               </div>
             </div>
 
-            {callQueue.map((r, i) => (
-              /* keyed fragment via the long form would need a React import
-                 that this file doesn't have — a keyed <div> wrapper is simpler
-                 and carries the key without one */
+            {visible.map((r, i) => (
+              /* a keyed <div> wrapper rather than a fragment — the long form
+                 would need a React import this file doesn't have */
               <div key={r.contact.id}>
-              {/* where the chosen run ends and the ranked queue resumes */}
-              {picked > 0 && i === picked && (
-                <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, margin: "14px 0 6px" }}>REST OF QUEUE</div>
+              {/* where the chosen run ends and the searchable remainder starts */}
+              {i === picked && (
+                <div style={{ margin: "16px 0 8px" }}>
+                  {picked > 0 && <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, marginBottom: 6 }}>REST OF QUEUE</div>}
+                  <div style={{ position: "relative" }}>
+                    <input
+                      value={callSearch}
+                      onChange={(e) => setCallSearch(e.target.value)}
+                      placeholder="🔎 Search name, role, company or number…"
+                      style={{ ...inputStyle, padding: "9px 30px 9px 11px", fontSize: 13 }}
+                    />
+                    {callSearch && (
+                      <button
+                        onClick={() => setCallSearch("")}
+                        aria-label="Clear search"
+                        style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", color: C.muted, fontSize: 16, cursor: "pointer", padding: "2px 6px", lineHeight: 1 }}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
+                  {q && (
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 5 }}>
+                      {rest.length} {rest.length === 1 ? "match" : "matches"}
+                      {hiddenBySearch > 0 ? ` · ${hiddenBySearch} hidden` : ""}
+                      {picked > 0 ? " · your run stays above" : ""}
+                    </div>
+                  )}
+                </div>
               )}
               <div
                 style={{
@@ -10016,6 +10112,11 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
               </div>
               </div>
             ))}
+            {q && rest.length === 0 && (
+              <div style={{ color: C.muted, fontSize: 13, padding: "14px 4px", textAlign: "center", lineHeight: 1.6 }}>
+                Nobody in the queue matches &ldquo;{callSearch}&rdquo;. Only contacts with a phone number appear here.
+              </div>
+            )}
           </>
         )}
       </>
@@ -10439,6 +10540,10 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           onHistory={(c, company) => {
             setContactCard(null);
             setStandaloneHistory({ contact: c, company });
+          }}
+          onRestartNurture={(accountId, contactId) => {
+            restartNurture(accountId, contactId);
+            setContactCard(null);
           }}
           onGraduate={(accountId, contactId, kind) => {
             graduateContact(accountId, contactId, kind);
@@ -14041,7 +14146,7 @@ function ConnDot({ contact, style }) {
 /* One person, on their own. Opening a whole account to reach one contact
    buries them among colleagues — this shows just the card for the person you
    clicked, with the actions that belong to them. */
-function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount, onCall, onHistory, onGraduate }) {
+function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount, onCall, onHistory, onGraduate, onRestartNurture }) {
   const c = contact || {};
   const stale = liStaleDays(c);
   const nurture = nurtureState(c);
@@ -14118,6 +14223,8 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
             tone: LI_META(c.liStatus).color === "muted" ? C.muted : C[LI_META(c.liStatus).color],
           })}
           {line("CONTACTED", c.contacted || "not yet")}
+          {/* separate from CONTACTED on purpose — first touch vs last restart */}
+          {c.nurturedAt ? line("RESTARTED", `${c.nurturedAt}${nurtureCycle(c) > 1 ? ` · cycle ${nurtureCycle(c)}` : ""}`, null, { tone: C.muted }) : null}
           {c.notes ? line("NOTES", c.notes) : null}
         </div>
 
@@ -14188,7 +14295,21 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
             ⌛ {LI_META(c.liStatus).label} — LinkedIn won&apos;t accept a new request for another {liRetryIn(c)} day{liRetryIn(c) === 1 ? "" : "s"}.
           </div>
         )}
-        {nurture && <div style={{ fontSize: 11, color: nurture === "nurture" ? C.amber : C.muted, lineHeight: 1.5, marginBottom: 10 }}>🌱 {NURTURE_META[nurture].hint}</div>}
+        {nurture && (
+          <div style={{ background: nurture === "nurture" ? "rgba(245,185,66,0.07)" : "transparent", border: `1px solid ${nurture === "nurture" ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 10 }}>
+            <div style={{ fontSize: 11, color: nurture === "nurture" ? C.amber : C.muted, lineHeight: 1.5 }}>🌱 {NURTURE_META[nurture].hint}</div>
+            {onRestartNurture && (
+              <>
+                <Btn ghost onClick={() => onRestartNurture(accountId, c.id)} style={{ padding: "6px 11px", fontSize: 12, marginTop: 8 }}>
+                  ↻ Restart as a fresh approach
+                </Btn>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 5 }}>
+                  Clears the status and un-ticks the follow-ups so the next message starts a new cycle. The original contact date is kept.
+                </div>
+              </>
+            )}
+          </div>
+        )}
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <Btn ghost onClick={() => onCall(c, accountId)} style={{ flex: "1 1 90px", padding: "8px 10px", fontSize: 12 }}>
