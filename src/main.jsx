@@ -9972,7 +9972,78 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const run = callQueue.filter((r) => r.pick !== -1);
     const rest = callQueue.filter((r) => r.pick === -1 && matches(r));
     const hiddenBySearch = callQueue.filter((r) => r.pick === -1).length - rest.length;
-    const visible = [...run, ...rest];
+
+    /* one row, used by both lists */
+    const callRow = (r, i) => (
+      <div key={r.contact.id}>
+      <div
+        style={{
+          background: C.panel,
+          border: `1px solid ${r.pick !== -1 ? C.amber : r.calls === 0 ? C.amber : C.panelEdge}`,
+          opacity: picked > 0 && r.pick === -1 ? 0.72 : 1,
+          borderRadius: 12,
+          padding: "11px 13px",
+          marginBottom: 6,
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 10,
+          alignItems: "center",
+        }}
+      >
+        <div style={{ minWidth: 0, flex: 1, cursor: "pointer" }} onClick={() => setContactCard({ contact: r.contact, company: r.company, accountId: r.accountId })}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginRight: 7 }}>{i + 1}</span>
+            <ConnDot contact={r.contact} />
+            {r.contact.name || "Unnamed"}
+          </div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {[r.contact.position, r.company].filter(Boolean).join(" · ")}
+          </div>
+          <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 3 }}>
+            {r.contact.phone}
+            {r.calls === 0 ? " · never called" : ` · ${r.calls} call${r.calls === 1 ? "" : "s"}, last ${r.lastCall}`}
+            {r.due ? " · ⚑ due" : ""}
+            {/* knowing you last died at the opener changes how you open
+                this one — that's the whole point of tracking it */}
+            {r.contact.callStage && (
+              <span style={{ color: r.contact.callStage === "booked" ? C.green : C.blue }}> · best: {callStage(r.contact.callStage)?.label}</span>
+            )}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
+          <button
+            onClick={() => toggleCallSession(r.contact.id)}
+            title={r.pick !== -1 ? `#${r.pick + 1} in this run — tap to remove` : "Add to this run"}
+            style={{
+              width: 34,
+              height: 42,
+              background: "transparent",
+              border: `1px solid ${r.pick !== -1 ? C.amber : C.panelEdge}`,
+              color: r.pick !== -1 ? C.amber : C.muted,
+              borderRadius: 10,
+              cursor: "pointer",
+              fontFamily: mono,
+              fontSize: 12,
+              fontWeight: 800,
+              flexShrink: 0,
+            }}
+          >
+            {r.pick !== -1 ? r.pick + 1 : "+"}
+          </button>
+          <a
+            href={`tel:${r.contact.phone}`}
+            style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 42, height: 42, border: `1px solid ${C.green}`, color: C.green, borderRadius: 10, textDecoration: "none", fontSize: 16 }}
+            title={`Call ${r.contact.phone}`}
+          >
+            ☎
+          </a>
+          <Btn ghost onClick={() => setCallQueueContact(r)} style={{ padding: "0 10px", height: 42, fontSize: 12, flexShrink: 0 }}>
+            Log
+          </Btn>
+        </div>
+      </div>
+      </div>
+    );
     return (
       <>
         <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 12 }}>
@@ -10010,108 +10081,44 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
               </div>
             </div>
 
-            {visible.map((r, i) => (
-              /* a keyed <div> wrapper rather than a fragment — the long form
-                 would need a React import this file doesn't have */
-              <div key={r.contact.id}>
-              {/* where the chosen run ends and the searchable remainder starts */}
-              {i === picked && (
-                <div style={{ margin: "16px 0 8px" }}>
-                  {picked > 0 && <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, marginBottom: 6 }}>REST OF QUEUE</div>}
-                  <div style={{ position: "relative" }}>
-                    <input
-                      value={callSearch}
-                      onChange={(e) => setCallSearch(e.target.value)}
-                      placeholder="🔎 Search name, role, company or number…"
-                      style={{ ...inputStyle, padding: "9px 30px 9px 11px", fontSize: 13 }}
-                    />
-                    {callSearch && (
-                      <button
-                        onClick={() => setCallSearch("")}
-                        aria-label="Clear search"
-                        style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", color: C.muted, fontSize: 16, cursor: "pointer", padding: "2px 6px", lineHeight: 1 }}
-                      >
-                        ×
-                      </button>
-                    )}
-                  </div>
-                  {q && (
-                    <div style={{ fontSize: 11, color: C.muted, marginTop: 5 }}>
-                      {rest.length} {rest.length === 1 ? "match" : "matches"}
-                      {hiddenBySearch > 0 ? ` · ${hiddenBySearch} hidden` : ""}
-                      {picked > 0 ? " · your run stays above" : ""}
-                    </div>
-                  )}
+            {/* Run and remainder are rendered as SEPARATE lists with the search
+                box between them. It used to sit inside a single map at the
+                divider index, which broke twice: with no matches the map
+                rendered nothing so the box vanished, and every keystroke
+                changed the key of the element holding it, so React remounted
+                the input and focus was lost after each character. */}
+            {run.map((r, i) => callRow(r, i))}
+
+            <div style={{ margin: "16px 0 8px" }}>
+              {picked > 0 && <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, marginBottom: 6 }}>REST OF QUEUE</div>}
+              <div style={{ position: "relative" }}>
+                <input
+                  value={callSearch}
+                  onChange={(e) => setCallSearch(e.target.value)}
+                  placeholder="🔎 Search name, role, company or number…"
+                  style={{ ...inputStyle, padding: "9px 30px 9px 11px", fontSize: 13 }}
+                />
+                {callSearch && (
+                  <button
+                    onClick={() => setCallSearch("")}
+                    aria-label="Clear search"
+                    style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", color: C.muted, fontSize: 16, cursor: "pointer", padding: "2px 6px", lineHeight: 1 }}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+              {q && (
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 5 }}>
+                  {rest.length} {rest.length === 1 ? "match" : "matches"}
+                  {hiddenBySearch > 0 ? ` · ${hiddenBySearch} hidden` : ""}
+                  {picked > 0 ? " · your run stays above" : ""}
                 </div>
               )}
-              <div
-                style={{
-                  background: C.panel,
-                  border: `1px solid ${r.pick !== -1 ? C.amber : r.calls === 0 ? C.amber : C.panelEdge}`,
-                  opacity: picked > 0 && r.pick === -1 ? 0.72 : 1,
-                  borderRadius: 12,
-                  padding: "11px 13px",
-                  marginBottom: 6,
-                  display: "flex",
-                  justifyContent: "space-between",
-                  gap: 10,
-                  alignItems: "center",
-                }}
-              >
-                <div style={{ minWidth: 0, flex: 1, cursor: "pointer" }} onClick={() => setContactCard({ contact: r.contact, company: r.company, accountId: r.accountId })}>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginRight: 7 }}>{i + 1}</span>
-                    <ConnDot contact={r.contact} />
-                    {r.contact.name || "Unnamed"}
-                  </div>
-                  <div style={{ fontSize: 11, color: C.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {[r.contact.position, r.company].filter(Boolean).join(" · ")}
-                  </div>
-                  <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 3 }}>
-                    {r.contact.phone}
-                    {r.calls === 0 ? " · never called" : ` · ${r.calls} call${r.calls === 1 ? "" : "s"}, last ${r.lastCall}`}
-                    {r.due ? " · ⚑ due" : ""}
-                    {/* knowing you last died at the opener changes how you open
-                        this one — that's the whole point of tracking it */}
-                    {r.contact.callStage && (
-                      <span style={{ color: r.contact.callStage === "booked" ? C.green : C.blue }}> · best: {callStage(r.contact.callStage)?.label}</span>
-                    )}
-                  </div>
-                </div>
-                <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
-                  <button
-                    onClick={() => toggleCallSession(r.contact.id)}
-                    title={r.pick !== -1 ? `#${r.pick + 1} in this run — tap to remove` : "Add to this run"}
-                    style={{
-                      width: 34,
-                      height: 42,
-                      background: "transparent",
-                      border: `1px solid ${r.pick !== -1 ? C.amber : C.panelEdge}`,
-                      color: r.pick !== -1 ? C.amber : C.muted,
-                      borderRadius: 10,
-                      cursor: "pointer",
-                      fontFamily: mono,
-                      fontSize: 12,
-                      fontWeight: 800,
-                      flexShrink: 0,
-                    }}
-                  >
-                    {r.pick !== -1 ? r.pick + 1 : "+"}
-                  </button>
-                  <a
-                    href={`tel:${r.contact.phone}`}
-                    style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 42, height: 42, border: `1px solid ${C.green}`, color: C.green, borderRadius: 10, textDecoration: "none", fontSize: 16 }}
-                    title={`Call ${r.contact.phone}`}
-                  >
-                    ☎
-                  </a>
-                  <Btn ghost onClick={() => setCallQueueContact(r)} style={{ padding: "0 10px", height: 42, fontSize: 12, flexShrink: 0 }}>
-                    Log
-                  </Btn>
-                </div>
-              </div>
-              </div>
-            ))}
+            </div>
+
+            {/* numbering continues past the run so positions stay unique */}
+            {rest.map((r, i) => callRow(r, picked + i))}
             {q && rest.length === 0 && (
               <div style={{ color: C.muted, fontSize: 13, padding: "14px 4px", textAlign: "center", lineHeight: 1.6 }}>
                 Nobody in the queue matches &ldquo;{callSearch}&rdquo;. Only contacts with a phone number appear here.
