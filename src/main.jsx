@@ -2313,6 +2313,44 @@ function followUpDueDate(contacted, fus, index) {
   for (let i = 0; i <= index; i++) totalDays += +fus[i]?.days || 0;
   return addDays(contacted, totalDays);
 }
+/* ---- scheduling a call-back ----
+   The schedule is CUMULATIVE: [3, 7, 14] means days 3, 10 and 24 after
+   contact, not three separate offsets. Appending a call-back as `{days: 7}`
+   therefore landed it 7 days after the LAST follow-up rather than 7 days from
+   today — in testing a 7-day call-back came due in 12 — and queued behind any
+   older pending item, so a commitment made to a human was deprioritised.
+
+   This inserts it at the CHRONOLOGICALLY correct slot and back-solves its
+   `days` so the cumulative total resolves to the date you picked. The item
+   that follows absorbs the difference, so every other follow-up keeps the date
+   it already had. */
+function insertCallback(contacted, fus, daysFromToday) {
+  const list = (fus || []).map((x) => ({ ...x }));
+  const target = addDays(today(), daysFromToday);
+  /* the absolute date each existing item currently resolves to */
+  const dates = [];
+  let run = 0;
+  list.forEach((x) => {
+    run += +x.days || 0;
+    dates.push(addDays(contacted, run));
+  });
+  /* first PENDING item that falls on or after the call-back — done items are
+     history and never move */
+  let at = list.length;
+  for (let i = 0; i < list.length; i++) {
+    if (!list[i].done && dates[i] >= target) {
+      at = i;
+      break;
+    }
+  }
+  let elapsed = 0;
+  for (let i = 0; i < at; i++) elapsed += +list[i]?.days || 0;
+  const gap = Math.max(0, Math.round((new Date(target) - new Date(addDays(contacted, elapsed))) / 86400000));
+  if (at < list.length) list[at] = { ...list[at], days: Math.max(0, (+list[at].days || 0) - gap) };
+  list.splice(at, 0, { days: gap, done: false, doneAt: "", channel: "Phone call", fromCallback: true });
+  return list;
+}
+
 /* next pending follow-up → {date, index, total} or null when all done / no contact date */
 const nextFollowUp = (a) => {
   if (!a.contacted) return null;
@@ -3792,7 +3830,7 @@ export default function FlightDeck() {
                   /* the call-back becomes a real dated follow-up rather than a
                      promise buried in a note */
                   if (callbackDays > 0) {
-                    next.followUps = [...(next.followUps || c.followUps || []), { days: callbackDays, done: false, doneAt: "", channel: "Phone call", fromCallback: true }];
+                    next.followUps = insertCallback(next.contacted || c.contacted || today(), next.followUps || c.followUps || [], callbackDays);
                   }
                   if (CALL_CLOSES.includes(outcome)) next.status = "closed";
                   if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
@@ -4210,7 +4248,13 @@ export default function FlightDeck() {
         .sort((a, b) => (engagementDueDate(a) || "9999-12-31").localeCompare(engagementDueDate(b) || "9999-12-31")),
     [state.accounts]
   );
-  const totalDueCount = dueList.length + dueContactsCount;
+  /* A contact graduated from an account exists TWICE — as the contact and as
+     its linked application, both carrying the same follow-up schedule. Adding
+     the two lists counted every account-derived lead twice, so the DUE badge
+     read roughly double once the pool started graduating people.
+     `fromAccountContact` marks the application copy, so excluding those leaves
+     one row per person. */
+  const totalDueCount = dueList.filter((a) => !a.fromAccountContact).length + dueContactsCount;
   const housekeepingProposals = useMemo(() => {
     /* a skipped entry stays hidden until its snooze expires, so the badge
        count reflects what's actually waiting on a decision */
@@ -10981,7 +11025,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 }
                 if (stage && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
                 if (callbackDays > 0) {
-                  next.followUps = [...(next.followUps || c.followUps || []), { days: callbackDays, done: false, doneAt: "", channel: "Phone call", fromCallback: true }];
+                  next.followUps = insertCallback(next.contacted || c.contacted || today(), next.followUps || c.followUps || [], callbackDays);
                 }
                 if (CALL_CLOSES.includes(outcome)) next.status = "closed";
                 if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
