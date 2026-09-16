@@ -8434,6 +8434,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           { key: "dueContacts", label: `⚑ Due (${accounts.filter((a) => (a.contacts || []).some((c) => isContactDue(c) && !c.archivedAt)).length})` },
           { key: "engageDue", label: `💬 Engage (${allContacts.filter(isEngagementDue).length})` },
           { key: "callable", label: `☎ Callable (${allContacts.filter((c) => (c.phone || "").trim() && c.status !== "closed").length})` },
+          /* the counterpart to Callable: people you can't ring yet. A missing
+             number is a research gap rather than a lead problem, and it's the
+             only thing standing between these contacts and the call queue. */
+          { key: "noPhone", label: `☎ No number (${allContacts.filter((c) => !(c.phone || "").trim() && c.status !== "closed").length})` },
           { key: "untouched", label: `🕳 No one reached (${accounts.filter((a) => isAccountOpen(a) && isAccountUntouched(a)).length})` },
           { key: "notContacted", label: `◻ Not contacted (${allContacts.filter(isContactBlankStatus).length})` },
         ],
@@ -8485,6 +8489,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? liveContacts(acc).some((c) => liRetryIn(c) > 0)
           : accFilter === "callable"
           ? liveContacts(acc).some((c) => (c.phone || "").trim() && c.status !== "closed")
+          : accFilter === "noPhone"
+          ? liveContacts(acc).some((c) => !(c.phone || "").trim() && c.status !== "closed")
           : accFilter === "nurture"
           ? liveContacts(acc).some((c) => nurtureState(c) === "nurture")
           : accFilter === "coldGone"
@@ -8522,7 +8528,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
-    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable", "liNone", "liRetry", "liWaiting"].includes(accFilter);
+    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable", "noPhone", "liNone", "liRetry", "liWaiting"].includes(accFilter);
 
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
@@ -8547,6 +8553,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               ? liRetryIn(c) > 0
               : accFilter === "callable"
               ? (c.phone || "").trim() && c.status !== "closed"
+              : accFilter === "noPhone"
+              ? !(c.phone || "").trim() && c.status !== "closed"
               : accFilter === "nurture"
               ? nurtureState(c) === "nurture"
               : accFilter === "coldGone"
