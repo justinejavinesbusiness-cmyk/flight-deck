@@ -6421,6 +6421,30 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
      many replies you got; these say whether you actually worked the leads —
      the most common reason a search underperforms isn't the message, it's
      stopping after one touch. */
+  /* ---- call metrics ----
+     Calling has its own conversion problem, separate from email: you can dial
+     a hundred numbers and the useful question isn't how many you rang, it's
+     how many picked up and how far those conversations got. Connect rate
+     diagnoses the list and the time of day; the stage spread diagnoses the
+     script. Both are invisible in the funnel, which only sees the outcome. */
+  const callStats = useMemo(() => {
+    const contacts = (state.accounts || []).flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt));
+    const calls = contacts.flatMap((c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => ({ ...t, contact: c })));
+    const since = addDays(today(), -30);
+    const recent = calls.filter((t) => t.date >= since);
+    /* the note carries the outcome label, which is the only place the result
+       of an individual call is recorded */
+    const isConnect = (t) => /Spoke with them|Asked to call back/i.test(t.note || "");
+    const connects = recent.filter(isConnect).length;
+    const connectRate = recent.length ? Math.round((connects / recent.length) * 100) : null;
+    /* best stage reached, per contact — the spread says where calls die */
+    const staged = contacts.filter((c) => c.callStage);
+    const spread = CALL_STAGES.map((st) => ({ ...st, n: staged.filter((c) => c.callStage === st.key).length })).filter((x) => x.n > 0);
+    const booked = contacts.filter((c) => c.callStage === "booked").length;
+    const worstStage = spread.length ? spread.reduce((w, x) => (x.n > w.n ? x : w)) : null;
+    return { total: calls.length, recent: recent.length, connects, connectRate, spread, booked, staged: staged.length, worstStage };
+  }, [state.accounts]);
+
   const outreachStats = useMemo(() => {
     const leads = apps.filter((a) => !a.archivedAt && !a.tombstoned && a.contacted && !isBlankStatus(a));
     const contacts = (state.accounts || []).flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt && c.contacted && c.status));
@@ -6667,6 +6691,68 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         ))}
       </div>
+
+      {/* ---- call metrics ----
+          Only shown once you've actually made calls — an empty card teaching
+          you about connect rates before you've dialled anyone is clutter. */}
+      {callStats.total > 0 && (
+        <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+          <Label>☎ Calls</Label>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 8 }}>
+            <div style={{ flex: "1 1 104px" }}>
+              <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: C.ink }}>{callStats.recent}</div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>
+                calls · 30 days
+                <div style={{ fontFamily: mono, fontSize: 9 }}>{callStats.total} all time</div>
+              </div>
+            </div>
+            <div style={{ flex: "1 1 104px" }}>
+              <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: callStats.connectRate === null ? C.muted : callStats.connectRate >= 20 ? C.green : callStats.connectRate >= 10 ? C.amber : C.red }}>
+                {callStats.connectRate === null ? "—" : `${callStats.connectRate}%`}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>
+                reached someone
+                <div style={{ fontFamily: mono, fontSize: 9 }}>
+                  {callStats.connects}/{callStats.recent}
+                </div>
+              </div>
+            </div>
+            <div style={{ flex: "1 1 104px" }}>
+              <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 800, color: callStats.booked ? C.green : C.muted }}>{callStats.booked}</div>
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.4 }}>meetings booked</div>
+            </div>
+          </div>
+
+          {/* where conversations die — the part the funnel can't show */}
+          {callStats.spread.length > 0 && (
+            <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.panelEdge}` }}>
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, marginBottom: 6 }}>FURTHEST STAGE REACHED</div>
+              {callStats.spread.map((x) => (
+                <div key={x.key} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, marginBottom: 3 }}>
+                  <span style={{ color: x.key === "booked" ? C.green : C.ink, minWidth: 0, flexShrink: 0, width: 128, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{x.label}</span>
+                  <span style={{ flex: 1, height: 5, background: C.bg, borderRadius: 3, overflow: "hidden", minWidth: 30 }}>
+                    <span style={{ display: "block", height: "100%", width: `${Math.round((x.n / callStats.staged) * 100)}%`, background: x.key === "booked" ? C.green : x.key === "nostart" || x.key === "opener" ? C.red : C.amber, borderRadius: 3 }} />
+                  </span>
+                  <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, flexShrink: 0 }}>{x.n}</span>
+                </div>
+              ))}
+              {callStats.worstStage && (
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 8 }}>
+                  {["nostart", "opener"].includes(callStats.worstStage.key)
+                    ? "Most calls end at the opener — that's the first fifteen seconds, and it's the cheapest thing to rewrite."
+                    : callStats.worstStage.key === "pitch"
+                    ? "Calls reach the pitch and stop there. Worth shortening it and asking a question sooner."
+                    : callStats.worstStage.key === "objection"
+                    ? "You're getting to objections, which means the opener works. This is the stage that rewards rehearsal."
+                    : callStats.worstStage.key === "interest"
+                    ? "People are interested but not booking. The ask at the end is the thing to change."
+                    : "Most calls that connect end in a booking — keep doing what you're doing."}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ---- outreach discipline ----
           Sits above the funnel because it explains it: a low reply rate with
@@ -9975,6 +10061,9 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       return { ...st, callSession: cur.includes(contactId) ? cur.filter((x) => x !== contactId) : [...cur, contactId] };
     });
   const clearCallSession = () => mutate((st) => ({ ...st, callSession: [] }), "Run cleared");
+  /* silent: it fires as part of logging a call, and a second toast on top of
+     the call confirmation would just be noise */
+  const dropFromCallSession = (contactId) => mutate((st) => ({ ...st, callSession: (st.callSession || []).filter((x) => x !== contactId) }));
 
   const callQueue = useMemo(() => {
     const rows = (state.accounts || []).flatMap((acc) =>
@@ -9986,7 +10075,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
     const session = state.callSession || [];
     return rows
-      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact), pick: session.indexOf(r.contact.id) }))
+      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact), dueDate: followUpOf(r.contact), pick: session.indexOf(r.contact.id) }))
       .sort(
         (a, b) =>
           /* anything you picked leads, in the order you picked it — a manual
@@ -10023,8 +10112,13 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       <div
         style={{
           background: C.panel,
-          border: `1px solid ${r.pick !== -1 ? C.amber : r.calls === 0 ? C.amber : C.panelEdge}`,
-          opacity: picked > 0 && r.pick === -1 ? 0.72 : 1,
+          /* Due beats never-called for the border: "you said you'd call today"
+             outranks "you've not called yet". Picked rows keep the amber run
+             colour so the run still reads as one block. */
+          border: `1px solid ${r.pick !== -1 ? C.amber : r.due ? C.red : r.calls === 0 ? C.amber : C.panelEdge}`,
+          /* a due row is never dimmed — dimming the thing you're overdue on is
+             the opposite of highlighting it */
+          opacity: picked > 0 && r.pick === -1 && !r.due ? 0.72 : 1,
           borderRadius: 12,
           padding: "11px 13px",
           marginBottom: 6,
@@ -10046,7 +10140,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 3 }}>
             {r.contact.phone}
             {r.calls === 0 ? " · never called" : ` · ${r.calls} call${r.calls === 1 ? "" : "s"}, last ${r.lastCall}`}
-            {r.due ? " · ⚑ due" : ""}
+            {r.due && <span style={{ color: C.red, fontWeight: 800 }}> · ⚑ DUE {r.dueDate}</span>}
             {/* knowing you last died at the opener changes how you open
                 this one — that's the whole point of tracking it */}
             {r.contact.callStage && (
@@ -10464,6 +10558,10 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           onRestoreSnapshot={restoreSnapshot}
           onExportSnapshot={exportSnapshot}
           onExportCurrent={exportCurrent}
+          /* so a call logged from inside the account modal also clears that
+             person from the call run — otherwise the run only empties when you
+             happen to log from the queue */
+          onCallLogged={dropFromCallSession}
           onImportBackup={importBackupFile}
           onDeleteSnapshot={(d) => {
             deleteSnapshot(d);
@@ -10585,6 +10683,8 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             if (acc) setModal({ kind: "account", entry: acc });
           }}
           onCall={(c, accountId) => {
+            /* routed through the same modal as the queue, so logging from the
+               card also drops them from the run */
             setContactCard(null);
             setCallQueueContact({ contact: c, accountId, company: contactCard.company });
           }}
@@ -10610,6 +10710,10 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           onClose={() => setCallQueueContact(null)}
           onSave={(payload) => {
             logCallOnContact(callQueueContact.accountId, callQueueContact.contact.id, payload);
+            /* the call is made, so they leave the run — the run is "who's left
+               to dial", and a name that stays after you've called it makes the
+               remaining count meaningless */
+            dropFromCallSession(callQueueContact.contact.id);
             setCallQueueContact(null);
           }}
         />
@@ -10674,7 +10778,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
   );
 }
 /* ---------- edit modal (centered) ---------- */
-function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft, isDesktop, snapshots, onRestoreSnapshot, onExportSnapshot, onDeleteSnapshot, onExportCurrent, onImportBackup }) {
+function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft, isDesktop, snapshots, onRestoreSnapshot, onExportSnapshot, onDeleteSnapshot, onExportCurrent, onImportBackup, onCallLogged }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
     if (kind === "application") {
@@ -11036,6 +11140,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             }));
             /* no toast here: `flash` lives in the parent, and the logged call
                is immediately visible in the contact's touch points and history */
+            if (onCallLogged) onCallLogged(callContact.contact.id);
             setCallContact(null);
           }}
         />
