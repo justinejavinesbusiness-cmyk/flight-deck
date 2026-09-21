@@ -338,6 +338,10 @@ const LI_STATUSES = [
   { key: "declined", label: "Declined / ignored", color: "red" },
   { key: "withdrawn", label: "Withdrawn", color: "muted" },
   { key: "na", label: "Messaged without connecting", color: "blue" },
+  /* Blocked is terminal in a way the others aren't: withdrawn and declined
+     reopen after three weeks, but a block has no expiry and no retry. It sits
+     last because it's the outcome you reach for least. */
+  { key: "blocked", label: "Blocked", color: "red" },
 ];
 const LI_META = (k) => LI_STATUSES.find((x) => x.key === (k || "")) || LI_STATUSES[0];
 const LI_STALE_DAYS = 7;
@@ -2308,10 +2312,36 @@ const normFollowUps = (a) => {
    its own. So with the default 3/7/14, the due dates land at day 3, day 10
    (3+7), and day 24 (3+7+14) after the application — not independently at
    day 3/7/14. A gap of 1 correctly means "the very next calendar day". */
+/* ---- follow-up tracks ----
+   Email and phone run as SEPARATE cadences off the same contact date. They
+   used to share one cumulative sequence, which crossed the wires both ways:
+   a phone follow-up's due date got pushed out by every email follow-up
+   scheduled before it, and logging a call ticked whichever follow-up was next
+   even when that one was an email you hadn't sent.
+
+   The channel already on each entry is the track. Entries with no channel
+   (everything written before this) form one default track together, so
+   existing schedules behave exactly as they did. */
+const trackOf = (fu) => (fu?.channel || "").trim();
+
+/* days accumulate only within the entry's own track */
 function followUpDueDate(contacted, fus, index) {
+  const track = trackOf(fus?.[index]);
   let totalDays = 0;
-  for (let i = 0; i <= index; i++) totalDays += +fus[i]?.days || 0;
+  for (let i = 0; i <= index; i++) {
+    if (trackOf(fus[i]) !== track) continue;
+    totalDays += +fus[i]?.days || 0;
+  }
   return addDays(contacted, totalDays);
+}
+
+/* next pending entry on one track, or across all when no track is given */
+function nextFollowUpOn(a, track) {
+  if (!a?.contacted) return null;
+  const fus = normFollowUps(a);
+  const i = fus.findIndex((f) => !f.done && (track === undefined || trackOf(f) === track));
+  if (i === -1) return null;
+  return { date: followUpDueDate(a.contacted, fus, i), index: i, total: fus.length, track: trackOf(fus[i]) };
 }
 /* ---- scheduling a call-back ----
    The schedule is CUMULATIVE: [3, 7, 14] means days 3, 10 and 24 after
@@ -2327,37 +2357,49 @@ function followUpDueDate(contacted, fus, index) {
 function insertCallback(contacted, fus, daysFromToday) {
   const list = (fus || []).map((x) => ({ ...x }));
   const target = addDays(today(), daysFromToday);
-  /* the absolute date each existing item currently resolves to */
+  const TRACK = "Phone call";
+  /* Everything here works within the PHONE track only. Days accumulate per
+     track, so an email follow-up sitting between two calls neither shifts the
+     call-back's date nor gets shifted by it. */
   const dates = [];
   let run = 0;
   list.forEach((x) => {
-    run += +x.days || 0;
-    dates.push(addDays(contacted, run));
+    if (trackOf(x) === TRACK) run += +x.days || 0;
+    dates.push(trackOf(x) === TRACK ? addDays(contacted, run) : null);
   });
-  /* first PENDING item that falls on or after the call-back — done items are
+  /* first PENDING phone item on or after the call-back — done items are
      history and never move */
   let at = list.length;
   for (let i = 0; i < list.length; i++) {
-    if (!list[i].done && dates[i] >= target) {
+    if (trackOf(list[i]) === TRACK && !list[i].done && dates[i] >= target) {
       at = i;
       break;
     }
   }
   let elapsed = 0;
-  for (let i = 0; i < at; i++) elapsed += +list[i]?.days || 0;
+  for (let i = 0; i < at; i++) if (trackOf(list[i]) === TRACK) elapsed += +list[i]?.days || 0;
   const gap = Math.max(0, Math.round((new Date(target) - new Date(addDays(contacted, elapsed))) / 86400000));
-  if (at < list.length) list[at] = { ...list[at], days: Math.max(0, (+list[at].days || 0) - gap) };
-  list.splice(at, 0, { days: gap, done: false, doneAt: "", channel: "Phone call", fromCallback: true });
+  if (at < list.length && trackOf(list[at]) === TRACK) list[at] = { ...list[at], days: Math.max(0, (+list[at].days || 0) - gap) };
+  list.splice(at, 0, { days: gap, done: false, doneAt: "", channel: TRACK, fromCallback: true });
   return list;
 }
 
 /* next pending follow-up → {date, index, total} or null when all done / no contact date */
+/* The soonest pending entry across ALL tracks. With email and phone running
+   independently, the first pending entry in array order is no longer
+   necessarily the earliest by date — a phone follow-up listed second can fall
+   due before an email listed first. Picking by index would have reported the
+   later date and hidden an overdue call from the due queue. */
 const nextFollowUp = (a) => {
   if (!a.contacted) return null;
   const fus = normFollowUps(a);
-  const i = fus.findIndex((f) => !f.done);
-  if (i === -1) return null;
-  return { date: followUpDueDate(a.contacted, fus, i), index: i, total: fus.length };
+  let best = null;
+  fus.forEach((f, i) => {
+    if (f.done) return;
+    const date = followUpDueDate(a.contacted, fus, i);
+    if (!best || date < best.date) best = { date, index: i, total: fus.length, track: trackOf(f) };
+  });
+  return best;
 };
 const followUpOf = (a) => nextFollowUp(a)?.date || "";
 
@@ -3822,7 +3864,11 @@ export default function FlightDeck() {
                     status: c.status || "outreach",
                   };
                   if (tickFollowUp && followUpIndex >= 0) {
-                    next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex ? { ...x, done: true, doneAt: today(), channel: "Phone call" } : x));
+                    next.followUps = (c.followUps || []).map((x, k) =>
+                      /* guard: only tick if that index really is a phone entry,
+                         so a stale index can't mark an email as sent */
+                      k === followUpIndex && trackOf(x) === "Phone call" ? { ...x, done: true, doneAt: today() } : x
+                    );
                   }
                   /* furthest stage ever reached on this contact, so a weaker
                      later call doesn't erase a better earlier one */
@@ -7238,6 +7284,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       },
       { key: "checkPost", label: `⚠ Check posting (${apps.filter((a) => postingNeedsCheck(a) && !a.archivedAt).length})` },
       { key: "fromPool", label: `🎯 From pool (${apps.filter((a) => isFromPool(a) && !a.archivedAt).length})` },
+      { key: "tombstoned", label: `🪦 Stripped (${apps.filter((a) => a.tombstoned).length})` },
       {
         key: "liPending",
         label: `in ${apps.filter((a) => !a.archivedAt && liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt }) > 0).length} pending`,
@@ -7247,10 +7294,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       { key: "noReply", label: `🔇 Closed, no reply (${apps.filter((a) => isRejectedNoReply(a) && !a.archivedAt).length})` },
       { key: "closed", label: `Closed (${apps.filter((a) => !isOpenApp(a) && !a.archivedAt).length})` },
       { key: "all", label: `All (${apps.filter((a) => !a.archivedAt).length})` },
-      { key: "archived", label: `🗄 Archived (${apps.filter((a) => !!a.archivedAt).length})` },
+      { key: "archived", label: `🗄 Archived (${apps.filter((a) => !!a.archivedAt && !a.tombstoned).length})` },
     ];
     const shown = apps
-      .filter((a) => (pipeFilter === "archived" ? !!a.archivedAt : !a.archivedAt))
+      /* Tombstoned entries were stripped to a bare record 30 days after
+         archiving — company, role, contact and email are all gone by design.
+         Left in the Archived list they rendered as rows of empty placeholders,
+         which reads as data corruption rather than "this is a retired stub".
+         They get their own tab instead. */
+      .filter((a) =>
+        pipeFilter === "tombstoned" ? !!a.tombstoned : pipeFilter === "archived" ? !!a.archivedAt && !a.tombstoned : !a.archivedAt
+      )
       .filter((a) =>
         pipeFilter === "due"
           ? isDue(a)
@@ -7610,6 +7664,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         )}
 
+        {pipeFilter === "tombstoned" && (
+          <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "11px 14px", marginBottom: 10, fontSize: 12, color: C.muted, lineHeight: 1.55 }}>
+            🪦 <strong style={{ color: C.ink }}>Stripped records.</strong> {HOUSEKEEPING_TOMBSTONE_DAYS} days after archiving, an entry is reduced to a stub — status, outreach
+            type and dates only. Company, role, contact and links are deleted to keep the synced payload small. They still count in your funnel totals, which is why they&apos;re
+            kept at all. Restoring brings the stub back, but the deleted fields are gone — the CSV backup is where the full record lives.
+          </div>
+        )}
+
         {isDesktop ? (
           <>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
@@ -7857,7 +7919,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       </td>
                       <td style={{ ...td, minWidth: 130 }}>
                         {cellInput(a, "role", { ph: "Role applied for" })}
-                        {a.archivedAt && pipeFilter === "archived" && (
+                        {a.archivedAt && ["archived", "tombstoned"].includes(pipeFilter) && (
                           <div style={{ marginTop: 3 }}>
                             {a.autoArchived && (
                               <div style={{ fontFamily: mono, fontSize: 9, color: C.muted, letterSpacing: 0.4, marginBottom: 2 }}>🗄 NO ANSWER · FILED {a.archivedAt}</div>
@@ -8245,7 +8307,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       <td style={{ ...td, fontWeight: 700, borderLeft: due ? `3px solid ${C.red}` : "3px solid transparent", minWidth: 150 }}>
                         {a.company || "Unnamed"}
                         {a.role && <div style={{ fontSize: 11, color: C.muted, fontWeight: 400 }}>{a.role}</div>}
-                        {a.archivedAt && pipeFilter === "archived" && (
+                        {a.archivedAt && ["archived", "tombstoned"].includes(pipeFilter) && (
                           <span
                             onClick={(e) => {
                               e.stopPropagation();
@@ -8460,6 +8522,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           { key: "liPending", label: `⏳ Pending 7d+ (${allContacts.filter((c) => liStaleDays(c) > 0).length})` },
           { key: "connected", label: `● Connected (${allContacts.filter((c) => c.liStatus === "connected").length})` },
           { key: "liRetry", label: `↻ Can retry (${allContacts.filter((c) => liRetryDays(c) > 0).length})` },
+          { key: "liBlocked", label: `⊘ Blocked (${allContacts.filter((c) => c.liStatus === "blocked").length})` },
           { key: "liWaiting", label: `⌛ Wait (${allContacts.filter((c) => liRetryIn(c) > 0).length})` },
         ],
       },
@@ -8485,6 +8548,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? liveContacts(acc).some((c) => (c.linkedin || "").trim() && !c.liStatus)
           : accFilter === "liRetry"
           ? liveContacts(acc).some((c) => liRetryDays(c) > 0)
+          : accFilter === "liBlocked"
+          ? liveContacts(acc).some((c) => c.liStatus === "blocked")
           : accFilter === "liWaiting"
           ? liveContacts(acc).some((c) => liRetryIn(c) > 0)
           : accFilter === "callable"
@@ -8528,7 +8593,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
-    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable", "noPhone", "liNone", "liRetry", "liWaiting"].includes(accFilter);
+    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable", "noPhone", "liNone", "liRetry", "liWaiting", "liBlocked"].includes(accFilter);
 
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
@@ -8549,6 +8614,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               ? (c.linkedin || "").trim() && !c.liStatus
               : accFilter === "liRetry"
               ? liRetryDays(c) > 0
+              : accFilter === "liBlocked"
+              ? c.liStatus === "blocked"
               : accFilter === "liWaiting"
               ? liRetryIn(c) > 0
               : accFilter === "callable"
@@ -11133,7 +11200,11 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   status: c.status || "outreach",
                 };
                 if (tickFollowUp && followUpIndex >= 0) {
-                  next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex ? { ...x, done: true, doneAt: today(), channel: "Phone call" } : x));
+                  next.followUps = (c.followUps || []).map((x, k) =>
+                      /* guard: only tick if that index really is a phone entry,
+                         so a stale index can't mark an email as sent */
+                      k === followUpIndex && trackOf(x) === "Phone call" ? { ...x, done: true, doneAt: today() } : x
+                    );
                 }
                 if (stage && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
                 if (callbackDays > 0) {
@@ -14069,7 +14140,13 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
   const [callbackDays, setCallbackDays] = useState(0);
   const picked = callOutcome(outcome);
   const fus = Array.isArray(contact.followUps) ? contact.followUps : [];
-  const nextUnticked = fus.findIndex((x) => !x.done);
+  /* only a PHONE follow-up can be ticked by a call. Ticking the next entry
+     regardless of channel meant logging a call marked an email you hadn't
+     sent as done — the two tracks crossed. */
+  const nextUnticked = fus.findIndex((x) => !x.done && trackOf(x) === "Phone call");
+  /* its position within the phone track, so the label reads "phone follow-up 2"
+     rather than its index in the combined array */
+  const phonePos = nextUnticked === -1 ? -1 : fus.slice(0, nextUnticked + 1).filter((x) => trackOf(x) === "Phone call").length;
   const toneCol = (t) => (t === "green" ? C.green : t === "red" ? C.red : t === "blue" ? C.blue : t === "amber" ? C.amber : C.muted);
   const past = (contact.touchpoints || []).filter((t) => t.channel === "Phone call");
   return (
@@ -14243,18 +14320,18 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
               marginBottom: 10,
             }}
           >
-            {tickFollowUp ? "☑" : "☐"} Also tick follow-up {nextUnticked + 1}
+            {tickFollowUp ? "☑" : "☐"} Also tick phone follow-up {phonePos}
           </button>
         )}
         {picked && !picked.landed && tickFollowUp && nextUnticked !== -1 && (
           <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
-            You didn&apos;t reach them this time. The call still counts as follow-up {nextUnticked + 1} — untick above if you&apos;d rather keep that slot for an attempt that
-            actually connects.
+            You didn&apos;t reach them this time. The call still counts as phone follow-up {phonePos} — untick above if you&apos;d rather keep that slot for an attempt that
+            actually connects. Your email follow-ups are untouched either way.
           </div>
         )}
         {picked && nextUnticked === -1 && (
           <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
-            Every scheduled follow-up is already done, so this logs as a touch point only.
+            No phone follow-up is pending, so this logs as a touch point only. Email follow-ups are a separate track and aren&apos;t affected.
           </div>
         )}
         {picked && CALL_CLOSES.includes(picked.key) && (
@@ -14449,6 +14526,11 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
         })()}
 
         {stale > 0 && <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginBottom: 10 }}>⚠ LinkedIn request pending {stale} days.</div>}
+        {c.liStatus === "blocked" && (
+          <div style={{ fontSize: 11, color: C.red, lineHeight: 1.5, marginBottom: 10 }}>
+            ⊘ Blocked on LinkedIn — that route is closed permanently, with no retry window. Email and phone still work if you have them.
+          </div>
+        )}
         {liRetryDays(c) > 0 && (
           <div style={{ fontSize: 11, color: C.green, lineHeight: 1.5, marginBottom: 10 }}>
             ↻ {LI_META(c.liStatus).label} {liRetryDays(c)} days ago — the {LI_RETRY_DAYS}-day window has passed, so you can send a fresh request.
