@@ -364,6 +364,15 @@ const liRetryIn = (c) => {
   const left = LI_RETRY_DAYS - daysSince(c.liStatusAt);
   return left > 0 ? left : 0;
 };
+/* ---- is this number actually dialable? ----
+   A field holding "0", "-", or a couple of stray digits is a placeholder
+   someone typed to move past the field, not a number you can ring. Testing
+   only for non-empty put 25 of those at the top of the call queue, ahead of
+   real numbers. Seven digits is the shortest real subscriber number; a
+   leading + and separators are stripped before counting. */
+const dialableDigits = (phone) => (phone || "").replace(/\D/g, "").replace(/^0+/, "").length;
+const hasPhone = (c) => dialableDigits(c?.phone) >= 7;
+
 const DEFAULT_TOUCH_CHANNEL = "Cold email";
 
 /* Ticking a follow-up means you actually sent something, so it should leave a
@@ -8495,11 +8504,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         items: [
           { key: "dueContacts", label: `⚑ Due (${accounts.filter((a) => (a.contacts || []).some((c) => isContactDue(c) && !c.archivedAt)).length})` },
           { key: "engageDue", label: `💬 Engage (${allContacts.filter(isEngagementDue).length})` },
-          { key: "callable", label: `☎ Callable (${allContacts.filter((c) => (c.phone || "").trim() && c.status !== "closed").length})` },
+          { key: "callable", label: `☎ Callable (${allContacts.filter((c) => hasPhone(c) && c.status !== "closed").length})` },
           /* the counterpart to Callable: people you can't ring yet. A missing
              number is a research gap rather than a lead problem, and it's the
              only thing standing between these contacts and the call queue. */
-          { key: "noPhone", label: `☎ No number (${allContacts.filter((c) => !(c.phone || "").trim() && c.status !== "closed").length})` },
+          { key: "noPhone", label: `☎ No number (${allContacts.filter((c) => !hasPhone(c) && c.status !== "closed").length})` },
           { key: "untouched", label: `🕳 No one reached (${accounts.filter((a) => isAccountOpen(a) && isAccountUntouched(a)).length})` },
           { key: "notContacted", label: `◻ Not contacted (${allContacts.filter(isContactBlankStatus).length})` },
         ],
@@ -8553,9 +8562,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           : accFilter === "liWaiting"
           ? liveContacts(acc).some((c) => liRetryIn(c) > 0)
           : accFilter === "callable"
-          ? liveContacts(acc).some((c) => (c.phone || "").trim() && c.status !== "closed")
+          ? liveContacts(acc).some((c) => hasPhone(c) && c.status !== "closed")
           : accFilter === "noPhone"
-          ? liveContacts(acc).some((c) => !(c.phone || "").trim() && c.status !== "closed")
+          ? liveContacts(acc).some((c) => !hasPhone(c) && c.status !== "closed")
           : accFilter === "nurture"
           ? liveContacts(acc).some((c) => nurtureState(c) === "nurture")
           : accFilter === "coldGone"
@@ -8619,9 +8628,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               : accFilter === "liWaiting"
               ? liRetryIn(c) > 0
               : accFilter === "callable"
-              ? (c.phone || "").trim() && c.status !== "closed"
+              ? hasPhone(c) && c.status !== "closed"
               : accFilter === "noPhone"
-              ? !(c.phone || "").trim() && c.status !== "closed"
+              ? !hasPhone(c) && c.status !== "closed"
               : accFilter === "nurture"
               ? nurtureState(c) === "nurture"
               : accFilter === "coldGone"
@@ -10143,6 +10152,10 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
   const callQueue = useMemo(() => {
     const rows = (state.accounts || []).flatMap((acc) =>
       (acc.contacts || [])
+        /* Keeps contacts whose number is a placeholder ("0", a stray digit)
+           rather than dropping them — they're leads you'd call if you found a
+           number, and a queue that hides them hides the work. They sort to the
+           bottom instead, below everything actually dialable. */
         .filter((c) => !c.archivedAt && !c.tombstoned && (c.phone || "").trim() && c.status !== "closed")
         .map((c) => ({ contact: c, accountId: acc.id, company: acc.company }))
     );
@@ -10150,13 +10163,17 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
     const session = state.callSession || [];
     return rows
-      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact), dueDate: followUpOf(r.contact), pick: session.indexOf(r.contact.id) }))
+      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact), dueDate: followUpOf(r.contact), dialable: hasPhone(r.contact), pick: session.indexOf(r.contact.id) }))
       .sort(
         (a, b) =>
           /* anything you picked leads, in the order you picked it — a manual
              choice should always beat the automatic ranking */
           (a.pick === -1 ? 1 : 0) - (b.pick === -1 ? 1 : 0) ||
           (a.pick !== -1 && b.pick !== -1 ? a.pick - b.pick : 0) ||
+          /* then everything you can actually dial, before the placeholders —
+             this outranks due and never-called, because no ranking matters on
+             a row you can't ring */
+          (a.dialable ? 0 : 1) - (b.dialable ? 0 : 1) ||
           /* then: never called first — those are what the queue exists for.
              Then whoever is due. Then longest since the last attempt. */
           a.calls - b.calls ||
@@ -10167,7 +10184,8 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
   }, [state.accounts, state.callSession]);
 
   const renderCalls = () => {
-    const uncalled = callQueue.filter((r) => r.calls === 0).length;
+    const uncalled = callQueue.filter((r) => r.calls === 0 && r.dialable).length;
+    const unreachable = callQueue.filter((r) => !r.dialable).length;
     const picked = callQueue.filter((r) => r.pick !== -1).length;
     /* Search only narrows the UNPICKED remainder. Filtering the run you've
        already built would hide calls you're part-way through making, and the
@@ -10213,7 +10231,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             {[r.contact.position, r.company].filter(Boolean).join(" · ")}
           </div>
           <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 3 }}>
-            {r.contact.phone}
+            {r.dialable ? r.contact.phone : <span style={{ color: C.amber }}>no usable number</span>}
             {r.calls === 0 ? " · never called" : ` · ${r.calls} call${r.calls === 1 ? "" : "s"}, last ${r.lastCall}`}
             {r.due && <span style={{ color: C.red, fontWeight: 800 }}> · ⚑ DUE {r.dueDate}</span>}
             {/* knowing you last died at the opener changes how you open
@@ -10243,10 +10261,25 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           >
             {r.pick !== -1 ? r.pick + 1 : "+"}
           </button>
+          {/* a dial button that dials "0" is worse than no button — it looks
+              like the row is ready to work when it isn't */}
           <a
-            href={`tel:${r.contact.phone}`}
-            style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 42, height: 42, border: `1px solid ${C.green}`, color: C.green, borderRadius: 10, textDecoration: "none", fontSize: 16 }}
-            title={`Call ${r.contact.phone}`}
+            href={r.dialable ? `tel:${r.contact.phone}` : undefined}
+            onClick={r.dialable ? undefined : (e) => e.preventDefault()}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: 42,
+              height: 42,
+              border: `1px solid ${r.dialable ? C.green : C.panelEdge}`,
+              color: r.dialable ? C.green : C.muted,
+              borderRadius: 10,
+              textDecoration: "none",
+              fontSize: 16,
+              cursor: r.dialable ? "pointer" : "not-allowed",
+            }}
+            title={r.dialable ? `Call ${r.contact.phone}` : "No usable number — add one on the contact"}
           >
             ☎
           </a>
@@ -10285,8 +10318,9 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
 
             <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
               <div style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
-                <div style={{ fontSize: 9, letterSpacing: "0.16em", color: C.muted }}>IN QUEUE</div>
-                <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 700, color: C.ink }}>{callQueue.length}</div>
+                <div style={{ fontSize: 9, letterSpacing: "0.16em", color: C.muted }}>DIALABLE</div>
+                <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 700, color: C.ink }}>{callQueue.length - unreachable}</div>
+                {unreachable > 0 && <div style={{ fontFamily: mono, fontSize: 9, color: C.amber }}>+{unreachable} need a number</div>}
               </div>
               <div style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
                 <div style={{ fontSize: 9, letterSpacing: "0.16em", color: C.muted }}>NEVER CALLED</div>
