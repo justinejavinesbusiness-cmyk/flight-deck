@@ -265,6 +265,14 @@ const NURTURE_TRACKS = [
   { key: "refresh", label: "Contact refresh", short: "Refresh", schedule: [3, 7, 14], hint: "Run the 3-7-14 sequence again, starting now" },
 ];
 const nurtureTrack = (k) => NURTURE_TRACKS.find((t) => t.key === k) || null;
+/* Applications don't get a "nurture" status — the plan is an overlay on a
+   status that's still pre-reply. Once they reply or close, the plan no longer
+   applies, without anything needing to clear it. */
+const NURTURE_APP_STATUSES = ["outreach", "applied", "followed up"];
+const appInNurture = (a) => !!a?.nurtureTrack && NURTURE_APP_STATUSES.includes(a?.status);
+/* a plan with a touch still ahead — the case housekeeping must leave alone,
+   because a 90-day wait is the plan working, not a lead rotting */
+const onActiveNurturePlan = (x) => (x?.status === "nurture" || appInNurture(x)) && !!nextFollowUp(x);
 /* ---- nurture stage ----
    A contact that hasn't moved in months isn't dead and isn't active — it's
    dormant, and the app previously had no word for that. It sat in "outreach"
@@ -317,14 +325,18 @@ const nurtureCycle = (c) => Math.max(0, +c?.nurtureCycle || 0);
      DONE move to `pastFollowUps` so the record of what you sent survives
      (undone ones are dropped — they never happened)
    - `contacted` and warm/cold are left alone: they're the history of this lead */
-function applyNurtureTrack(c, trackKey) {
+/* `keepStatus` is for applications: there the plan sits on top of the
+   existing status ("applied", "outreach") rather than replacing it, so the
+   pipeline's stage vocabulary — and every funnel count built on it — is
+   untouched. Contacts have a real "nurture" status and take it. */
+function applyNurtureTrack(c, trackKey, { keepStatus = false } = {}) {
   const plan = nurtureTrack(trackKey);
   if (!plan) return c;
   const cycle = nurtureCycle(c) + 1;
   const spent = (c.followUps || []).filter((f) => f.done).map((f) => ({ ...f, cycle: nurtureCycle(c) }));
   return {
     ...c,
-    status: "nurture",
+    status: keepStatus ? c.status : "nurture",
     nurtureTrack: plan.key,
     nurturedAt: today(),
     nurtureCycle: cycle,
@@ -758,7 +770,8 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
          compute its due dates from the original contact date and disagree
          with the contact about when the next touch is due */
       nurturedAt: c.nurturedAt || "",
-      nurtureTrack: c.nurtureTrack || "",
+      nurtureTrack: c.status === "nurture" ? c.nurtureTrack || "" : "",
+      pastFollowUps: (c.pastFollowUps || []).map((f) => ({ ...f })),
       nurtureCycle: c.nurtureCycle || 0,
       fromAccountContact: true,
     };
@@ -2213,6 +2226,9 @@ function computeAutoArchivable(state, apps) {
   return (apps || []).filter((a) => {
     if (a.archivedAt || a.tombstoned || a.fromAccountContact) return false;
     if (!AUTO_ARCHIVE_STATUSES.includes(a.status)) return false;
+    /* waiting out a nurture plan isn't going stale — without this a 60-day
+       plan was auto-archived at day 30, before its first touch came due */
+    if (onActiveNurturePlan(a)) return false;
     if (hadReply(a)) return false; /* a reply happened at some point — human call */
     const last = lastActivityDate(a);
     return !!last && last <= cutoff;
@@ -2226,6 +2242,7 @@ function computeHousekeepingProposals(state, apps) {
   apps.forEach((a) => {
     if (a.archivedAt || a.tombstoned || a.fromAccountContact) return; /* synced entries are managed via their contact, not directly */
     if (!isOpenApp(a)) return; /* closed already — nothing to clean up */
+    if (onActiveNurturePlan(a)) return; /* deliberately waiting, not stale */
     /* measured from REAL last activity, not the original contact date — an
        entry followed up on recently is being actively worked, not rotting */
     const last = lastActivityDate(a);
@@ -2247,6 +2264,7 @@ function computeHousekeepingProposals(state, apps) {
     (acc.contacts || []).forEach((c) => {
       if (c.archivedAt || c.tombstoned) return;
       if (!isContactOpen(c) || !isContactOutreached(c)) return;
+      if (onActiveNurturePlan(c)) return; /* deliberately waiting, not stale */
       const last = lastActivityDate(c);
       if (!last || last > cutoff) return;
       const days = daysSince(last);
@@ -6241,6 +6259,19 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                          pipeline side would blank it on the contact */
                       ...(data.hook !== undefined ? { hook: data.hook, researchedAt: data.researchedAt || c.researchedAt } : {}),
                       ...(data.hookPolished !== undefined ? { hookPolished: data.hookPolished, hookPolishedFrom: data.hookPolishedFrom || "" } : {}),
+                      /* a plan set from the pipeline puts the contact in nurture;
+                         ending it there takes the contact back to its mapped
+                         status. Either way the schedule anchor travels too. */
+                      ...(data.nurturedAt !== undefined
+                        ? { nurturedAt: data.nurturedAt, nurtureCycle: data.nurtureCycle || 0, pastFollowUps: (data.pastFollowUps || []).map((f) => ({ ...f })) }
+                        : {}),
+                      ...(data.nurtureTrack !== undefined
+                        ? data.nurtureTrack && NURTURE_APP_STATUSES.includes(data.status)
+                          ? { status: "nurture", nurtureTrack: data.nurtureTrack }
+                          : c.status === "nurture"
+                          ? { status: mapAppStatusToContactStatus(data.status), nurtureTrack: "" }
+                          : {}
+                        : {}),
                     }
               ),
             }));
@@ -7353,6 +7384,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       },
       { key: "checkPost", label: `⚠ Check posting (${apps.filter((a) => postingNeedsCheck(a) && !a.archivedAt).length})` },
       { key: "fromPool", label: `🎯 From pool (${apps.filter((a) => isFromPool(a) && !a.archivedAt).length})` },
+      /* both standalone applications on a plan AND the rows mirroring account
+         contacts in nurture — same lead, same list, wherever it was set */
+      { key: "forNurture", label: `🌱 For nurture (${apps.filter((a) => appInNurture(a) && !a.archivedAt).length})` },
       { key: "tombstoned", label: `🪦 Stripped (${apps.filter((a) => a.tombstoned).length})` },
       {
         key: "liPending",
@@ -7381,6 +7415,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? postingNeedsCheck(a)
           : pipeFilter === "fromPool"
           ? isFromPool(a)
+          : pipeFilter === "forNurture"
+          ? appInNurture(a)
           : pipeFilter === "liPending"
           ? liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt }) > 0
           : pipeFilter === "blank"
@@ -8200,6 +8236,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                             in · {liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt })}d PENDING
                           </div>
                         )}
+                        {/* the row's status says "applied"/"outreach"; this says
+                            it's deliberately waiting on a plan */}
+                        {appInNurture(a) && (
+                          <div
+                            title={nurturePlanLine(a)}
+                            style={{ marginTop: 4, marginLeft: 4, display: "inline-block", border: `1px solid ${C.amber}`, borderRadius: 5, color: C.amber, fontFamily: mono, fontSize: 9, padding: "1px 5px", letterSpacing: 0.4 }}
+                          >
+                            🌱 {nurtureTrack(a.nurtureTrack)?.short.toUpperCase()} NURTURE
+                          </div>
+                        )}
                         {!isOpenApp(a) && a.status !== "offer" && (
                           <button
                             onClick={(e) => {
@@ -8489,6 +8535,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                         {liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt }) > 0 && (
                           <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: 0.4, color: C.red, marginTop: 4 }}>
                             in · {liStaleDays({ linkedin: a.contactLinkedin, liStatus: a.liStatus, liStatusAt: a.liStatusAt })}d PENDING
+                          </div>
+                        )}
+                        {/* the row's status says "applied"/"outreach"; this says
+                            it's deliberately waiting on a plan */}
+                        {appInNurture(a) && (
+                          <div
+                            title={nurturePlanLine(a)}
+                            style={{ marginTop: 4, marginLeft: 4, display: "inline-block", border: `1px solid ${C.amber}`, borderRadius: 5, color: C.amber, fontFamily: mono, fontSize: 9, padding: "1px 5px", letterSpacing: 0.4 }}
+                          >
+                            🌱 {nurtureTrack(a.nurtureTrack)?.short.toUpperCase()} NURTURE
                           </div>
                         )}
                       </td>
@@ -11009,6 +11065,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         hookPolishedFrom: entry?.hookPolishedFrom ?? "",
         /* read-only here, but the form shows due dates, so it needs the anchor */
         nurturedAt: entry?.nurturedAt ?? "",
+        nurtureTrack: entry?.nurtureTrack ?? "",
+        nurtureCycle: entry?.nurtureCycle ?? 0,
+        pastFollowUps: Array.isArray(entry?.pastFollowUps) ? entry.pastFollowUps.map((f) => ({ ...f })) : [],
         attempt: attemptOf(entry || {}),
         notes: entry?.notes || pre.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
@@ -11223,6 +11282,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
      blank records. */
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmRestore, setConfirmRestore] = useState("");
+  const [appNurtureOpen, setAppNurtureOpen] = useState(false);
   /* settings sidebar: which section is highlighted, and the scroll container
      it jumps within */
   const [settingsSection, setSettingsSection] = useState("general");
@@ -11892,6 +11952,41 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 </div>
               )}
             </div>
+
+            {/* Nurture for applications. Offered while the entry is still
+                pre-reply; the plan overlays the status rather than replacing it,
+                so the funnel keeps counting this as the application it is. */}
+            {NURTURE_APP_STATUSES.includes(f.status) &&
+              (() => {
+                const active = appInNurture(f);
+                if (!active && !appNurtureOpen)
+                  return (
+                    <button
+                      type="button"
+                      onClick={() => setAppNurtureOpen(true)}
+                      style={{ background: "transparent", border: "none", color: C.muted, fontSize: 12, cursor: "pointer", padding: "0 0 12px", fontFamily: sans }}
+                    >
+                      🌱 Put on a nurture plan…
+                    </button>
+                  );
+                return (
+                  <div style={{ background: "rgba(245,185,66,0.06)", border: `1px solid ${active ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 10px", marginBottom: 12 }}>
+                    <div style={{ fontSize: 11, color: active ? C.amber : C.muted, lineHeight: 1.5, marginBottom: 7 }}>
+                      🌱 {active ? nurturePlanLine(f) : "Pick a plan — it replaces the follow-up schedule with a new cycle starting today. The status stays as it is."}
+                    </div>
+                    <NurturePicker current={active ? f.nurtureTrack : ""} onPick={(k) => setF((p) => applyNurtureTrack(p, k, { keepStatus: true }))} />
+                    {active && (
+                      <button
+                        type="button"
+                        onClick={() => setF((p) => ({ ...p, nurtureTrack: "" }))}
+                        style={{ background: "transparent", border: "none", color: C.muted, fontSize: 11, cursor: "pointer", padding: "7px 0 0", fontFamily: sans }}
+                      >
+                        ✕ End plan (keeps the schedule)
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
 
             {["rejected", "bad fit"].includes(f.status) && (
               <div style={{ marginBottom: 12 }}>
@@ -14547,10 +14642,10 @@ function NurturePicker({ current, onPick }) {
   );
 }
 
-/* where a contact is in its nurture plan, in one line */
+/* where a contact or application is in its nurture plan, in one line */
 const nurturePlanLine = (c) => {
   const plan = nurtureTrack(c?.nurtureTrack);
-  if (c?.status !== "nurture" || !plan) return "";
+  if (!(c?.status === "nurture" || appInNurture(c)) || !plan) return "";
   const fus = c.followUps || [];
   const done = fus.filter((f) => f.done).length;
   const next = nextFollowUp(c);
