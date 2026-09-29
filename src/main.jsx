@@ -222,10 +222,18 @@ const OUTREACH_CHANNELS = ["Email", "Call", "Text", "Other"];
 const BAD_FIT_REASONS = ["Salary too low", "Values mismatch", "Culture concerns", "Red flags in process", "Scope creep", "Other"];
 
 /* ---- account / contact relationship model ---- */
-const CONTACT_STATUSES = ["", "outreach", "replied", "discovery call", "ongoing", "closed"];
-const contactStatusLabel = (s) => (s ? s : "Not contacted yet");
+const CONTACT_STATUSES = ["", "outreach", "nurture", "replied", "discovery call", "ongoing", "closed"];
+const contactStatusLabel = (s) => (s === "nurture" ? "for nurture" : s ? s : "Not contacted yet");
 const contactStatusColor = (s) =>
-  s === "closed" ? C.muted : s === "ongoing" ? C.green : s === "discovery call" ? C.amber : s === "replied" || s === "outreach" ? C.blue : C.muted;
+  s === "closed"
+    ? C.muted
+    : s === "ongoing"
+    ? C.green
+    : s === "discovery call" || s === "nurture"
+    ? C.amber
+    : s === "replied" || s === "outreach"
+    ? C.blue
+    : C.muted;
 const isContactBlankStatus = (c) => !c.status;
 /* whole days between a date and today (negative if the date is in the future).
    Declared up here because nurtureState below needs it and `const` doesn't
@@ -236,6 +244,27 @@ const daysSince = (isoDate) => {
 };
 const isContactOpen = (c) => c.status !== "closed";
 const isContactOutreached = (c) => !!c.status; /* any status set means real contact has happened */
+
+/* ---- the date a follow-up schedule counts from ----
+   Normally the first contact. A nurture plan starts a NEW cycle, so its
+   schedule counts from the day the plan was set instead — otherwise a 30-day
+   nurture on a lead first contacted in July would be overdue the moment it
+   was created. `contacted` itself is never moved: it's the history that says
+   this is a re-approach rather than a first touch. */
+const anchorOf = (a) => a?.nurturedAt || a?.contacted || "";
+
+/* ---- nurture plans ----
+   A quiet lead isn't one thing. Some need a month's space, some a quarter;
+   some just need the original sequence run again because the first one
+   never landed. Each waiting plan ends in three touches a week apart — one
+   message after a long silence is easy to miss, three is a real attempt. */
+const NURTURE_TRACKS = [
+  { key: "30", label: "30-day nurture", short: "30d", schedule: [30, 7, 7], hint: "Space, then three touches a week apart" },
+  { key: "60", label: "60-day nurture", short: "60d", schedule: [60, 7, 7], hint: "A couple of months, then three touches" },
+  { key: "90", label: "90-day nurture", short: "90d", schedule: [90, 7, 7], hint: "A quarter out, then three touches" },
+  { key: "refresh", label: "Contact refresh", short: "Refresh", schedule: [3, 7, 14], hint: "Run the 3-7-14 sequence again, starting now" },
+];
+const nurtureTrack = (k) => NURTURE_TRACKS.find((t) => t.key === k) || null;
 /* ---- nurture stage ----
    A contact that hasn't moved in months isn't dead and isn't active — it's
    dormant, and the app previously had no word for that. It sat in "outreach"
@@ -255,6 +284,10 @@ const nurtureState = (c) => {
   /* "discovery call" and beyond means it IS moving — nurture is about silence
      in the early stages, not about a slow interview process */
   if (["discovery call", "ongoing"].includes(c.status)) return "";
+  /* a lead on a nurture plan is being handled — a 90-day wait is the plan,
+     not neglect, so it isn't flagged while a planned touch is still ahead.
+     Once the plan's three touches are spent it's judged like anyone else. */
+  if (c.status === "nurture" && nextFollowUp(c)) return "";
   const last = lastActivityDate(c);
   if (!last) return "";
   const d = daysSince(last);
@@ -274,6 +307,33 @@ const nurtureState = (c) => {
    rather than a first touch — so the restart stamps its own date and leaves
    `contacted` alone. Each subsequent restart moves nurturedAt forward. */
 const nurtureCycle = (c) => Math.max(0, +c?.nurtureCycle || 0);
+
+/* Puts a contact on a nurture plan. Pure, and shared by the contact card and
+   the account form so the two can never apply a plan differently.
+
+   - status becomes "nurture" (still outreach as far as the funnel is concerned)
+   - a new cycle starts today: `nurturedAt` is the anchor the schedule counts from
+   - the plan's schedule replaces the old one; follow-ups that were actually
+     DONE move to `pastFollowUps` so the record of what you sent survives
+     (undone ones are dropped — they never happened)
+   - `contacted` and warm/cold are left alone: they're the history of this lead */
+function applyNurtureTrack(c, trackKey) {
+  const plan = nurtureTrack(trackKey);
+  if (!plan) return c;
+  const cycle = nurtureCycle(c) + 1;
+  const spent = (c.followUps || []).filter((f) => f.done).map((f) => ({ ...f, cycle: nurtureCycle(c) }));
+  return {
+    ...c,
+    status: "nurture",
+    nurtureTrack: plan.key,
+    nurturedAt: today(),
+    nurtureCycle: cycle,
+    contacted: c.contacted || today(),
+    pastFollowUps: [...(c.pastFollowUps || []), ...spent],
+    followUps: plan.schedule.map((d) => ({ days: d, done: false, doneAt: "", fromNurture: plan.key })),
+    history: withLog(c, [logEntry("status", `🌱 ${plan.label} (cycle ${cycle})`)]).history,
+  };
+}
 
 const NURTURE_META = {
   nurture: { label: "NURTURE", color: "amber", hint: "quiet 60+ days — worth a light touch, not a hard pitch" },
@@ -372,6 +432,11 @@ const liRetryIn = (c) => {
    leading + and separators are stripped before counting. */
 const dialableDigits = (phone) => (phone || "").replace(/\D/g, "").replace(/^0+/, "").length;
 const hasPhone = (c) => dialableDigits(c?.phone) >= 7;
+/* "0" is a deliberate marker: you looked and couldn't find a number. That's a
+   different state from a blank field, which just means you haven't looked yet —
+   one is a research task, the other is a dead end on this channel. */
+const phoneNotFound = (c) => /^0+$/.test((c?.phone || "").trim());
+const phoneMissing = (c) => !hasPhone(c) && !phoneNotFound(c);
 
 const DEFAULT_TOUCH_CHANNEL = "Cold email";
 
@@ -456,7 +521,7 @@ const hasNoWayIn = (acc) => liveContacts(acc).length === 0;
    merging counts in parallel, each outreached contact gets a real, linked
    entry in state.applications (source "Accounts", fromAccountContact: true),
    kept in sync as the contact's own status/tags/follow-ups change. */
-const CONTACT_TO_APP_STATUS = { "": "", outreach: "outreach", replied: "replied", "discovery call": "screening", ongoing: "interview", closed: "rejected" };
+const CONTACT_TO_APP_STATUS = { "": "", outreach: "outreach", nurture: "outreach", replied: "replied", "discovery call": "screening", ongoing: "interview", closed: "rejected" };
 const mapContactStatusToAppStatus = (contactStatus) => CONTACT_TO_APP_STATUS[contactStatus] ?? "";
 /* reverse of the above — used when converting a standalone application into
    an account contact. The contact status model is coarser than the
@@ -689,6 +754,12 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
       fromPool: !!c.fromPool,
       poolName: c.poolName || "",
       notes: c.notes,
+      /* the nurture cycle travels with the lead, or the pipeline row would
+         compute its due dates from the original contact date and disagree
+         with the contact about when the next touch is due */
+      nurturedAt: c.nurturedAt || "",
+      nurtureTrack: c.nurtureTrack || "",
+      nurtureCycle: c.nurtureCycle || 0,
       fromAccountContact: true,
     };
 
@@ -1535,6 +1606,10 @@ function propagateConvergedStatus(applications, accounts, sourceApp, newStatus) 
       const link = c.linkedApplicationId;
       if (!link || (link !== sourceId && !affectedIds.has(link))) return c;
       if (c.status === contactStatus) return c;
+      /* a nurture contact's pipeline row reads "outreach", so an "outreach"
+         coming back from the pipeline is the same state, not a demotion —
+         only a real move (a reply, a close) should take it out of nurture */
+      if (c.status === "nurture" && contactStatus === "outreach") return c;
       touched = true;
       return { ...c, status: contactStatus };
     });
@@ -2105,7 +2180,7 @@ function lastActivityDate(a) {
   const fus = Array.isArray(a.followUps) ? a.followUps : [];
   fus.forEach((f, i) => {
     if (!f?.done) return;
-    bump(f.doneAt || (a.contacted ? followUpDueDate(a.contacted, fus, i) : ""));
+    bump(f.doneAt || (anchorOf(a) ? followUpDueDate(anchorOf(a), fus, i) : ""));
   });
   (a.touchpoints || []).forEach((t) => bump(t?.date));
   /* restarting a nurtured lead IS activity — without this the contact stays
@@ -2346,11 +2421,11 @@ function followUpDueDate(contacted, fus, index) {
 
 /* next pending entry on one track, or across all when no track is given */
 function nextFollowUpOn(a, track) {
-  if (!a?.contacted) return null;
+  if (!anchorOf(a)) return null;
   const fus = normFollowUps(a);
   const i = fus.findIndex((f) => !f.done && (track === undefined || trackOf(f) === track));
   if (i === -1) return null;
-  return { date: followUpDueDate(a.contacted, fus, i), index: i, total: fus.length, track: trackOf(fus[i]) };
+  return { date: followUpDueDate(anchorOf(a), fus, i), index: i, total: fus.length, track: trackOf(fus[i]) };
 }
 /* ---- scheduling a call-back ----
    The schedule is CUMULATIVE: [3, 7, 14] means days 3, 10 and 24 after
@@ -2400,12 +2475,12 @@ function insertCallback(contacted, fus, daysFromToday) {
    due before an email listed first. Picking by index would have reported the
    later date and hidden an overdue call from the due queue. */
 const nextFollowUp = (a) => {
-  if (!a.contacted) return null;
+  if (!anchorOf(a)) return null;
   const fus = normFollowUps(a);
   let best = null;
   fus.forEach((f, i) => {
     if (f.done) return;
-    const date = followUpDueDate(a.contacted, fus, i);
+    const date = followUpDueDate(anchorOf(a), fus, i);
     if (!best || date < best.date) best = { date, index: i, total: fus.length, track: trackOf(f) };
   });
   return best;
@@ -3768,41 +3843,24 @@ export default function FlightDeck() {
      fires automatically at 60 days: clearing a status removes the contact from
      the funnel, and doing that on a timer would quietly rewrite your outreach
      numbers without you asking. */
-  const restartNurture = (accountId, contactId) =>
+  /* Puts a contact on a nurture plan from the card. Replaces the old restart,
+     which blanked the status — that deleted the linked pipeline row and
+     quietly dropped the lead out of the funnel. A nurture contact stays in
+     the funnel as outreach; only its schedule restarts. */
+  const setNurturePlan = (accountId, contactId, trackKey) =>
     mutate(
       (st) => {
         const oldContacts = (st.accounts || []).find((a) => a.id === accountId)?.contacts || [];
         const next = {
           ...st,
           accounts: (st.accounts || []).map((a) =>
-            a.id !== accountId
-              ? a
-              : {
-                  ...a,
-                  contacts: (a.contacts || []).map((c) =>
-                    c.id !== contactId
-                      ? c
-                      : {
-                          ...c,
-                          status: "",
-                          outreachKind: "",
-                          /* the schedule reruns from the NEXT contact, not from
-                             a date months back */
-                          followUps: (c.followUps || []).map((x) => ({ ...x, done: false, doneAt: "" })),
-                          nurturedAt: today(),
-                          nurtureCycle: nurtureCycle(c) + 1,
-                          /* `contacted` is deliberately untouched — it's what
-                             marks this as a re-approach rather than a first touch */
-                          history: withLog(c, [logEntry("status", `↻ Restarted as nurture (cycle ${nurtureCycle(c) + 1})`)]).history,
-                        }
-                  ),
-                }
+            a.id !== accountId ? a : { ...a, contacts: (a.contacts || []).map((c) => (c.id === contactId ? applyNurtureTrack(c, trackKey) : c)) }
           ),
         };
-        /* status cleared means the linked pipeline row must go too */
+        /* the pipeline row picks up the new schedule and its anchor */
         return reconcileAccountApplications(next, accountId, oldContacts);
       },
-      "↻ Reset — pick cold or warm when you write"
+      `🌱 ${nurtureTrack(trackKey)?.label || "Nurture"} set`
     );
 
   /* Marks a contact as contacted from the card. Mirrors what the account
@@ -3885,7 +3943,7 @@ export default function FlightDeck() {
                   /* the call-back becomes a real dated follow-up rather than a
                      promise buried in a note */
                   if (callbackDays > 0) {
-                    next.followUps = insertCallback(next.contacted || c.contacted || today(), next.followUps || c.followUps || [], callbackDays);
+                    next.followUps = insertCallback(anchorOf(next) || anchorOf(c) || today(), next.followUps || c.followUps || [], callbackDays);
                   }
                   if (CALL_CLOSES.includes(outcome)) next.status = "closed";
                   if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
@@ -6512,7 +6570,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
        starts with a seeded schedule, so empty only ever means cleared. */
     const optedOut = everyone.filter((x) => (x.followUps || []).length === 0).length;
     const all = everyone.filter((x) => (x.followUps || []).length > 0);
-    const doneFus = all.reduce((n, x) => n + (x.followUps || []).filter((f) => f.done).length, 0);
+    /* pastFollowUps holds what was sent before a nurture plan reset the
+       schedule — it's still work done, so it still counts */
+    const doneFus = all.reduce((n, x) => n + (x.followUps || []).filter((f) => f.done).length + (x.pastFollowUps || []).length, 0);
     const avgFollowUps = all.length ? doneFus / all.length : 0;
     /* a lead sitting at one touch with nothing done is the leak — but only
        among leads that are actually meant to be followed up */
@@ -8508,7 +8568,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           /* the counterpart to Callable: people you can't ring yet. A missing
              number is a research gap rather than a lead problem, and it's the
              only thing standing between these contacts and the call queue. */
-          { key: "noPhone", label: `☎ No number (${allContacts.filter((c) => !hasPhone(c) && c.status !== "closed").length})` },
+          { key: "noPhone", label: `☎ No number yet (${allContacts.filter((c) => phoneMissing(c) && c.status !== "closed").length})` },
+          { key: "phoneNotFound", label: `⊘ Can't find number (${allContacts.filter((c) => phoneNotFound(c) && c.status !== "closed").length})` },
           { key: "untouched", label: `🕳 No one reached (${accounts.filter((a) => isAccountOpen(a) && isAccountUntouched(a)).length})` },
           { key: "notContacted", label: `◻ Not contacted (${allContacts.filter(isContactBlankStatus).length})` },
         ],
@@ -8517,7 +8578,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         group: "Relationship",
         items: [
           { key: "outreachedContacts", label: `Outreached (${accounts.filter((a) => (a.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)).length})` },
-          { key: "nurture", label: `🌱 Nurture (${allContacts.filter((c) => nurtureState(c) === "nurture").length})` },
+          /* the STATUS — leads you've deliberately put on a plan */
+          { key: "forNurture", label: `🌱 For nurture (${allContacts.filter((c) => c.status === "nurture").length})` },
+          /* the auto-detected signal — quiet 60+ days with no plan. Renamed
+             from "Nurture" so the two don't read as the same thing */
+          { key: "nurture", label: `💤 Going quiet (${allContacts.filter((c) => nurtureState(c) === "nurture").length})` },
           { key: "coldGone", label: `❄ Gone cold (${allContacts.filter((c) => nurtureState(c) === "stale").length})` },
         ],
       },
@@ -8559,12 +8624,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? liveContacts(acc).some((c) => liRetryDays(c) > 0)
           : accFilter === "liBlocked"
           ? liveContacts(acc).some((c) => c.liStatus === "blocked")
+          : accFilter === "forNurture"
+          ? liveContacts(acc).some((c) => c.status === "nurture")
           : accFilter === "liWaiting"
           ? liveContacts(acc).some((c) => liRetryIn(c) > 0)
           : accFilter === "callable"
           ? liveContacts(acc).some((c) => hasPhone(c) && c.status !== "closed")
           : accFilter === "noPhone"
-          ? liveContacts(acc).some((c) => !hasPhone(c) && c.status !== "closed")
+          ? liveContacts(acc).some((c) => phoneMissing(c) && c.status !== "closed")
+          : accFilter === "phoneNotFound"
+          ? liveContacts(acc).some((c) => phoneNotFound(c) && c.status !== "closed")
           : accFilter === "nurture"
           ? liveContacts(acc).some((c) => nurtureState(c) === "nurture")
           : accFilter === "coldGone"
@@ -8602,7 +8671,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
-    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable", "noPhone", "liNone", "liRetry", "liWaiting", "liBlocked"].includes(accFilter);
+    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable", "noPhone", "phoneNotFound", "liNone", "liRetry", "liWaiting", "liBlocked", "forNurture"].includes(accFilter);
 
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
@@ -8625,12 +8694,16 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               ? liRetryDays(c) > 0
               : accFilter === "liBlocked"
               ? c.liStatus === "blocked"
+              : accFilter === "forNurture"
+              ? c.status === "nurture"
               : accFilter === "liWaiting"
               ? liRetryIn(c) > 0
               : accFilter === "callable"
               ? hasPhone(c) && c.status !== "closed"
               : accFilter === "noPhone"
-              ? !hasPhone(c) && c.status !== "closed"
+              ? phoneMissing(c) && c.status !== "closed"
+              : accFilter === "phoneNotFound"
+              ? phoneNotFound(c) && c.status !== "closed"
               : accFilter === "nurture"
               ? nurtureState(c) === "nurture"
               : accFilter === "coldGone"
@@ -10231,7 +10304,11 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             {[r.contact.position, r.company].filter(Boolean).join(" · ")}
           </div>
           <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 3 }}>
-            {r.dialable ? r.contact.phone : <span style={{ color: C.amber }}>no usable number</span>}
+            {r.dialable ? (
+              r.contact.phone
+            ) : (
+              <span style={{ color: C.amber }}>{phoneNotFound(r.contact) ? "number not found" : "no usable number"}</span>
+            )}
             {r.calls === 0 ? " · never called" : ` · ${r.calls} call${r.calls === 1 ? "" : "s"}, last ${r.lastCall}`}
             {r.due && <span style={{ color: C.red, fontWeight: 800 }}> · ⚑ DUE {r.dueDate}</span>}
             {/* knowing you last died at the opener changes how you open
@@ -10801,8 +10878,8 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             setContactCard(null);
             setStandaloneHistory({ contact: c, company });
           }}
-          onRestartNurture={(accountId, contactId) => {
-            restartNurture(accountId, contactId);
+          onNurture={(accountId, contactId, trackKey) => {
+            setNurturePlan(accountId, contactId, trackKey);
             setContactCard(null);
           }}
           onGraduate={(accountId, contactId, kind) => {
@@ -10930,6 +11007,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
            and the next copy action would regenerate it from scratch */
         hookPolished: entry?.hookPolished ?? "",
         hookPolishedFrom: entry?.hookPolishedFrom ?? "",
+        /* read-only here, but the form shows due dates, so it needs the anchor */
+        nurturedAt: entry?.nurturedAt ?? "",
         attempt: attemptOf(entry || {}),
         notes: entry?.notes || pre.notes || "",
         custom: entry?.custom ? entry.custom.map((c) => ({ ...c })) : [],
@@ -11242,7 +11321,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 }
                 if (stage && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
                 if (callbackDays > 0) {
-                  next.followUps = insertCallback(next.contacted || c.contacted || today(), next.followUps || c.followUps || [], callbackDays);
+                  next.followUps = insertCallback(anchorOf(next) || anchorOf(c) || today(), next.followUps || c.followUps || [], callbackDays);
                 }
                 if (CALL_CLOSES.includes(outcome)) next.status = "closed";
                 if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
@@ -11672,7 +11751,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>No follow-ups scheduled for this one.</div>
             )}
             {(f.followUps || []).map((fu, i) => {
-              const d = f.contacted ? followUpDueDate(f.contacted, f.followUps, i) : "";
+              const d = anchorOf(f) ? followUpDueDate(anchorOf(f), f.followUps, i) : "";
               const due = d && !fu.done && d <= today();
               return (
                 <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
@@ -13201,6 +13280,18 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     </div>
                   </div>
 
+                  {/* choosing "for nurture" asks which plan — the status alone
+                      doesn't say when to come back, and the plan is what puts
+                      the next touch in the due queue */}
+                  {c.status === "nurture" && (
+                    <div style={{ background: "rgba(245,185,66,0.06)", border: `1px solid ${C.amber}`, borderRadius: 10, padding: "9px 10px", marginBottom: 6 }}>
+                      <div style={{ fontSize: 11, color: C.amber, lineHeight: 1.5, marginBottom: 7 }}>
+                        🌱 {nurturePlanLine(c) || "Pick a plan — it replaces the follow-up schedule with a new cycle starting today."}
+                      </div>
+                      <NurturePicker current={c.nurtureTrack || ""} onPick={(k) => setContact(applyNurtureTrack(c, k))} />
+                    </div>
+                  )}
+
                   <button
                     onClick={() => setContact({ gotReply: !c.gotReply })}
                     title="Records that a human answered, so closing this contact doesn't erase the fact"
@@ -13389,7 +13480,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                         );
                       })()}
                       {fus.map((fu, fi) => {
-                        const due = c.contacted ? followUpDueDate(c.contacted, fus, fi) : "";
+                        const due = anchorOf(c) ? followUpDueDate(anchorOf(c), fus, fi) : "";
                         return (
                           /* the tick and its copy icon travel together — a
                              separate row of icons makes you count positions to
@@ -14418,10 +14509,59 @@ function ConnDot({ contact, style }) {
   );
 }
 
+/* The four nurture plans as tappable cards. Shared by the contact card and
+   the account form. Picking the plan that's already active restarts it — a
+   new cycle from today — which is the "run it again" case. */
+function NurturePicker({ current, onPick }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 6 }}>
+      {NURTURE_TRACKS.map((t) => {
+        const on = current === t.key;
+        return (
+          <button
+            key={t.key}
+            type="button"
+            onClick={() => onPick(t.key)}
+            title={on ? "Active — tap to restart this plan from today" : t.hint}
+            style={{
+              textAlign: "left",
+              background: on ? "rgba(245,185,66,0.12)" : "transparent",
+              border: `1px solid ${on ? C.amber : C.panelEdge}`,
+              borderRadius: 10,
+              padding: "7px 9px",
+              cursor: "pointer",
+              fontFamily: sans,
+              minWidth: 0,
+            }}
+          >
+            <div style={{ fontSize: 12, fontWeight: 700, color: on ? C.amber : C.ink }}>
+              {on ? "● " : ""}
+              {t.label}
+            </div>
+            <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.35, marginTop: 1 }}>{t.hint}</div>
+            <div style={{ fontFamily: mono, fontSize: 9, color: C.muted, marginTop: 3 }}>{t.schedule.map((d) => `${d}d`).join(" → ")}</div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* where a contact is in its nurture plan, in one line */
+const nurturePlanLine = (c) => {
+  const plan = nurtureTrack(c?.nurtureTrack);
+  if (c?.status !== "nurture" || !plan) return "";
+  const fus = c.followUps || [];
+  const done = fus.filter((f) => f.done).length;
+  const next = nextFollowUp(c);
+  return `${plan.label} · ${done}/${fus.length} touches${next ? ` · next ${next.date}` : " · plan complete"}`;
+};
+
 /* One person, on their own. Opening a whole account to reach one contact
    buries them among colleagues — this shows just the card for the person you
    clicked, with the actions that belong to them. */
-function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount, onCall, onHistory, onGraduate, onRestartNurture }) {
+function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount, onCall, onHistory, onGraduate, onNurture }) {
+  const [pickingPlan, setPickingPlan] = useState(false);
   const c = contact || {};
   const stale = liStaleDays(c);
   const nurture = nurtureState(c);
@@ -14491,7 +14631,10 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
           {line("STATUS", contactStatusLabel(c.status) + (c.outreachKind ? ` · ${c.outreachKind}` : ""))}
           {c.callStage ? line("BEST CALL", callStage(c.callStage)?.label || c.callStage, null, { tone: c.callStage === "booked" ? C.green : C.ink }) : null}
           {line("EMAIL", c.email, c.email ? `mailto:${c.email}` : null, { copy: c.email })}
-          {line("PHONE", c.phone, c.phone ? `tel:${c.phone}` : null, { copy: c.phone })}
+          {/* a "0" is shown as what it means, not dialled or copied */}
+          {phoneNotFound(c)
+            ? line("PHONE", "Couldn't find", null, { tone: C.muted })
+            : line("PHONE", c.phone, hasPhone(c) ? `tel:${c.phone}` : null, { copy: c.phone })}
           {/* status stays plain text and coloured by state; the icon is the link */}
           {line("LINKEDIN", c.linkedin ? LI_META(c.liStatus).label : "", null, {
             open: c.linkedin ? (c.linkedin.startsWith("http") ? c.linkedin : `https://${c.linkedin}`) : null,
@@ -14575,21 +14718,39 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
             ⌛ {LI_META(c.liStatus).label} — LinkedIn won&apos;t accept a new request for another {liRetryIn(c)} day{liRetryIn(c) === 1 ? "" : "s"}.
           </div>
         )}
-        {nurture && (
-          <div style={{ background: nurture === "nurture" ? "rgba(245,185,66,0.07)" : "transparent", border: `1px solid ${nurture === "nurture" ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 10 }}>
-            <div style={{ fontSize: 11, color: nurture === "nurture" ? C.amber : C.muted, lineHeight: 1.5 }}>🌱 {NURTURE_META[nurture].hint}</div>
-            {onRestartNurture && (
-              <>
-                <Btn ghost onClick={() => onRestartNurture(accountId, c.id)} style={{ padding: "6px 11px", fontSize: 12, marginTop: 8 }}>
-                  ↻ Restart as a fresh approach
-                </Btn>
-                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 5 }}>
-                  Clears the status and un-ticks the follow-ups so the next message starts a new cycle. The original contact date is kept.
+        {/* Nurture. Open by default when the lead has gone quiet or is already
+            on a plan; for any other contacted lead it's one tap away rather
+            than taking space on every card. */}
+        {onNurture && c.status && c.status !== "closed" && (() => {
+          const onPlan = c.status === "nurture";
+          const open = pickingPlan || !!nurture || onPlan;
+          if (!open)
+            return (
+              <button
+                onClick={() => setPickingPlan(true)}
+                style={{ background: "transparent", border: "none", color: C.muted, fontSize: 12, cursor: "pointer", padding: "0 0 10px", fontFamily: sans }}
+              >
+                🌱 Put on a nurture plan…
+              </button>
+            );
+          return (
+            <div style={{ background: "rgba(245,185,66,0.06)", border: `1px solid ${onPlan || nurture === "nurture" ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 10 }}>
+              {onPlan ? (
+                <div style={{ fontSize: 11, color: C.amber, lineHeight: 1.5, marginBottom: 8 }}>🌱 {nurturePlanLine(c)}</div>
+              ) : nurture ? (
+                <div style={{ fontSize: 11, color: nurture === "nurture" ? C.amber : C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+                  🌱 {NURTURE_META[nurture].hint}. Pick a plan:
                 </div>
-              </>
-            )}
-          </div>
-        )}
+              ) : (
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>🌱 Pick a plan:</div>
+              )}
+              <NurturePicker current={onPlan ? c.nurtureTrack : ""} onPick={(k) => onNurture(accountId, c.id, k)} />
+              <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 6 }}>
+                Starts a new follow-up cycle from today. What you already sent stays in the history, and the first contact date and warm/cold are kept.
+              </div>
+            </div>
+          );
+        })()}
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <Btn ghost onClick={() => onCall(c, accountId)} style={{ flex: "1 1 90px", padding: "8px 10px", fontSize: 12 }}>
