@@ -8610,6 +8610,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         items: [
           { key: "active", label: `Active (${accounts.filter(isAccountOpen).length})` },
           { key: "all", label: `All (${accounts.length})` },
+          /* everyone you've reached out to, whatever happened next — moved here
+             from Relationship (it was "Outreached") because it's a view of your
+             work, not a relationship state. Counts PEOPLE, since the list it
+             opens is people; it used to count accounts, so the number and the
+             list disagreed. */
+          { key: "outreachedContacts", label: `✓ Contacted (${allContacts.filter(isContactOutreached).length})` },
           { key: "highConfidence", label: `⭐ High confidence (${accounts.filter((a) => a.highConfidence).length})` },
           { key: "closed", label: `Closed (${accounts.filter((a) => a.status === "closed").length})` },
           { key: "badFit", label: `🚫 Bad fit (${accounts.filter((a) => a.status === "bad fit").length})` },
@@ -8633,7 +8639,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {
         group: "Relationship",
         items: [
-          { key: "outreachedContacts", label: `Outreached (${accounts.filter((a) => (a.contacts || []).some((c) => isContactOutreached(c) && !c.archivedAt)).length})` },
           /* the STATUS — leads you've deliberately put on a plan */
           { key: "forNurture", label: `🌱 For nurture (${allContacts.filter((c) => c.status === "nurture").length})` },
           /* the auto-detected signal — quiet 60+ days with no plan. Renamed
@@ -8779,6 +8784,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               : accFilter === "engageDue"
               ? /* longest-overdue first — same work-queue logic as follow-ups */
                 (engagementDueDate(a) || "9999-12-31").localeCompare(engagementDueDate(b) || "9999-12-31") || a._company.localeCompare(b._company)
+              : accFilter === "outreachedContacts"
+              ? /* most recently contacted first — "who did I reach out to"
+                   is usually "who did I reach out to lately" */
+                (b.contacted || "").localeCompare(a.contacted || "") || a._company.localeCompare(b._company)
               : a._company.localeCompare(b._company)
           )
       : [];
