@@ -296,7 +296,10 @@ const nurtureState = (c) => {
      not neglect, so it isn't flagged while a planned touch is still ahead.
      Once the plan's three touches are spent it's judged like anyone else. */
   if (c.status === "nurture" && nextFollowUp(c)) return "";
-  const last = lastActivityDate(c);
+  /* already in nurture and waiting on you to pick a plan — it's in the For
+     nurture list, so flagging it "going quiet" as well would double-count it */
+  if (c.status === "nurture" && !c.nurtureTrack) return "";
+  const last = lastOutreachDate(c);
   if (!last) return "";
   const d = daysSince(last);
   if (d >= NURTURE_TO_DAYS) return "stale";
@@ -2184,6 +2187,33 @@ function computeSynthesis(state, apps, zone) {
        completed before doneAt stamping existed)
      · every logged touch point date
    Works for both applications and account contacts — they share these fields. */
+/* Commenting on someone's post keeps you visible, but it isn't outreach —
+   nobody was asked anything. Older engagement touch points only carry the
+   note, newer ones carry the flag too. */
+const isEngagementTouch = (t) => !!t?.engage || /^Engaged with a post/i.test(t?.note || "");
+
+/* The nurture clock: like lastActivityDate, but only counting things that
+   were actually outreach — messages, emails, calls, ticked follow-ups, the
+   first contact, a plan restart. Engaging with a post doesn't reset it, or
+   a lead you only like posts from would never count as gone quiet. */
+function lastOutreachDate(a) {
+  if (!a) return "";
+  let latest = a.contacted || "";
+  const bump = (d) => {
+    if (d && d > latest) latest = d;
+  };
+  const fus = Array.isArray(a.followUps) ? a.followUps : [];
+  fus.forEach((f, i) => {
+    if (!f?.done) return;
+    bump(f.doneAt || (anchorOf(a) ? followUpDueDate(anchorOf(a), fus, i) : ""));
+  });
+  (a.touchpoints || []).forEach((t) => {
+    if (!isEngagementTouch(t)) bump(t?.date);
+  });
+  bump(a.nurturedAt);
+  return latest;
+}
+
 function lastActivityDate(a) {
   if (!a) return "";
   let latest = a.contacted || "";
@@ -2234,6 +2264,57 @@ function computeAutoArchivable(state, apps) {
     return !!last && last <= cutoff;
   });
 }
+/* ---- automatic move to nurture ----
+   A contact still at "outreach" with no real outreach for 30+ days isn't
+   mid-sequence any more. It's moved to "for nurture" AND given a plan sized
+   to how long it's been quiet — the longer the silence, the longer the space
+   before trying again:
+
+     30–59 days quiet  →  30-day plan
+     60–89 days quiet  →  60-day plan
+     90+   days quiet  →  90-day plan
+
+   The plan starts a new cycle today (see applyNurtureTrack), so its first
+   touch is 30/60/90 days out, then two more a week apart. You can switch
+   the plan on the contact card at any time.
+
+   Deliberately narrow:
+   - only "outreach". A lead that replied and went quiet is a conversation;
+     moving it would overwrite "replied", so that call stays yours
+   - LinkedIn post engagement doesn't count as outreach (lastOutreachDate)
+   - a follow-up scheduled in the FUTURE means something is planned, so it
+     waits; an overdue one doesn't protect it — that's the neglect this is for
+   - a contact already moved to nurture without a plan (by an earlier version
+     of this sweep) gets its plan assigned the same way */
+const AUTO_NURTURE_TIERS = [
+  { minDays: 90, track: "90" },
+  { minDays: 60, track: "60" },
+  { minDays: 30, track: "30" },
+];
+const AUTO_NURTURE_MIN_DAYS = 30;
+const autoNurtureTrackFor = (quietDays) => AUTO_NURTURE_TIERS.find((t) => quietDays >= t.minDays)?.track || "";
+
+function computeAutoNurture(state) {
+  const out = [];
+  (state?.accounts || []).forEach((acc) => {
+    if (acc.archivedAt || acc.tombstoned) return;
+    (acc.contacts || []).forEach((c) => {
+      if (c.archivedAt || c.tombstoned) return;
+      const planless = c.status === "nurture" && !c.nurtureTrack && !!c.autoNurturedAt;
+      if (c.status !== "outreach" && !planless) return;
+      if (!planless) {
+        const next = nextFollowUp(c);
+        if (next && next.date > today()) return;
+      }
+      const last = lastOutreachDate(c);
+      const days = last ? daysSince(last) : null;
+      if (days === null || days < AUTO_NURTURE_MIN_DAYS) return;
+      out.push({ accountId: acc.id, contactId: c.id, days, track: autoNurtureTrackFor(days) });
+    });
+  });
+  return out;
+}
+
 const HOUSEKEEPING_TOMBSTONE_DAYS = 30;
 function computeHousekeepingProposals(state, apps) {
   const cutoff = addDays(today(), -HOUSEKEEPING_STALE_DAYS);
@@ -4350,7 +4431,7 @@ export default function FlightDeck() {
                     : {
                         ...c,
                         lastEngagedAt: today(),
-                        touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "LinkedIn", note: "Engaged with a post" }],
+                        touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "LinkedIn", note: "Engaged with a post", engage: true }],
                       }
                 ),
               }
@@ -4367,8 +4448,15 @@ export default function FlightDeck() {
   const nurtureList = useMemo(
     () =>
       (state.accounts || [])
-        .flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt && nurtureState(c)).map((c) => ({ ...c, _company: a.company, _accountId: a.id, _state: nurtureState(c) })))
-        .sort((a, b) => (lastActivityDate(a) || "9999").localeCompare(lastActivityDate(b) || "9999")),
+        /* plus anyone moved to nurture who's still waiting for a plan — the
+           auto-move puts them there overnight, and this is where you'll see it */
+        .flatMap((a) =>
+          (a.contacts || [])
+            .filter((c) => !c.archivedAt && (nurtureState(c) || (c.status === "nurture" && !c.nurtureTrack)))
+            .map((c) => ({ ...c, _company: a.company, _accountId: a.id, _state: nurtureState(c) || "plan" }))
+        )
+        /* plan-needed first — they're the ones waiting on a decision */
+        .sort((a, b) => (a._state === "plan" ? 0 : 1) - (b._state === "plan" ? 0 : 1) || (lastOutreachDate(a) || "9999").localeCompare(lastOutreachDate(b) || "9999")),
     [state.accounts]
   );
 
@@ -5012,6 +5100,64 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       applications: s.applications.map((a) => (ids.has(a.id) ? { ...a, archivedAt: today(), autoArchived: true } : a)),
     }));
     setTimeout(() => flash(`🗄 Filed ${stale.length} application${stale.length === 1 ? "" : "s"} with no answer in ${days}+ days — see the Archived filter to restore`), 600);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  /* ---- daily move to nurture ----
+     Same once-a-day shape as auto-archive. Each moved contact gets a history
+     entry saying why, and its pipeline row is reconciled so the funnel still
+     sees it as outreach. */
+  const autoNurtureChecked = useRef(false);
+  useEffect(() => {
+    if (!loaded || autoNurtureChecked.current) return;
+    autoNurtureChecked.current = true;
+    if (state.lastAutoNurtureDate === today()) return;
+    const due = computeAutoNurture(state);
+    if (!due.length) {
+      mutate((s) => ({ ...s, lastAutoNurtureDate: today() }));
+      return;
+    }
+    /* accountId -> (contactId -> the move) */
+    const byAccount = new Map();
+    due.forEach((d) => {
+      if (!byAccount.has(d.accountId)) byAccount.set(d.accountId, new Map());
+      byAccount.get(d.accountId).set(d.contactId, d);
+    });
+    mutate((s) => {
+      let next = { ...s, lastAutoNurtureDate: today() };
+      byAccount.forEach((ids, accountId) => {
+        const oldContacts = (next.accounts || []).find((a) => a.id === accountId)?.contacts || [];
+        next = {
+          ...next,
+          accounts: (next.accounts || []).map((a) =>
+            a.id !== accountId
+              ? a
+              : {
+                  ...a,
+                  contacts: (a.contacts || []).map((c) => {
+                    const move = ids.get(c.id);
+                    if (!move) return c;
+                    const planned = applyNurtureTrack(c, move.track);
+                    return {
+                      ...planned,
+                      autoNurturedAt: today(),
+                      history: withLog(planned, [
+                        logEntry("status", `🌱 Put on a ${nurtureTrack(move.track)?.label || "nurture plan"} automatically — no outreach in ${move.days} days`),
+                      ]).history,
+                    };
+                  }),
+                }
+          ),
+        };
+        next = reconcileAccountApplications(next, accountId, oldContacts);
+      });
+      return next;
+    });
+    setTimeout(() => {
+      const n = (k) => due.filter((d) => d.track === k).length;
+      const parts = ["30", "60", "90"].filter((k) => n(k)).map((k) => `${n(k)} on ${k}-day`);
+      flash(`🌱 ${due.length} contact${due.length === 1 ? "" : "s"} moved to nurture (${parts.join(", ")}) — see Accounts → For nurture`);
+    }, 900);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
@@ -7041,11 +7187,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       {nurtureList.length > 0 && (
         <div style={{ background: "rgba(245,185,66,0.06)", border: `1px solid ${C.amber}`, borderRadius: 14, padding: "12px 16px", marginBottom: 14 }}>
           <Label>
-            🌱 Going quiet — {nurtureList.filter((c) => c._state === "nurture").length} nurture
+            🌱 Nurture
+            {nurtureList.filter((c) => c._state === "plan").length > 0 ? ` — ${nurtureList.filter((c) => c._state === "plan").length} need a plan` : ""}
+            {nurtureList.filter((c) => c._state === "nurture").length > 0 ? `, ${nurtureList.filter((c) => c._state === "nurture").length} going quiet` : ""}
             {nurtureList.filter((c) => c._state === "stale").length > 0 ? `, ${nurtureList.filter((c) => c._state === "stale").length} gone cold` : ""}
           </Label>
           <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
-            No movement in 60+ days. These aren&apos;t dead — they&apos;re the cheapest leads you have, because someone already knows who you are.
+            No outreach in {NURTURE_FROM_DAYS}+ days (liking posts doesn&apos;t count). These aren&apos;t dead — they&apos;re the cheapest leads you have, because someone
+            already knows who you are. Tap one to pick a plan.
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {nurtureList.slice(0, 5).map((c) => (
@@ -7060,11 +7209,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   <span style={{ color: C.muted }}> · {c._company}</span>
                 </span>
                 <span style={{ fontFamily: mono, fontSize: 10, color: c._state === "stale" ? C.muted : C.amber, flexShrink: 0 }}>
-                  {daysSince(lastActivityDate(c))}d{c._state === "stale" ? " cold" : ""}
+                  {c._state === "plan" ? "PICK PLAN · " : ""}
+                  {daysSince(lastOutreachDate(c))}d{c._state === "stale" ? " cold" : ""}
                 </span>
               </div>
             ))}
-            {nurtureList.length > 5 && <div style={{ fontSize: 11, color: C.muted }}>+ {nurtureList.length - 5} more in Accounts → Nurture</div>}
+            {nurtureList.length > 5 && <div style={{ fontSize: 11, color: C.muted }}>+ {nurtureList.length - 5} more in Accounts → For nurture / Going quiet</div>}
           </div>
         </div>
       )}
@@ -8640,7 +8790,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         group: "Relationship",
         items: [
           /* the STATUS — leads you've deliberately put on a plan */
-          { key: "forNurture", label: `🌱 For nurture (${allContacts.filter((c) => c.status === "nurture").length})` },
+          {
+            key: "forNurture",
+            label: (() => {
+              const inN = allContacts.filter((c) => c.status === "nurture");
+              const needPlan = inN.filter((c) => !c.nurtureTrack).length;
+              return `🌱 For nurture (${inN.length}${needPlan ? ` · ${needPlan} need a plan` : ""})`;
+            })(),
+          },
           /* the auto-detected signal — quiet 60+ days with no plan. Renamed
              from "Nurture" so the two don't read as the same thing */
           { key: "nurture", label: `💤 Going quiet (${allContacts.filter((c) => nurtureState(c) === "nurture").length})` },
@@ -13505,7 +13662,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                               onClick={() =>
                                 setContact({
                                   lastEngagedAt: today(),
-                                  touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "LinkedIn", note: "Engaged with a post" }],
+                                  touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "LinkedIn", note: "Engaged with a post", engage: true }],
                                 })
                               }
                               style={{ padding: "6px 10px", fontSize: 12, flexShrink: 0 }}
@@ -14658,7 +14815,10 @@ const nurturePlanLine = (c) => {
   const fus = c.followUps || [];
   const done = fus.filter((f) => f.done).length;
   const next = nextFollowUp(c);
-  return `${plan.label} · ${done}/${fus.length} touches${next ? ` · next ${next.date}` : " · plan complete"}`;
+  /* an auto-assigned plan says so, so it's clear it was the sweep's call
+     rather than yours — and that you can switch it */
+  const auto = c.autoNurturedAt && c.autoNurturedAt === c.nurturedAt ? " · set automatically" : "";
+  return `${plan.label} · ${done}/${fus.length} touches${next ? ` · next ${next.date}` : " · plan complete"}${auto}`;
 };
 
 /* One person, on their own. Opening a whole account to reach one contact
@@ -14840,7 +15000,13 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
           return (
             <div style={{ background: "rgba(245,185,66,0.06)", border: `1px solid ${onPlan || nurture === "nurture" ? C.amber : C.panelEdge}`, borderRadius: 10, padding: "9px 11px", marginBottom: 10 }}>
               {onPlan ? (
-                <div style={{ fontSize: 11, color: C.amber, lineHeight: 1.5, marginBottom: 8 }}>🌱 {nurturePlanLine(c)}</div>
+                <div style={{ fontSize: 11, color: C.amber, lineHeight: 1.5, marginBottom: 8 }}>
+                  🌱{" "}
+                  {nurturePlanLine(c) ||
+                    (c.autoNurturedAt
+                      ? `Moved here automatically on ${c.autoNurturedAt} — no outreach in ${NURTURE_FROM_DAYS}+ days. Pick a plan:`
+                      : "In nurture with no plan yet. Pick one:")}
+                </div>
               ) : nurture ? (
                 <div style={{ fontSize: 11, color: nurture === "nurture" ? C.amber : C.muted, lineHeight: 1.5, marginBottom: 8 }}>
                   🌱 {NURTURE_META[nurture].hint}. Pick a plan:
