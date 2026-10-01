@@ -605,6 +605,42 @@ function contactFromApplicationData(data) {
 /* The company-level half. Notes and bad-fit reasons were being thrown away
    here too — an application's notes are about the company as much as the
    person, so they're kept on BOTH rather than picked between. */
+/* ---- keeping the job post when an application becomes an account ----
+   The original pipeline row is removed on conversion and its replacement is
+   rebuilt from the CONTACT, which has nowhere to hold a role, post link,
+   screenshot or salary — so all of it vanished. It's written into the
+   account's notes (readable where you'll look) and also kept as a structured
+   copy (`sourceApplications`), so nothing depends on parsing the note back. */
+const jobPostSnapshot = (app) => ({
+  role: app.role || "",
+  postLink: app.postLink || "",
+  screenshotLink: app.screenshotLink || "",
+  postShot: app.postShot || "",
+  salary: app.salary || "",
+  offer: app.offer || "",
+  source: app.source || "",
+  jobBoardName: app.jobBoardName || "",
+  status: app.status || "",
+  contacted: app.contacted || "",
+  convertedAt: today(),
+});
+function jobPostNote(app) {
+  const j = jobPostSnapshot(app);
+  const lines = [
+    `📋 From application — converted ${j.convertedAt}`,
+    j.role && `Role: ${j.role}`,
+    j.postLink && `Job post: ${j.postLink}`,
+    j.screenshotLink && `Screenshot: ${j.screenshotLink}`,
+    j.postShot && `Uploaded screenshot: ${shotPublicUrl(j.postShot)}`,
+    (j.salary || j.offer) && `Salary / offer: ${[j.salary, j.offer].filter(Boolean).join(" / ")}`,
+    j.source && `Found via: ${j.source}${j.jobBoardName ? ` · ${j.jobBoardName}` : ""}`,
+    (j.status || j.contacted) && `Was: ${[j.status, j.contacted && `contacted ${j.contacted}`].filter(Boolean).join(", ")}`,
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+/* appends the block to existing notes rather than replacing them */
+const withJobPostNote = (notes, app) => [(notes || "").trim(), jobPostNote(app)].filter(Boolean).join("\n\n");
+
 function convertApplicationToAccount(app) {
   return {
     id: uid(),
@@ -615,7 +651,10 @@ function convertApplicationToAccount(app) {
     status: "",
     highConfidence: !!app.highConfidence,
     badReasons: Array.isArray(app.badReasons) ? [...app.badReasons] : [],
-    notes: app.notes || "",
+    notes: withJobPostNote(app.notes, app),
+    /* the tag: this account started life as an application */
+    fromApplication: true,
+    sourceApplications: [jobPostSnapshot(app)],
     /* pool membership survives the shape change, so coverage doesn't drop */
     ...(app.fromPool ? { fromPool: true, poolName: app.poolName || "", hook: app.hook || "", researchedAt: app.researchedAt || "", poolAddedAt: app.poolAddedAt || today() } : {}),
     contacts: [contactFromApplicationData(app)],
@@ -691,7 +730,19 @@ function mergeApplicationIntoAccount(existingApp, newAppData, accounts) {
       matchIdx !== -1
         ? existingAccount.contacts.map((c, i) => (i === matchIdx ? { ...c, ...newContact, id: c.id, linkedApplicationId: c.linkedApplicationId } : c))
         : [...existingAccount.contacts, newContact];
-    return (accounts || []).map((acc) => (acc.id === existingAccount.id ? { ...acc, contacts } : acc));
+    /* the merged-in application's job post is kept the same way a converted
+       one's is — this path dropped it too */
+    return (accounts || []).map((acc) =>
+      acc.id === existingAccount.id
+        ? {
+            ...acc,
+            contacts,
+            notes: withJobPostNote(acc.notes, newAppData),
+            fromApplication: true,
+            sourceApplications: [...(acc.sourceApplications || []), jobPostSnapshot(newAppData)],
+          }
+        : acc
+    );
   }
 
   /* no account yet — the existing application becomes one, per the normal
@@ -699,6 +750,8 @@ function mergeApplicationIntoAccount(existingApp, newAppData, accounts) {
      the one that came from the existing application (never the same contact
      twice, since a brand-new account only ever starts with one). */
   const newAccount = convertApplicationToAccount(existingApp);
+  newAccount.notes = withJobPostNote(newAccount.notes, newAppData);
+  newAccount.sourceApplications = [...newAccount.sourceApplications, jobPostSnapshot(newAppData)];
   const existingContactName = (existingApp.contact || "").trim().toLowerCase();
   if (newContactName && newContactName === existingContactName) {
     newAccount.contacts = [{ ...newAccount.contacts[0], ...newContact, id: newAccount.contacts[0].id }];
@@ -8767,6 +8820,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
              list disagreed. */
           { key: "outreachedContacts", label: `✓ Contacted (${allContacts.filter(isContactOutreached).length})` },
           { key: "highConfidence", label: `⭐ High confidence (${accounts.filter((a) => a.highConfidence).length})` },
+          { key: "fromApplication", label: `📋 From application (${accounts.filter((a) => a.fromApplication).length})` },
           { key: "closed", label: `Closed (${accounts.filter((a) => a.status === "closed").length})` },
           { key: "badFit", label: `🚫 Bad fit (${accounts.filter((a) => a.status === "bad fit").length})` },
         ],
@@ -8826,6 +8880,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ? isAccountOpen(acc)
           : accFilter === "highConfidence"
           ? !!acc.highConfidence
+          : accFilter === "fromApplication"
+          ? !!acc.fromApplication
           : accFilter === "notContacted"
           ? liveContacts(acc).some(isContactBlankStatus)
           : accFilter === "untouched"
@@ -9200,6 +9256,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                           {cellInput(acc, "website", { ph: "website.com", onCommit: updateAccountField })}
                           {acc.website && openLink(acc.website, { title: "Open website" })}
                         </div>
+                        {acc.fromApplication && (
+                          <span
+                            title={(acc.sourceApplications || []).map((j) => [j.role, j.postLink].filter(Boolean).join(" — ")).filter(Boolean).join("\n") || "Converted from an application — the job post is in the notes"}
+                            style={{ display: "inline-block", marginTop: 3, border: `1px solid ${C.blue}`, borderRadius: 5, color: C.blue, fontFamily: mono, fontSize: 9, padding: "1px 5px", letterSpacing: 0.4 }}
+                          >
+                            📋 FROM APPLICATION
+                          </span>
+                        )}
                       </td>
                       <td style={{ ...td, minWidth: 120 }}>
                         {cellInput(acc, "industry", { ph: "Industry", onCommit: updateAccountField })}
@@ -9327,6 +9391,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                       {acc.highConfidence && <span style={{ color: C.amber }}>⭐</span>}
                       <div style={{ fontWeight: 700, fontSize: 14 }}>{acc.company || "Unnamed"}</div>
+                      {acc.fromApplication && (
+                        <span title="Converted from an application — the job post is in the notes" style={{ border: `1px solid ${C.blue}`, borderRadius: 5, color: C.blue, fontFamily: mono, fontSize: 9, padding: "1px 4px" }}>
+                          📋 APP
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontFamily: mono, fontSize: 11, color: anyDue ? C.red : C.muted, flexShrink: 0 }}>
                       {contacts.length ? `${contacts.length} contact${contacts.length === 1 ? "" : "s"}` : "🕳 no contacts yet"}{anyDue ? " ⚑" : ""}
@@ -13853,7 +13922,45 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               + Add another contact
             </button>
 
-            <Field label="Notes" value={f.notes} onChange={set("notes")} placeholder="relationship notes, how you connected…" />
+            {/* multi-line: notes now carry the job post block from a converted
+                application, and a single-line input would both crush it onto
+                one line and strip the line breaks the first time you edited it */}
+            <div style={{ marginBottom: 12 }}>
+              <Label>Notes</Label>
+              <textarea
+                value={f.notes}
+                onChange={(e) => set("notes")(e.target.value)}
+                placeholder="relationship notes, how you connected…"
+                rows={Math.min(12, Math.max(3, (f.notes || "").split("\n").length + 1))}
+                style={{ ...inputStyle, fontFamily: sans, resize: "vertical", lineHeight: 1.5 }}
+              />
+              {/* the job posts this account came from, as real links — the note
+                  text can be edited freely without losing these */}
+              {(entry?.sourceApplications || []).some((j) => j.postLink || j.screenshotLink || j.postShot) && (
+                <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                  {(entry?.sourceApplications || []).map((j, k) => (
+                    <div key={k} style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", fontSize: 12 }}>
+                      <span style={{ color: C.muted }}>📋 {j.role || "Application"}</span>
+                      {j.postLink && (
+                        <a href={j.postLink} target="_blank" rel="noreferrer" style={{ color: C.blue, textDecoration: "none" }}>
+                          job post ↗
+                        </a>
+                      )}
+                      {j.screenshotLink && (
+                        <a href={j.screenshotLink} target="_blank" rel="noreferrer" style={{ color: C.blue, textDecoration: "none" }}>
+                          screenshot ↗
+                        </a>
+                      )}
+                      {j.postShot && (
+                        <a href={shotPublicUrl(j.postShot)} target="_blank" rel="noreferrer" style={{ color: C.blue, textDecoration: "none" }}>
+                          uploaded screenshot ↗
+                        </a>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
 
             {entry &&
               (() => {
