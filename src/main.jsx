@@ -252,6 +252,13 @@ const isContactOutreached = (c) => !!c.status; /* any status set means real cont
    was created. `contacted` itself is never moved: it's the history that says
    this is a re-approach rather than a first touch. */
 const anchorOf = (a) => a?.nurturedAt || a?.contacted || "";
+/* Calls keep their own anchor. A call that never connected is not outreach, so
+   it must not stamp `contacted` — but its retry still needs a date to count
+   from. `callAnchor` is that date: set by the first attempt on a lead with no
+   contact date, and kept afterwards so the call dates don't shift when the
+   lead is later contacted for real. */
+const phoneAnchorOf = (a) => a?.nurturedAt || a?.callAnchor || a?.contacted || "";
+const anchorFor = (a, track) => (track === "Phone call" ? phoneAnchorOf(a) : anchorOf(a));
 
 /* ---- nurture plans ----
    A quiet lead isn't one thing. Some need a month's space, some a quarter;
@@ -390,6 +397,12 @@ const engagementOverdueDays = (c) => {
   return due && due <= today() ? daysSince(due) : 0;
 };
 
+/* a call follow-up that has come due, whether or not the lead is in the funnel
+   yet — a retry after a no-answer belongs in the call queue either way */
+const isCallDue = (c) => {
+  const n = nextFollowUpOn(c, "Phone call");
+  return !!(n && isContactOpen(c) && n.date <= today());
+};
 const isContactDue = (c) => {
   if (isContactBlankStatus(c)) return false;
   const n = nextFollowUp(c);
@@ -826,6 +839,7 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
          compute its due dates from the original contact date and disagree
          with the contact about when the next touch is due */
       nurturedAt: c.nurturedAt || "",
+      callAnchor: c.callAnchor || "",
       nurtureTrack: c.status === "nurture" ? c.nurtureTrack || "" : "",
       pastFollowUps: (c.pastFollowUps || []).map((f) => ({ ...f })),
       nurtureCycle: c.nurtureCycle || 0,
@@ -1302,23 +1316,50 @@ const workItemReadiness = (w) => (w.worked ? "contacted" : (w.hook || "").trim()
    time, find another route, or fix the number, and flattening them into the
    email vocabulary throws away the instruction.
 
-   `landed` marks the outcomes where your message actually reached them. Every
-   logged call ticks a follow-up by default — dialling is the outreach work, and
-   the tick records that you did it — so this flag no longer gates that. It
-   drives the wording instead: after a no-answer the modal says plainly that the
-   slot is being used on an attempt that didn't connect, so burning a follow-up
-   is a choice you make rather than one made for you. */
+   `connects` is whether the outcome means you actually got THEM on the phone.
+   Only a connected call counts as outreach: it is the only kind that stamps a
+   contact date, starts the lead in the funnel, or resets the nurture clock.
+   Everything else is logged as an attempt — visible in the history and the
+   call counts, invisible to the outreach numbers. It is a default, not a
+   verdict: the log has a switch, because a voicemail-turned-pickup or a
+   gatekeeper who put you through are real. `fixed` outcomes can't be switched
+   — a no-answer is never a connection, and "spoke with them" always is. */
 const CALL_OUTCOMES = [
-  { key: "spoke", label: "Spoke with them", tone: "green", landed: true },
-  { key: "voicemail", label: "Left a voicemail", tone: "amber", landed: true },
-  { key: "callback", label: "Asked to call back", tone: "blue", landed: true },
-  { key: "noanswer", label: "No answer", tone: "muted", landed: false },
-  { key: "gatekeeper", label: "Blocked by gatekeeper", tone: "amber", landed: false },
-  { key: "wrongnumber", label: "Wrong number", tone: "red", landed: false },
-  { key: "notinterested", label: "Not interested", tone: "red", landed: true },
-  { key: "cannotcontact", label: "Can't be reached", tone: "red", landed: false },
+  { key: "spoke", label: "Spoke with them", tone: "green", connects: true, fixed: true },
+  { key: "voicemail", label: "Left a voicemail", tone: "amber", connects: false },
+  { key: "callback", label: "Asked to call back", tone: "blue", connects: true },
+  { key: "noanswer", label: "No answer", tone: "muted", connects: false, fixed: true },
+  { key: "gatekeeper", label: "Blocked by gatekeeper", tone: "amber", connects: false },
+  { key: "wrongnumber", label: "Wrong number", tone: "red", connects: false, fixed: true },
+  { key: "notinterested", label: "Not interested", tone: "red", connects: true },
+  { key: "cannotcontact", label: "Can't be reached", tone: "red", connects: false, fixed: true },
 ];
 const callOutcome = (k) => CALL_OUTCOMES.find((o) => o.key === k) || null;
+const isCallTouch = (t) => t?.channel === "Phone call";
+/* Did this logged call connect? New calls say so outright. Older ones only
+   carry the outcome label at the start of the note, so that is read back; a
+   phone touch point typed in by hand has neither and is taken at its word. */
+const callConnected = (t) => {
+  if (typeof t?.connected === "boolean") return t.connected;
+  const o = CALL_OUTCOMES.find((x) => (t?.note || "").startsWith(x.label));
+  return o ? o.connects : true;
+};
+const isUnconnectedCall = (t) => isCallTouch(t) && !callConnected(t);
+/* A lead that sits in the funnel ONLY because an unanswered call put it there
+   — the old behaviour, where dialling alone counted as contact. Deliberately
+   narrow: any sign of other outreach (a cold/warm choice, a reply, a written
+   follow-up sent, any non-call touch point, a contact date that predates the
+   first call) and it is left alone. */
+const countedByCallOnly = (c) => {
+  if (!c || c.status !== "outreach" || c.outreachKind || c.gotReply || c.archivedAt || c.tombstoned) return false;
+  const tps = c.touchpoints || [];
+  const calls = tps.filter(isCallTouch);
+  if (!calls.length || calls.length !== tps.length || calls.some(callConnected)) return false;
+  if ((c.followUps || []).some((f) => f.done && f.channel !== "Phone call")) return false;
+  return c.contacted === calls.map((t) => t.date).sort()[0];
+};
+/* takes it back out of the funnel, keeping the call dates where they were */
+const uncountCallOnly = (c) => ({ ...c, status: "", contacted: "", callAnchor: c.callAnchor || c.contacted || "" });
 
 /* ---- how far the call got ----
    The outcome says what happened to the call; the stage says how far you got
@@ -1346,7 +1387,7 @@ const CALLBACK_DAYS = [3, 5, 7, 14, 30, 60];
 const CALL_CLOSES = ["notinterested", "cannotcontact", "wrongnumber"];
 /* speaking to someone, or being asked to call back, means a human engaged —
    that's the same signal the email side calls a reply */
-const CALL_IS_REPLY = ["spoke", "callback"];
+const CALL_IS_REPLY = ["spoke", "callback"]; /* only when the call connected */
 /* what closes an APPLICATION from a call — narrower than for a contact */
 const APP_CALL_CLOSES = ["notinterested"];
 
@@ -2259,11 +2300,14 @@ function lastOutreachDate(a) {
   };
   const fus = Array.isArray(a.followUps) ? a.followUps : [];
   fus.forEach((f, i) => {
-    if (!f?.done) return;
-    bump(f.doneAt || (anchorOf(a) ? followUpDueDate(anchorOf(a), fus, i) : ""));
+    /* a follow-up ticked by a call that didn't connect is an attempt */
+    if (!f?.done || f.attempt) return;
+    const anchor = anchorFor(a, trackOf(f));
+    bump(f.doneAt || (anchor ? followUpDueDate(anchor, fus, i) : ""));
   });
   (a.touchpoints || []).forEach((t) => {
-    if (!isEngagementTouch(t)) bump(t?.date);
+    /* nor is a call nobody picked up */
+    if (!isEngagementTouch(t) && !isUnconnectedCall(t)) bump(t?.date);
   });
   bump(a.nurturedAt);
   return latest;
@@ -2278,7 +2322,8 @@ function lastActivityDate(a) {
   const fus = Array.isArray(a.followUps) ? a.followUps : [];
   fus.forEach((f, i) => {
     if (!f?.done) return;
-    bump(f.doneAt || (anchorOf(a) ? followUpDueDate(anchorOf(a), fus, i) : ""));
+    const anchor = anchorFor(a, trackOf(f));
+    bump(f.doneAt || (anchor ? followUpDueDate(anchor, fus, i) : ""));
   });
   (a.touchpoints || []).forEach((t) => bump(t?.date));
   /* restarting a nurtured lead IS activity — without this the contact stays
@@ -2574,31 +2619,41 @@ const trackPos = (fus, i) => (fus || []).slice(0, i + 1).filter((x) => trackOf(x
    logged (account form, call queue / contact card, application form) so they
    can't drift apart. `phoneKey` and `closes`/`closedStatus` differ between a
    contact and an application; everything else is the same. */
-function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays }, { phoneKey = "phone", closes = CALL_CLOSES, closedStatus = "closed" } = {}) {
+function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays, connected }, { phoneKey = "phone", closes = CALL_CLOSES, closedStatus = "closed" } = {}) {
   const o = callOutcome(outcome);
-  const st = callStage(stage);
+  /* what you indicated in the log, unless the outcome settles it by itself */
+  const reached = o?.fixed || typeof connected !== "boolean" ? !!o?.connects : connected;
+  const st = reached ? callStage(stage) : null;
+  /* said out loud only when it differs from what the outcome implies */
+  const flag = reached === !!o?.connects ? "" : reached ? " · connected" : " · didn't connect";
   /* the stage rides in the note so it shows in the timeline without its own row */
-  const note = `${o?.label || "Call"}${st ? ` · ${st.label}` : ""}${(notes || "").trim() ? ` — ${notes.trim()}` : ""}`;
+  const note = `${o?.label || "Call"}${flag}${st ? ` · ${st.label}` : ""}${(notes || "").trim() ? ` — ${notes.trim()}` : ""}`;
   const next = {
     ...c,
-    /* the touch point IS the record of the call — it feeds the activity date,
-       the nurture clock and the timeline */
-    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: PHONE_TRACK, note }],
-    /* a call IS contact, so an untouched record starts here */
-    contacted: c.contacted || today(),
-    status: c.status || "outreach",
+    /* every call is recorded, connected or not — the history and the call
+       counts want the attempts too */
+    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: PHONE_TRACK, note, outcome, connected: reached }],
   };
+  if (reached) {
+    /* only a call that connected is contact — an untouched record starts here */
+    next.contacted = c.contacted || today();
+    next.status = c.status || "outreach";
+  } else if (!phoneAnchorOf(c)) {
+    /* not outreach, so no contact date — but the retry needs a day to count from */
+    next.callAnchor = today();
+  }
   if (tickFollowUp && followUpIndex >= 0) {
     /* guard: only a phone entry can be ticked by a call, so a stale index
-       can't mark an email as sent */
-    next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex && isPhoneFu(x) ? { ...x, done: true, doneAt: today() } : x));
+       can't mark an email as sent. `attempt` keeps a tick earned by an
+       unconnected call out of the outreach numbers. */
+    next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex && isPhoneFu(x) ? { ...x, done: true, doneAt: today(), attempt: !reached } : x));
   }
   /* furthest stage ever reached, so a weaker later call doesn't erase it */
-  if (stage && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
+  if (st && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
   /* a call-back becomes a real dated phone follow-up */
-  if (callbackDays > 0) next.followUps = insertCallback(anchorOf(next) || today(), next.followUps || c.followUps || [], callbackDays);
+  if (callbackDays > 0) next.followUps = insertCallback(phoneAnchorOf(next) || today(), next.followUps || c.followUps || [], callbackDays);
   if (closes.includes(outcome)) next.status = closedStatus;
-  if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
+  if (reached && CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
   /* a wrong number shouldn't stay in the field inviting a redial */
   if (outcome === "wrongnumber") next[phoneKey] = "";
   return next;
@@ -2617,11 +2672,10 @@ function followUpDueDate(contacted, fus, index) {
 
 /* next pending entry on one track, or across all when no track is given */
 function nextFollowUpOn(a, track) {
-  if (!anchorOf(a)) return null;
   const fus = normFollowUps(a);
-  const i = fus.findIndex((f) => !f.done && (track === undefined || trackOf(f) === track));
+  const i = fus.findIndex((f) => !f.done && (track === undefined || trackOf(f) === track) && anchorFor(a, trackOf(f)));
   if (i === -1) return null;
-  return { date: followUpDueDate(anchorOf(a), fus, i), index: i, total: fus.length, track: trackOf(fus[i]) };
+  return { date: followUpDueDate(anchorFor(a, trackOf(fus[i])), fus, i), index: i, total: fus.length, track: trackOf(fus[i]) };
 }
 /* ---- scheduling a call-back ----
    The schedule is CUMULATIVE: [3, 7, 14] means days 3, 10 and 24 after
@@ -2671,12 +2725,15 @@ function insertCallback(contacted, fus, daysFromToday) {
    due before an email listed first. Picking by index would have reported the
    later date and hidden an overdue call from the due queue. */
 const nextFollowUp = (a) => {
-  if (!anchorOf(a)) return null;
+  if (!anchorOf(a) && !phoneAnchorOf(a)) return null;
   const fus = normFollowUps(a);
   let best = null;
   fus.forEach((f, i) => {
     if (f.done) return;
-    const date = followUpDueDate(anchorOf(a), fus, i);
+    /* each track counts from its own anchor; a track with none isn't running */
+    const anchor = anchorFor(a, trackOf(f));
+    if (!anchor) return;
+    const date = followUpDueDate(anchor, fus, i);
     if (!best || date < best.date) best = { date, index: i, total: fus.length, track: trackOf(f) };
   });
   return best;
@@ -3295,7 +3352,7 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch, 
       },
       body: JSON.stringify({
         model: model || AI_PROVIDERS.anthropic.defaultModel,
-        max_tokens: AI_MAX_TOKENS,
+        max_tokens: cap,
         system,
         messages: [{ role: "user", content: user }],
         /* Anthropic runs this server-side and returns the finished text in one
@@ -4116,6 +4173,29 @@ export default function FlightDeck() {
       `☎ ${callOutcome(payload.outcome)?.label || "Call"} logged`
     );
   };
+  /* Takes contacts back out of the funnel when an unanswered call was the only
+     thing that put them there. Offered, never automatic: it changes the
+     outreach numbers, and that is the user's call to make. */
+  const uncountCallOnlyContacts = (ids) =>
+    mutate(
+      (st) => {
+        let next = st;
+        (st.accounts || []).forEach((acc) => {
+          if (!(acc.contacts || []).some((c) => ids.includes(c.id) && countedByCallOnly(c))) return;
+          const oldContacts = acc.contacts || [];
+          next = {
+            ...next,
+            accounts: (next.accounts || []).map((a) =>
+              a.id !== acc.id ? a : { ...a, contacts: (a.contacts || []).map((c) => (ids.includes(c.id) && countedByCallOnly(c) ? uncountCallOnly(c) : c)) }
+            ),
+          };
+          /* blanking the status is what removes the linked pipeline row */
+          next = reconcileAccountApplications(next, acc.id, oldContacts);
+        });
+        return next;
+      },
+      `${ids.length} ${ids.length === 1 ? "contact" : "contacts"} no longer counted as outreach`
+    );
   useEffect(() => setPipePage(0), [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
   /* bulk selection for converting applications to accounts */
   const [selectMode, setSelectMode] = useState(false);
@@ -6465,6 +6545,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       /* a plan set from the pipeline puts the contact in nurture;
                          ending it there takes the contact back to its mapped
                          status. Either way the schedule anchor travels too. */
+                      ...(data.callAnchor ? { callAnchor: data.callAnchor } : {}),
                       ...(data.nurturedAt !== undefined
                         ? { nurturedAt: data.nurturedAt, nurtureCycle: data.nurtureCycle || 0, pastFollowUps: (data.pastFollowUps || []).map((f) => ({ ...f })) }
                         : {}),
@@ -6781,8 +6862,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const recent = calls.filter((t) => t.date >= since);
     /* the note carries the outcome label, which is the only place the result
        of an individual call is recorded */
-    const isConnect = (t) => /Spoke with them|Asked to call back/i.test(t.note || "");
-    const connects = recent.filter(isConnect).length;
+    const connects = recent.filter(callConnected).length;
     const connectRate = recent.length ? Math.round((connects / recent.length) * 100) : null;
     /* best stage reached, per contact — the spread says where calls die */
     const staged = contacts.filter((c) => c.callStage);
@@ -6806,11 +6886,13 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const all = everyone.filter((x) => (x.followUps || []).length > 0);
     /* pastFollowUps holds what was sent before a nurture plan reset the
        schedule — it's still work done, so it still counts */
-    const doneFus = all.reduce((n, x) => n + (x.followUps || []).filter((f) => f.done).length + (x.pastFollowUps || []).length, 0);
+    /* a tick earned by a call that never connected is an attempt, not a follow-up */
+    const sent = (f) => f.done && !f.attempt;
+    const doneFus = all.reduce((n, x) => n + (x.followUps || []).filter(sent).length + (x.pastFollowUps || []).filter((f) => !f.attempt).length, 0);
     const avgFollowUps = all.length ? doneFus / all.length : 0;
     /* a lead sitting at one touch with nothing done is the leak — but only
        among leads that are actually meant to be followed up */
-    const oneAndDone = all.filter((x) => (x.followUps || []).filter((f) => f.done).length === 0 && isOpenApp(x)).length;
+    const oneAndDone = all.filter((x) => (x.followUps || []).filter(sent).length === 0 && isOpenApp(x)).length;
 
     const liAll = [...apps, ...contacts].filter((x) => !x.archivedAt && (x.linkedin || x.contactLinkedin) && x.liStatus);
     const requested = liAll.filter((x) => ["requested", "connected", "declined", "withdrawn"].includes(x.liStatus)).length;
@@ -10531,7 +10613,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
     const session = state.callSession || [];
     return rows
-      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact), dueDate: followUpOf(r.contact), dialable: hasPhone(r.contact), pick: session.indexOf(r.contact.id) }))
+      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact) || isCallDue(r.contact), dueDate: followUpOf(r.contact), dialable: hasPhone(r.contact), pick: session.indexOf(r.contact.id) }))
       .sort(
         (a, b) =>
           /* anything you picked leads, in the order you picked it — a manual
@@ -10553,6 +10635,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
 
   const renderCalls = () => {
     const uncalled = callQueue.filter((r) => r.calls === 0 && r.dialable).length;
+    const callOnly = callQueue.filter((r) => countedByCallOnly(r.contact));
     const unreachable = callQueue.filter((r) => !r.dialable).length;
     const picked = callQueue.filter((r) => r.pick !== -1).length;
     /* Search only narrows the UNPICKED remainder. Filtering the run you've
@@ -10667,6 +10750,33 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
         <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 12 }}>
           Everyone with a phone number, ordered by who&apos;s most worth calling — never-called first, then due, then longest since the last attempt. Closed contacts are left out.
         </div>
+        {callOnly.length > 0 && (
+          <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 12, padding: "10px 13px", marginBottom: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.amber }}>
+              {callOnly.length} counted as outreach from a call that never connected
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, margin: "2px 0 8px" }}>
+              Logged before calls had to connect to count. Tap a name to take it out of your outreach numbers — the call stays in its history.
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              {callOnly.map((r) => (
+                <button
+                  key={r.contact.id}
+                  onClick={() => uncountCallOnlyContacts([r.contact.id])}
+                  title={`${r.company || ""} — stop counting as outreach`}
+                  style={{ fontSize: 11, padding: "4px 10px", borderRadius: 14, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.ink, cursor: "pointer" }}
+                >
+                  {r.contact.name || "Unnamed"} ×
+                </button>
+              ))}
+              {callOnly.length > 1 && (
+                <Btn ghost onClick={() => uncountCallOnlyContacts(callOnly.map((r) => r.contact.id))} style={{ padding: "5px 11px", fontSize: 11 }}>
+                  Un-count all
+                </Btn>
+              )}
+            </div>
+          </div>
+        )}
         {callQueue.length === 0 ? (
           <div style={{ color: C.muted, fontSize: 13, padding: "20px 4px", textAlign: "center", lineHeight: 1.6 }}>
             No contacts have a phone number yet. Add one on a contact and they&apos;ll appear here.
@@ -11304,6 +11414,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         hookPolishedFrom: entry?.hookPolishedFrom ?? "",
         /* read-only here, but the form shows due dates, so it needs the anchor */
         nurturedAt: entry?.nurturedAt ?? "",
+        callAnchor: entry?.callAnchor ?? "",
         nurtureTrack: entry?.nurtureTrack ?? "",
         nurtureCycle: entry?.nurtureCycle ?? 0,
         pastFollowUps: Array.isArray(entry?.pastFollowUps) ? entry.pastFollowUps.map((f) => ({ ...f })) : [],
@@ -12188,14 +12299,15 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     </div>
                   )}
                   {phone.map(({ fu, i }, k) => {
-                    const d = anchorOf(f) ? followUpDueDate(anchorOf(f), fus, i) : "";
+                    const d = phoneAnchorOf(f) ? followUpDueDate(phoneAnchorOf(f), fus, i) : "";
                     const due = d && !fu.done && d <= today();
+                    const tried = fu.done && fu.attempt;
                     return (
                       <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
                         <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, width: isDesktop ? 78 : 16, flexShrink: 0 }}>{isDesktop ? `Call ${k + 1}` : k + 1}</div>
-                        <div style={{ fontFamily: mono, fontSize: 12, color: fu.done ? C.green : due ? C.red : C.ink, flex: 1, overflow: "hidden", whiteSpace: "nowrap" }}>
+                        <div style={{ fontFamily: mono, fontSize: 12, color: tried ? C.amber : fu.done ? C.green : due ? C.red : C.ink, flex: 1, overflow: "hidden", whiteSpace: "nowrap" }}>
                           {d || "set a contact date"}
-                          {fu.done ? ` ✓ called ${fu.doneAt || ""}` : due ? " ⚑ DUE" : ""}
+                          {tried ? ` ↺ tried ${fu.doneAt || ""}, no connect` : fu.done ? ` ✓ called ${fu.doneAt || ""}` : due ? " ⚑ DUE" : ""}
                         </div>
                         <button
                           /* not done → log the call (which ticks it); done → un-tick */
@@ -12221,7 +12333,11 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                         key={d}
                         /* dated from TODAY, like a call-back — "call in 7 days"
                            shouldn't land 7 days after a contact date weeks old */
-                        onClick={() => setF((p) => ({ ...p, contacted: p.contacted || today(), followUps: insertCallback(anchorOf(p) || today(), p.followUps || [], d) }))}
+                        onClick={() =>
+                          /* scheduling a call isn't contact, so this no longer
+                             stamps the contact date — it sets the calls' own anchor */
+                          setF((p) => ({ ...p, callAnchor: p.callAnchor || (phoneAnchorOf(p) ? "" : today()), followUps: insertCallback(phoneAnchorOf(p) || today(), p.followUps || [], d) }))
+                        }
                         style={{ fontFamily: mono, fontSize: 11, padding: "4px 9px", borderRadius: 14, border: `1px dashed ${C.panelEdge}`, background: "transparent", color: C.muted, cursor: "pointer" }}
                       >
                         {d}d
@@ -13949,8 +14065,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       <span style={{ fontSize: 10, color: C.muted }}>☎ Calls:</span>
                       {fus.map((fu, fi) => {
                         if (!isPhoneFu(fu)) return null;
-                        const due = anchorOf(c) ? followUpDueDate(anchorOf(c), fus, fi) : "";
+                        const due = phoneAnchorOf(c) ? followUpDueDate(phoneAnchorOf(c), fus, fi) : "";
                         const overdue = due && !fu.done && due <= today();
+                        const tried = fu.done && fu.attempt;
                         return (
                           <span key={fi} style={{ display: "inline-flex", alignItems: "center" }}>
                             <button
@@ -13959,19 +14076,19 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                                   ? setContact({ followUps: fus.map((x, xi) => (xi === fi ? { ...x, done: false, doneAt: "" } : x)) })
                                   : setCallContact({ contact: c, index: i })
                               }
-                              title={fu.done ? `Called ${fu.doneAt || ""} — tap to un-tick` : `Due ${due || "—"} — tap to log the call`}
+                              title={tried ? `Tried ${fu.doneAt || ""}, didn't connect — tap to un-tick` : fu.done ? `Called ${fu.doneAt || ""} — tap to un-tick` : `Due ${due || "—"} — tap to log the call`}
                               style={{
                                 fontFamily: mono,
                                 fontSize: 10,
                                 padding: "3px 8px",
                                 borderRadius: 10,
-                                border: `1px solid ${fu.done ? C.green : overdue ? C.red : C.panelEdge}`,
-                                background: fu.done ? "rgba(74,222,128,0.1)" : "transparent",
-                                color: fu.done ? C.green : overdue ? C.red : C.muted,
+                                border: `1px solid ${tried ? C.amber : fu.done ? C.green : overdue ? C.red : C.panelEdge}`,
+                                background: tried ? "rgba(245,185,66,0.1)" : fu.done ? "rgba(74,222,128,0.1)" : "transparent",
+                                color: tried ? C.amber : fu.done ? C.green : overdue ? C.red : C.muted,
                                 cursor: "pointer",
                               }}
                             >
-                              {fu.done ? "✓" : "☎"} {due ? due.slice(5) : `${fu.days}d`}
+                              {tried ? "↺" : fu.done ? "✓" : "☎"} {due ? due.slice(5) : `${fu.days}d`}
                             </button>
                             <button
                               onClick={() => setContact({ followUps: fus.filter((_, xi) => xi !== fi) })}
@@ -14760,7 +14877,10 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
   const [tickFollowUp, setTickFollowUp] = useState(true);
   const [stage, setStage] = useState("");
   const [callbackDays, setCallbackDays] = useState(0);
+  /* null = go with what the outcome implies; set once you say otherwise */
+  const [connectedPick, setConnectedPick] = useState(null);
   const picked = callOutcome(outcome);
+  const connected = !picked ? false : picked.fixed || connectedPick === null ? picked.connects : connectedPick;
   const fus = Array.isArray(contact.followUps) ? contact.followUps : [];
   /* only a PHONE follow-up can be ticked by a call. Ticking the next entry
      regardless of channel meant logging a call marked an email you hadn't
@@ -14817,7 +14937,11 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
             return (
               <button
                 key={o.key}
-                onClick={() => setOutcome(o.key)}
+                onClick={() => {
+                  setOutcome(o.key);
+                  /* a new outcome starts from its own default */
+                  setConnectedPick(null);
+                }}
                 style={{
                   textAlign: "left",
                   background: on ? `${col}1f` : "transparent",
@@ -14836,9 +14960,44 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
           })}
         </div>
 
+        {/* The line between an attempt and outreach. Only a connected call
+            stamps the contact date or counts anywhere as outreach, so it is
+            stated here rather than inferred silently. */}
+        {picked && (
+          <button
+            onClick={() => !picked.fixed && setConnectedPick(!connected)}
+            disabled={picked.fixed}
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              textAlign: "left",
+              background: connected ? "rgba(74,222,128,0.09)" : "transparent",
+              border: `1px solid ${connected ? C.green : C.panelEdge}`,
+              color: connected ? C.green : C.muted,
+              borderRadius: 10,
+              padding: "9px 12px",
+              fontSize: 13,
+              fontWeight: 700,
+              cursor: picked.fixed ? "default" : "pointer",
+              opacity: picked.fixed ? 0.75 : 1,
+              marginBottom: 4,
+            }}
+          >
+            {connected ? "☑ Connected on the phone" : "☐ Didn't connect on the phone"}
+          </button>
+        )}
+        {picked && (
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+            {connected
+              ? "Counts as outreach."
+              : "Logged as an attempt only — not counted as outreach."}
+            {picked.fixed ? "" : " Tap to change."}
+          </div>
+        )}
+
         {/* only meaningful once you actually spoke — a voicemail or a
             no-answer has no stages to have passed through */}
-        {picked && ["spoke", "callback", "notinterested"].includes(picked.key) && (
+        {picked && connected && (
           <>
             <Label>How far did the call get?</Label>
             <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
@@ -14871,16 +15030,16 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
 
         {/* Offered for every outcome that leaves the lead alive — a no-answer
             or a gatekeeper block is precisely when you want to schedule the
-            retry, and gating this on `landed` meant the outcomes that most
+            retry, and gating this on a connection meant the outcomes that most
             need a next attempt were the only ones that couldn't book one.
             Only the closing outcomes are excluded. */}
         {picked && !closes.includes(picked.key) && (
           <>
-            <Label>{picked.landed ? "Call back in…" : "Try again in…"}</Label>
+            <Label>{connected ? "Call back in…" : "Try again in…"}</Label>
             <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 4 }}>
               {/* an unanswered call is often worth retrying tomorrow at a
                   different time of day, which a 3-day minimum can't express */}
-              {[0, ...(picked.landed ? CALLBACK_DAYS : [1, 2, ...CALLBACK_DAYS])].map((d) => {
+              {[0, ...(connected ? CALLBACK_DAYS : [1, 2, ...CALLBACK_DAYS])].map((d) => {
                 const on = callbackDays === d;
                 return (
                   <button
@@ -14906,7 +15065,7 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
             <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
               {callbackDays
                 ? `Adds a follow-up due ${addDays(today(), callbackDays)} so it comes back in your due queue.`
-                : picked.landed
+                : connected
                 ? "No call-back scheduled — this call just gets logged."
                 : "No retry scheduled — without a date this attempt is easy to forget about."}
             </div>
@@ -14921,10 +15080,10 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
           style={{ ...inputStyle, minHeight: 84, resize: "vertical", fontSize: 13, marginBottom: 10 }}
         />
 
-        {/* Every logged call counts as follow-up work, not just the ones that
-            landed — dialling IS the outreach, and the tick records that you did
-            it. Still a toggle, because three no-answers in one afternoon would
-            otherwise burn the whole sequence without reaching anyone. */}
+        {/* Any logged call can clear the pending phone follow-up, so a
+            no-answer doesn't sit in the due list forever — but one that
+            didn't connect is recorded as tried, not as outreach. Still a
+            toggle, for when you'd rather keep it due. */}
         {picked && nextUnticked !== -1 && (
           <button
             onClick={() => setTickFollowUp((v) => !v)}
@@ -14945,10 +15104,10 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
             {tickFollowUp ? "☑" : "☐"} Also tick phone follow-up {phonePos}
           </button>
         )}
-        {picked && !picked.landed && tickFollowUp && nextUnticked !== -1 && (
+        {picked && !connected && tickFollowUp && nextUnticked !== -1 && (
           <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 10 }}>
-            You didn&apos;t reach them this time. The call still counts as phone follow-up {phonePos} — untick above if you&apos;d rather keep that slot for an attempt that
-            actually connects. Your email follow-ups are untouched either way.
+            You didn&apos;t reach them, so phone follow-up {phonePos} is marked as tried rather than done — it leaves your due list but isn&apos;t counted as outreach. Untick
+            above to keep it due. Your email follow-ups are untouched either way.
           </div>
         )}
         {picked && nextUnticked === -1 && (
@@ -14968,7 +15127,7 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
           </Btn>
           <Btn
             disabled={!outcome}
-            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked, stage, callbackDays })}
+            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked, stage: connected ? stage : "", callbackDays, connected })}
             style={{ flex: 2 }}
           >
             Log call
