@@ -1347,6 +1347,8 @@ const CALL_CLOSES = ["notinterested", "cannotcontact", "wrongnumber"];
 /* speaking to someone, or being asked to call back, means a human engaged —
    that's the same signal the email side calls a reply */
 const CALL_IS_REPLY = ["spoke", "callback"];
+/* what closes an APPLICATION from a call — narrower than for a contact */
+const APP_CALL_CLOSES = ["notinterested"];
 
 const POOL_READINESS_META = {
   parked: { label: "PARKED", color: "muted", hint: "no hook yet" },
@@ -2555,10 +2557,52 @@ const normFollowUps = (a) => {
    scheduled before it, and logging a call ticked whichever follow-up was next
    even when that one was an email you hadn't sent.
 
-   The channel already on each entry is the track. Entries with no channel
-   (everything written before this) form one default track together, so
-   existing schedules behave exactly as they did. */
-const trackOf = (fu) => (fu?.channel || "").trim();
+   There are exactly two tracks: calls ("Phone call") and everything written
+   (email, LinkedIn, no channel set). Existing schedules with no channel are
+   all on the written track and behave exactly as they did. */
+/* Two tracks, not one per channel: calls, and everything written. Keying the
+   track on the raw channel meant picking "LinkedIn" on one follow-up split it
+   off from its blank-channel neighbours and silently re-dated both. */
+const PHONE_TRACK = "Phone call";
+const trackOf = (fu) => (fu?.channel === PHONE_TRACK ? PHONE_TRACK : "");
+const isPhoneFu = (fu) => trackOf(fu) === PHONE_TRACK;
+/* 1-based position of follow-up i among the follow-ups on its own track —
+   "phone follow-up 2", "follow-up 3" — rather than its slot in the mixed array */
+const trackPos = (fus, i) => (fus || []).slice(0, i + 1).filter((x) => trackOf(x) === trackOf(fus[i])).length;
+
+/* Logs a call onto a lead. Pure, and shared by every place a call can be
+   logged (account form, call queue / contact card, application form) so they
+   can't drift apart. `phoneKey` and `closes`/`closedStatus` differ between a
+   contact and an application; everything else is the same. */
+function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays }, { phoneKey = "phone", closes = CALL_CLOSES, closedStatus = "closed" } = {}) {
+  const o = callOutcome(outcome);
+  const st = callStage(stage);
+  /* the stage rides in the note so it shows in the timeline without its own row */
+  const note = `${o?.label || "Call"}${st ? ` · ${st.label}` : ""}${(notes || "").trim() ? ` — ${notes.trim()}` : ""}`;
+  const next = {
+    ...c,
+    /* the touch point IS the record of the call — it feeds the activity date,
+       the nurture clock and the timeline */
+    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: PHONE_TRACK, note }],
+    /* a call IS contact, so an untouched record starts here */
+    contacted: c.contacted || today(),
+    status: c.status || "outreach",
+  };
+  if (tickFollowUp && followUpIndex >= 0) {
+    /* guard: only a phone entry can be ticked by a call, so a stale index
+       can't mark an email as sent */
+    next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex && isPhoneFu(x) ? { ...x, done: true, doneAt: today() } : x));
+  }
+  /* furthest stage ever reached, so a weaker later call doesn't erase it */
+  if (stage && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
+  /* a call-back becomes a real dated phone follow-up */
+  if (callbackDays > 0) next.followUps = insertCallback(anchorOf(next) || today(), next.followUps || c.followUps || [], callbackDays);
+  if (closes.includes(outcome)) next.status = closedStatus;
+  if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
+  /* a wrong number shouldn't stay in the field inviting a redial */
+  if (outcome === "wrongnumber") next[phoneKey] = "";
+  return next;
+}
 
 /* days accumulate only within the entry's own track */
 function followUpDueDate(contacted, fus, index) {
@@ -4055,61 +4099,21 @@ export default function FlightDeck() {
   /* Writes a call straight to state. The account modal has its own copy that
      works on unsaved form data; this is for the call queue and contact card,
      which act on the saved record directly. Same effects either way. */
-  const logCallOnContact = (accountId, contactId, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays }) => {
-    const o = callOutcome(outcome);
-    const st = callStage(stage);
-    /* the stage rides in the note so it shows in the timeline without needing
-       its own row, and stays on the contact for the reach-analysis below */
-    const note = `${o?.label || "Call"}${st ? ` · ${st.label}` : ""}${notes.trim() ? ` — ${notes.trim()}` : ""}`;
+  const logCallOnContact = (accountId, contactId, payload) => {
     mutate(
       (st) => {
         const oldContacts = (st.accounts || []).find((a) => a.id === accountId)?.contacts || [];
         const next = {
-        ...st,
-        accounts: (st.accounts || []).map((a) =>
-          a.id !== accountId
-            ? a
-            : {
-                ...a,
-                contacts: (a.contacts || []).map((c) => {
-                  if (c.id !== contactId) return c;
-                  const next = {
-                    ...c,
-                    /* the touch point IS the record of this call — writing a
-                        history entry too rendered the same event twice in the
-                        timeline, once with the wrong icon */
-                    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "Phone call", note }],
-                    contacted: c.contacted || today(),
-                    status: c.status || "outreach",
-                  };
-                  if (tickFollowUp && followUpIndex >= 0) {
-                    next.followUps = (c.followUps || []).map((x, k) =>
-                      /* guard: only tick if that index really is a phone entry,
-                         so a stale index can't mark an email as sent */
-                      k === followUpIndex && trackOf(x) === "Phone call" ? { ...x, done: true, doneAt: today() } : x
-                    );
-                  }
-                  /* furthest stage ever reached on this contact, so a weaker
-                     later call doesn't erase a better earlier one */
-                  if (stage && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
-                  /* the call-back becomes a real dated follow-up rather than a
-                     promise buried in a note */
-                  if (callbackDays > 0) {
-                    next.followUps = insertCallback(anchorOf(next) || anchorOf(c) || today(), next.followUps || c.followUps || [], callbackDays);
-                  }
-                  if (CALL_CLOSES.includes(outcome)) next.status = "closed";
-                  if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
-                  if (outcome === "wrongnumber") next.phone = "";
-                  return next;
-                }),
-              }
-        ),
+          ...st,
+          accounts: (st.accounts || []).map((a) =>
+            a.id !== accountId ? a : { ...a, contacts: (a.contacts || []).map((c) => (c.id === contactId ? applyCallLog(c, payload) : c)) }
+          ),
         };
         /* a call can start a contact (status → outreach) or close one, and
            both belong in the funnel */
         return reconcileAccountApplications(next, accountId, oldContacts);
       },
-      `☎ ${o?.label || "Call"} logged`
+      `☎ ${callOutcome(payload.outcome)?.label || "Call"} logged`
     );
   };
   useEffect(() => setPipePage(0), [pipeFilter, pipeSearch, pipeSourceFilter, pipeStatusFilter]);
@@ -8538,7 +8542,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       >
                         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                           <span style={{ cursor: "pointer" }} onClick={() => setModal({ kind: "application", entry: a })} title="Click to edit the follow-up schedule">
-                            {nf ? `${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}
+                            {nf ? `${nf.track === PHONE_TRACK ? "☎ " : ""}${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}
                           </span>
                           {fus.length > 0 && (
                             <button
@@ -8756,7 +8760,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       </td>
                       <td style={{ ...td, fontFamily: mono, fontSize: 12, whiteSpace: "nowrap", color: due ? C.red : nf ? C.muted : C.green }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span>{nf ? `${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}</span>
+                          <span>{nf ? `${nf.track === PHONE_TRACK ? "☎ " : ""}${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : fus.length ? `all done (${fus.length})` : "—"}</span>
                           {fus.length > 0 && (
                             <button
                               onClick={(e) => {
@@ -9175,7 +9179,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       )}
                       {fus.length > 0 && (
                         <span style={{ fontFamily: mono, fontSize: 11, color: due ? C.red : nf ? C.muted : C.green }}>
-                          {nf ? `Next: ${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : `all done (${fus.length})`}
+                          {nf ? `Next: ${nf.track === PHONE_TRACK ? "☎ " : ""}${nf.date} (${doneCount}/${fus.length})${due ? " ⚑" : ""}` : `all done (${fus.length})`}
                         </span>
                       )}
                       {c.linkedin && (
@@ -11551,7 +11555,11 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
     if (kind === "application") {
       onSave({
         ...f,
-        followUps: (f.followUps || []).map((x) => ({ days: Math.max(0, +x.days || 0), done: !!x.done, doneAt: x.doneAt || "" })),
+        /* spread first: this used to rebuild each follow-up as {days, done,
+           doneAt} only, dropping its channel — so a phone follow-up saved from
+           here fell back onto the written track, and for a linked lead the
+           stripped copy then synced over the contact's */
+        followUps: (f.followUps || []).map((x) => ({ ...x, days: Math.max(0, +x.days || 0), done: !!x.done, doneAt: x.doneAt || "" })),
         custom: (f.custom || []).filter((c) => c.k || c.v),
       });
     } else if (kind === "account") {
@@ -11589,42 +11597,18 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
           contact={callContact.contact}
           company={f.company}
           onClose={() => setCallContact(null)}
-          onSave={({ outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays }) => {
-            const o = callOutcome(outcome);
-            const st = callStage(stage);
+          closes={callContact.app ? APP_CALL_CLOSES : CALL_CLOSES}
+          onSave={(payload) => {
+            if (callContact.app) {
+              /* an application: the lead IS the form. Only "not interested"
+                 closes it — a wrong number ends the phone route, not the
+                 application, which can carry on by email. */
+              setF((p) => applyCallLog(p, payload, { phoneKey: "contactPhone", closes: APP_CALL_CLOSES, closedStatus: "rejected" }));
+              setCallContact(null);
+              return;
+            }
             const i = callContact.index;
-            const note = `${o?.label || "Call"}${st ? ` · ${st.label}` : ""}${notes.trim() ? ` — ${notes.trim()}` : ""}`;
-            setF((p) => ({
-              ...p,
-              contacts: p.contacts.map((c, j) => {
-                if (j !== i) return c;
-                const next = {
-                  ...c,
-                  /* a call is a touch point like any other, so it feeds the
-                     activity date, the nurture clock and the timeline */
-                  touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: "Phone call", note }],
-                  /* a call IS contact, so an untouched record starts here */
-                  contacted: c.contacted || today(),
-                  status: c.status || "outreach",
-                };
-                if (tickFollowUp && followUpIndex >= 0) {
-                  next.followUps = (c.followUps || []).map((x, k) =>
-                      /* guard: only tick if that index really is a phone entry,
-                         so a stale index can't mark an email as sent */
-                      k === followUpIndex && trackOf(x) === "Phone call" ? { ...x, done: true, doneAt: today() } : x
-                    );
-                }
-                if (stage && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
-                if (callbackDays > 0) {
-                  next.followUps = insertCallback(anchorOf(next) || anchorOf(c) || today(), next.followUps || c.followUps || [], callbackDays);
-                }
-                if (CALL_CLOSES.includes(outcome)) next.status = "closed";
-                if (CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
-                /* a wrong number shouldn't stay in the field inviting a redial */
-                if (outcome === "wrongnumber") next.phone = "";
-                return next;
-              }),
-            }));
+            setF((p) => ({ ...p, contacts: p.contacts.map((c, j) => (j === i ? applyCallLog(c, payload) : c)) }));
             /* no toast here: `flash` lives in the parent, and the logged call
                is immediately visible in the contact's touch points and history */
             if (onCallLogged) onCallLogged(callContact.contact.id);
@@ -12033,27 +12017,35 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
 
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <Label>Follow-up schedule (days after contact)</Label>
-              {(f.followUps || []).length > 0 && (
+              {(f.followUps || []).some((x) => !isPhoneFu(x)) && (
                 <button
-                  onClick={() => setF((p) => ({ ...p, followUps: [] }))}
+                  /* clears the written follow-ups only — call follow-ups are
+                     their own schedule, below */
+                  onClick={() => setF((p) => ({ ...p, followUps: (p.followUps || []).filter(isPhoneFu) }))}
                   style={{ background: "transparent", border: "none", color: C.muted, fontSize: 11, textDecoration: "underline", cursor: "pointer", padding: 0, marginBottom: 4 }}
                 >
                   🚫 No follow-up needed
                 </button>
               )}
             </div>
-            {(f.followUps || []).length === 0 && (
+            {!(f.followUps || []).some((x) => !isPhoneFu(x)) && (
               <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>No follow-ups scheduled for this one.</div>
             )}
             {(f.followUps || []).map((fu, i) => {
+              /* calls have their own schedule below — they're ticked by
+                 logging a call, not from this list */
+              if (isPhoneFu(fu)) return null;
               const d = anchorOf(f) ? followUpDueDate(anchorOf(f), f.followUps, i) : "";
               const due = d && !fu.done && d <= today();
+              /* numbered within the written track, so a call sitting earlier
+                 in the array doesn't make this "Follow-up 3" when it's the 2nd */
+              const n = trackPos(f.followUps, i);
               return (
                 <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
                   {/* the row order already says which follow-up this is, so the
                       full label is desktop-only — it was pushing the delete
                       button off the right edge on a phone */}
-                  <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, width: isDesktop ? 78 : 16, flexShrink: 0 }}>{isDesktop ? `Follow-up ${i + 1}` : i + 1}</div>
+                  <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, width: isDesktop ? 78 : 16, flexShrink: 0 }}>{isDesktop ? `Follow-up ${n}` : n}</div>
                   <input
                     type="number"
                     inputMode="numeric"
@@ -12072,8 +12064,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       clipboard — the library is only useful if reaching it
                       takes one tap from where you're actually working */}
                   <button
-                    onClick={() => onCopyDraft && onCopyDraft(i, f)}
-                    title={`Copy your best "${copyPurposeLabel(purposeForFollowUp(i))}" draft, filled in for this lead`}
+                    onClick={() => onCopyDraft && onCopyDraft(n - 1, f)}
+                    title={`Copy your best "${copyPurposeLabel(purposeForFollowUp(n - 1))}" draft, filled in for this lead`}
                     style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.blue, borderRadius: 10, padding: isDesktop ? "0 9px" : "0", width: isDesktop ? "auto" : 34, height: 34, cursor: "pointer", flexShrink: 0, fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}
                   >
                     {isDesktop ? "⧉ Copy" : "⧉"}
@@ -12139,8 +12131,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                           /* ticking it logs the send; un-ticking removes only the
                              auto-created entry, never one you wrote yourself */
                           touchpoints: wasDone
-                            ? (p.touchpoints || []).filter((t) => !(t.fromFollowUp && t.note === `Follow-up #${i + 1}`))
-                            : [...(p.touchpoints || []), followUpTouchpoint(ch, i)],
+                            ? (p.touchpoints || []).filter((t) => !(t.fromFollowUp && t.note === `Follow-up #${n}`))
+                            : [...(p.touchpoints || []), followUpTouchpoint(ch, n - 1)],
                         };
                       })
                     }
@@ -12159,11 +12151,86 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               );
             })}
             <button
-              onClick={() => setF((p) => ({ ...p, followUps: [...(p.followUps || []), { days: (+(p.followUps?.slice(-1)[0]?.days) || 7) + 7, done: false }] }))}
+              onClick={() =>
+                setF((p) => {
+                  const written = (p.followUps || []).filter((x) => !isPhoneFu(x));
+                  return { ...p, followUps: [...(p.followUps || []), { days: (+written.slice(-1)[0]?.days || 7) + 7, done: false }] };
+                })
+              }
               style={{ background: "transparent", border: `1px dashed ${C.panelEdge}`, color: C.muted, borderRadius: 10, padding: "8px 12px", fontSize: 12, cursor: "pointer", width: "100%", boxSizing: "border-box", marginBottom: 12 }}
             >
               + Add follow-up
             </button>
+
+            {/* ---- call follow-ups ----
+                A separate schedule from the written one: its own dates, and
+                ticked by LOGGING A CALL rather than by a checkbox, so a tick
+                here always has an outcome behind it. */}
+            {(() => {
+              const fus = f.followUps || [];
+              const phone = fus.map((fu, i) => ({ fu, i })).filter((x) => isPhoneFu(x.fu));
+              const lead = { id: entry?.id || "new", name: f.contact, position: f.contactPosition, phone: f.contactPhone, followUps: fus, touchpoints: f.touchpoints || [] };
+              const openCall = () => setCallContact({ contact: lead, index: -1, app: true });
+              return (
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                    <Label>☎ Call follow-ups (log call)</Label>
+                    <button
+                      onClick={openCall}
+                      style={{ background: "transparent", border: `1px solid ${C.green}`, color: C.green, borderRadius: 10, padding: "5px 11px", fontSize: 12, fontWeight: 700, cursor: "pointer", marginBottom: 4, flexShrink: 0 }}
+                    >
+                      ☎ Log call
+                    </button>
+                  </div>
+                  {phone.length === 0 && (
+                    <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+                      No calls scheduled. Log a call and choose &ldquo;Call back in…&rdquo;, or add one below.
+                    </div>
+                  )}
+                  {phone.map(({ fu, i }, k) => {
+                    const d = anchorOf(f) ? followUpDueDate(anchorOf(f), fus, i) : "";
+                    const due = d && !fu.done && d <= today();
+                    return (
+                      <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
+                        <div style={{ fontFamily: mono, fontSize: 11, color: C.muted, width: isDesktop ? 78 : 16, flexShrink: 0 }}>{isDesktop ? `Call ${k + 1}` : k + 1}</div>
+                        <div style={{ fontFamily: mono, fontSize: 12, color: fu.done ? C.green : due ? C.red : C.ink, flex: 1, overflow: "hidden", whiteSpace: "nowrap" }}>
+                          {d || "set a contact date"}
+                          {fu.done ? ` ✓ called ${fu.doneAt || ""}` : due ? " ⚑ DUE" : ""}
+                        </div>
+                        <button
+                          /* not done → log the call (which ticks it); done → un-tick */
+                          onClick={() => (fu.done ? setF((p) => ({ ...p, followUps: p.followUps.map((x, j) => (j === i ? { ...x, done: false, doneAt: "" } : x)) })) : openCall())}
+                          title={fu.done ? "Mark not done" : "Log the call to tick this"}
+                          style={{ background: "transparent", border: `1px solid ${fu.done ? C.green : C.panelEdge}`, color: fu.done ? C.green : C.muted, borderRadius: 10, minWidth: 34, height: 34, padding: "0 8px", cursor: "pointer", flexShrink: 0, fontSize: 12 }}
+                        >
+                          {fu.done ? "✓" : "☎"}
+                        </button>
+                        <button
+                          onClick={() => setF((p) => ({ ...p, followUps: p.followUps.filter((_, j) => j !== i) }))}
+                          style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, width: 34, height: 34, cursor: "pointer", flexShrink: 0 }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: C.muted }}>+ Call in</span>
+                    {CALLBACK_DAYS.map((d) => (
+                      <button
+                        key={d}
+                        /* dated from TODAY, like a call-back — "call in 7 days"
+                           shouldn't land 7 days after a contact date weeks old */
+                        onClick={() => setF((p) => ({ ...p, contacted: p.contacted || today(), followUps: insertCallback(anchorOf(p) || today(), p.followUps || [], d) }))}
+                        style={{ fontFamily: mono, fontSize: 11, padding: "4px 9px", borderRadius: 14, border: `1px dashed ${C.panelEdge}`, background: "transparent", color: C.muted, cursor: "pointer" }}
+                      >
+                        {d}d
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
 
             <div style={{ marginBottom: 12 }}>
               <Label>Status ("outreach" counts toward Outreach, not Apps)</Label>
@@ -13761,7 +13828,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     />
                   </div>
 
-                  {fus.length > 0 && (
+                  {fus.some((x) => !isPhoneFu(x)) && (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
                       <span style={{ fontSize: 10, color: C.muted }}>⚑</span>
                       {/* one channel for this contact's follow-ups — the touch
@@ -13770,7 +13837,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                         /* same invisible-select-over-an-icon trick as the
                            application row; this one is tighter still */
                         const chVal = c.followUpChannel || modal.defaultTouchChannel || DEFAULT_TOUCH_CHANNEL;
-                        const opts = TOUCHPOINT_CHANNELS.map((ch) => (
+                        /* calls have their own row below, so "Phone call" isn't
+                           offered as the channel for this one (kept only if
+                           it's what's already saved, so the select isn't lying) */
+                        const opts = TOUCHPOINT_CHANNELS.filter((ch) => ch !== PHONE_TRACK || chVal === PHONE_TRACK).map((ch) => (
                           <option key={ch} value={ch}>
                             {ch}
                           </option>
@@ -13810,7 +13880,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                         );
                       })()}
                       {fus.map((fu, fi) => {
+                        if (isPhoneFu(fu)) return null; /* shown in the call row below */
                         const due = anchorOf(c) ? followUpDueDate(anchorOf(c), fus, fi) : "";
+                        /* numbered within the written track */
+                        const n = trackPos(fus, fi);
                         return (
                           /* the tick and its copy icon travel together — a
                              separate row of icons makes you count positions to
@@ -13823,9 +13896,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                               setContact({
                                 followUps: fus.map((x, xi) => (xi === fi ? { ...x, done: !x.done, doneAt: !x.done ? today() : "" } : x)),
                                 touchpoints: wasDone
-                                  ? (c.touchpoints || []).filter((t) => !(t.fromFollowUp && t.note === `Follow-up #${fi + 1}`))
-                                  : [...(c.touchpoints || []), followUpTouchpoint(ch, fi)],
-                                history: wasDone ? c.history || [] : withLog(c, [logEntry("followup", `Follow-up #${fi + 1} sent via ${ch}`)]).history,
+                                  ? (c.touchpoints || []).filter((t) => !(t.fromFollowUp && t.note === `Follow-up #${n}`))
+                                  : [...(c.touchpoints || []), followUpTouchpoint(ch, n - 1)],
+                                history: wasDone ? c.history || [] : withLog(c, [logEntry("followup", `Follow-up #${n} sent via ${ch}`)]).history,
                               });
                             }}
                             title={due ? `Due ${due}` : ""}
@@ -13844,8 +13917,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                           </button>
                           {onCopyDraft && (
                             <button
-                              onClick={() => onCopyDraft(fi, { company: f.company, contact: c.name, contactPosition: c.position, industry: f.industry })}
-                              title={`Copy your "${copyPurposeLabel(purposeForFollowUp(fi))}" draft for ${c.name || "this contact"}`}
+                              onClick={() => onCopyDraft(n - 1, { company: f.company, contact: c.name, contactPosition: c.position, industry: f.industry })}
+                              title={`Copy your "${copyPurposeLabel(purposeForFollowUp(n - 1))}" draft for ${c.name || "this contact"}`}
                               style={{ background: "transparent", border: "none", color: C.blue, fontSize: 11, cursor: "pointer", padding: "0 3px", lineHeight: 1 }}
                             >
                               ⧉
@@ -13856,11 +13929,67 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       })}
 
                       <button
-                        onClick={() => setContact({ followUps: [] })}
-                        title="No follow-up needed — clear all"
+                        onClick={() => setContact({ followUps: fus.filter(isPhoneFu) })}
+                        title="No follow-up needed — clears these (call follow-ups are kept)"
                         style={{ background: "transparent", border: "none", color: C.muted, fontSize: 11, cursor: "pointer", padding: 0 }}
                       >
                         🚫
+                      </button>
+                    </div>
+                  )}
+
+                  {/* ---- call follow-ups ----
+                      Their own row and their own dates. An open one is ticked
+                      by logging the call, so it always has an outcome behind
+                      it; a done one un-ticks on tap. Shown by date rather than
+                      "Nd", because a call-back is a day you promised, and its
+                      stored gap can be 0 or 40 depending on what came before. */}
+                  {(fus.some(isPhoneFu) || hasPhone(c)) && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginTop: 6 }}>
+                      <span style={{ fontSize: 10, color: C.muted }}>☎ Calls:</span>
+                      {fus.map((fu, fi) => {
+                        if (!isPhoneFu(fu)) return null;
+                        const due = anchorOf(c) ? followUpDueDate(anchorOf(c), fus, fi) : "";
+                        const overdue = due && !fu.done && due <= today();
+                        return (
+                          <span key={fi} style={{ display: "inline-flex", alignItems: "center" }}>
+                            <button
+                              onClick={() =>
+                                fu.done
+                                  ? setContact({ followUps: fus.map((x, xi) => (xi === fi ? { ...x, done: false, doneAt: "" } : x)) })
+                                  : setCallContact({ contact: c, index: i })
+                              }
+                              title={fu.done ? `Called ${fu.doneAt || ""} — tap to un-tick` : `Due ${due || "—"} — tap to log the call`}
+                              style={{
+                                fontFamily: mono,
+                                fontSize: 10,
+                                padding: "3px 8px",
+                                borderRadius: 10,
+                                border: `1px solid ${fu.done ? C.green : overdue ? C.red : C.panelEdge}`,
+                                background: fu.done ? "rgba(74,222,128,0.1)" : "transparent",
+                                color: fu.done ? C.green : overdue ? C.red : C.muted,
+                                cursor: "pointer",
+                              }}
+                            >
+                              {fu.done ? "✓" : "☎"} {due ? due.slice(5) : `${fu.days}d`}
+                            </button>
+                            <button
+                              onClick={() => setContact({ followUps: fus.filter((_, xi) => xi !== fi) })}
+                              title="Remove this call follow-up"
+                              style={{ background: "transparent", border: "none", color: C.muted, fontSize: 11, cursor: "pointer", padding: "0 3px", lineHeight: 1 }}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        );
+                      })}
+                      {!fus.some(isPhoneFu) && <span style={{ fontSize: 10, color: C.muted }}>none scheduled</span>}
+                      <button
+                        onClick={() => setCallContact({ contact: c, index: i })}
+                        title="Log a call — pick “Call back in…” there to schedule the next one"
+                        style={{ fontFamily: mono, fontSize: 10, padding: "3px 8px", borderRadius: 10, border: `1px dashed ${C.green}`, background: "transparent", color: C.green, cursor: "pointer" }}
+                      >
+                        ☎ log call
                       </button>
                     </div>
                   )}
@@ -14625,7 +14754,7 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    exist rather than sitting in its own silo: a touch point (so the activity
    date, nurture clock and history timeline all move), optionally a ticked
    follow-up, and a status change when the outcome ends the pursuit. */
-function ColdCallModal({ contact, company, onClose, onSave }) {
+function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES }) {
   const [outcome, setOutcome] = useState("");
   const [notes, setNotes] = useState("");
   const [tickFollowUp, setTickFollowUp] = useState(true);
@@ -14745,7 +14874,7 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
             retry, and gating this on `landed` meant the outcomes that most
             need a next attempt were the only ones that couldn't book one.
             Only the closing outcomes are excluded. */}
-        {picked && !CALL_CLOSES.includes(picked.key) && (
+        {picked && !closes.includes(picked.key) && (
           <>
             <Label>{picked.landed ? "Call back in…" : "Try again in…"}</Label>
             <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 4 }}>
@@ -14827,9 +14956,9 @@ function ColdCallModal({ contact, company, onClose, onSave }) {
             No phone follow-up is pending, so this logs as a touch point only. Email follow-ups are a separate track and aren&apos;t affected.
           </div>
         )}
-        {picked && CALL_CLOSES.includes(picked.key) && (
+        {picked && closes.includes(picked.key) && (
           <div style={{ fontSize: 11, color: C.amber, lineHeight: 1.5, marginBottom: 10 }}>
-            This closes the contact, so it stops appearing in due lists and the nurture clock.
+            This closes the lead, so it stops appearing in due lists and the nurture clock.
           </div>
         )}
 
