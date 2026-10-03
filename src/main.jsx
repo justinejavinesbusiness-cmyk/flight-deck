@@ -1414,16 +1414,6 @@ const CALL_FILTER_GROUPS = [
     ],
   },
   {
-    /* every logged call is an attempt, connected or not — this is how many
-       times you've dialled them, which is what tells you when to stop */
-    label: "Attempts",
-    items: [1, 2, 3, 4, 5].map((n) => ({
-      key: `tries:${n}`,
-      label: n === 5 ? "5 or more attempts" : `${n} attempt${n === 1 ? "" : "s"}`,
-      test: (r) => (n === 5 ? r.calls >= 5 : r.calls === n),
-    })),
-  },
-  {
     label: "Last call",
     items: ["callback", "spoke", "voicemail", "noanswer", "gatekeeper", "notinterested"].map((k) => ({
       key: `out:${k}`,
@@ -1442,6 +1432,18 @@ const CALL_FILTER_GROUPS = [
 ];
 const CALL_FILTERS = CALL_FILTER_GROUPS.flatMap((g) => g.items);
 const callFilterOf = (k) => CALL_FILTERS.find((x) => x.key === k) || null;
+/* Typed attempts filter. Every logged call is an attempt, connected or not.
+   "3" is exactly three, "3+" is three or more, "2-4" is a range, and "0" is
+   never called. Anything else is ignored rather than hiding the whole queue —
+   a half-typed "2-" shouldn't blank the list mid-keystroke. */
+function parseAttempts(text) {
+  const t = String(text || "").replace(/\s+/g, "");
+  let m;
+  if ((m = t.match(/^(\d+)$/))) return (n) => n === +m[1];
+  if ((m = t.match(/^(\d+)\+$/))) return (n) => n >= +m[1];
+  if ((m = t.match(/^(\d+)-(\d+)$/))) return (n) => n >= Math.min(+m[1], +m[2]) && n <= Math.max(+m[1], +m[2]);
+  return null;
+}
 
 /* Call-back intervals. A caller who asked for "next week" needs a date, not a
    note buried in the log — this turns the answer into a scheduled follow-up so
@@ -4155,6 +4157,7 @@ export default function FlightDeck() {
   const [copyFilter, setCopyFilter] = useState("all");
   const [callSearch, setCallSearch] = useState("");
   const [callFilter, setCallFilter] = useState("");
+  const [callAttempts, setCallAttempts] = useState("");
   /* choosing who goes in a CSV — local to this device, it's a one-off action */
   const [csvMode, setCsvMode] = useState(false);
   const [csvPick, setCsvPick] = useState(() => new Set());
@@ -10751,9 +10754,11 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     /* like the search, the filter only narrows the unpicked remainder */
     const activeFilter = callFilterOf(callFilter);
     const unpicked = callQueue.filter((r) => r.pick === -1);
-    const rest = unpicked.filter((r) => matches(r) && (!activeFilter || activeFilter.test(r)));
+    const attemptsTest = parseAttempts(callAttempts);
+    const attemptsTyped = callAttempts.trim() !== "";
+    const rest = unpicked.filter((r) => matches(r) && (!activeFilter || activeFilter.test(r)) && (!attemptsTest || attemptsTest(r.calls)));
     const hiddenBySearch = unpicked.length - rest.length;
-    const narrowed = !!q || !!activeFilter;
+    const narrowed = !!q || !!activeFilter || !!attemptsTest;
     const addShownToRun = () => {
       const ids = rest.filter((r) => r.dialable).map((r) => r.contact.id);
       if (!ids.length) return;
@@ -11050,6 +11055,15 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                   </button>
                 )}
               </div>
+              <input
+                value={callAttempts}
+                onChange={(e) => setCallAttempts(e.target.value)}
+                inputMode="numeric"
+                aria-label="Filter by number of phone attempts"
+                title="Phone attempts: 3 = exactly three, 3+ = three or more, 2-4 = a range, 0 = never called"
+                placeholder="☎ Attempts"
+                style={{ ...inputStyle, flex: "0 1 120px", width: "auto", padding: "9px 11px", fontSize: 13, border: `1px solid ${attemptsTest ? C.amber : attemptsTyped ? C.red : C.panelEdge}`, color: attemptsTest ? C.amber : C.ink }}
+              />
               <select
                 value={callFilter}
                 onChange={(e) => setCallFilter(e.target.value)}
@@ -11068,6 +11082,9 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                 ))}
               </select>
               </div>
+              {attemptsTyped && !attemptsTest && (
+                <div style={{ fontSize: 11, color: C.red, marginTop: 5 }}>Attempts: type a number like 3, or 3+ for three or more, or 2-4 for a range.</div>
+              )}
               {narrowed && (
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 6 }}>
                   <div style={{ fontSize: 11, color: C.muted }}>
@@ -11081,9 +11098,16 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                         + Add {rest.filter((r) => r.dialable).length} to run
                       </Btn>
                     )}
-                    {activeFilter && (
-                      <Btn ghost onClick={() => setCallFilter("")} style={{ padding: "5px 11px", fontSize: 11 }}>
-                        Clear filter
+                    {(activeFilter || attemptsTyped) && (
+                      <Btn
+                        ghost
+                        onClick={() => {
+                          setCallFilter("");
+                          setCallAttempts("");
+                        }}
+                        style={{ padding: "5px 11px", fontSize: 11 }}
+                      >
+                        Clear filters
                       </Btn>
                     )}
                   </div>
@@ -11093,9 +11117,9 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
 
             {/* numbering continues past the run so positions stay unique */}
             {rest.map((r, i) => callRow(r, picked + i))}
-            {!q && activeFilter && rest.length === 0 && (
+            {!q && (activeFilter || attemptsTest) && rest.length === 0 && (
               <div style={{ color: C.muted, fontSize: 13, padding: "14px 4px", textAlign: "center", lineHeight: 1.6 }}>
-                Nobody left in the queue is &ldquo;{activeFilter.label}&rdquo;.
+                Nobody left in the queue matches {[activeFilter ? `“${activeFilter.label}”` : "", attemptsTest ? `${callAttempts.trim()} attempts` : ""].filter(Boolean).join(" with ")}.
               </div>
             )}
             {q && rest.length === 0 && (
