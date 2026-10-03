@@ -1345,6 +1345,29 @@ const callConnected = (t) => {
   return o ? o.connects : true;
 };
 const isUnconnectedCall = (t) => isCallTouch(t) && !callConnected(t);
+/* What one logged call was: its outcome, whether it connected, how far it got.
+   Newer logs store all three; older ones only have the note, which begins with
+   the outcome label and carries the stage after a "·". */
+const callInfo = (t) => {
+  const note = t?.note || "";
+  const outcome = t?.outcome || CALL_OUTCOMES.find((o) => note.startsWith(o.label))?.key || "";
+  const stage = t?.stage || (callConnected(t) ? CALL_STAGES.find((x) => note.includes(` · ${x.label}`))?.key || "" : "");
+  return { outcome, connected: callConnected(t), stage, date: t?.date || "" };
+};
+/* Where calling this person stands, from their log: the most recent call, and
+   the most recent one that actually connected. Same-day calls keep the order
+   they were logged in. */
+const callStanding = (c) => {
+  const calls = (c?.touchpoints || [])
+    .map((t, i) => ({ t, i }))
+    .filter((x) => isCallTouch(x.t))
+    .sort((a, b) => (a.t.date || "").localeCompare(b.t.date || "") || a.i - b.i)
+    .map((x) => callInfo(x.t));
+  const last = calls[calls.length - 1] || null;
+  const lastTalk = calls.filter((x) => x.connected).pop() || null;
+  return { count: calls.length, connectedCount: calls.filter((x) => x.connected).length, lastOutcome: last?.outcome || "", everConnected: !!lastTalk, talkStage: lastTalk?.stage || "" };
+};
+
 /* A lead that sits in the funnel ONLY because an unanswered call put it there
    — the old behaviour, where dialling alone counted as contact. Deliberately
    narrow: any sign of other outreach (a cold/warm choice, a reply, a written
@@ -1377,6 +1400,48 @@ const CALL_STAGES = [
 ];
 const callStage = (k) => CALL_STAGES.find((x) => x.key === k) || null;
 const callStageIdx = (k) => CALL_STAGES.findIndex((x) => x.key === k);
+/* ---- queue filters ----
+   Each one answers "who do I ring next for THIS reason". Grouped the way the
+   call log is: what needs doing, how the last call ended, and where the last
+   real conversation stopped. */
+const CALL_FILTER_GROUPS = [
+  {
+    label: "Needs a call",
+    items: [
+      { key: "due", label: "⚑ Due for a call", test: (r) => r.callDue },
+      { key: "never", label: "Never called", test: (r) => r.calls === 0 },
+      { key: "unreached", label: "Called, never connected", test: (r) => r.calls > 0 && !r.everConnected },
+    ],
+  },
+  {
+    /* every logged call is an attempt, connected or not — this is how many
+       times you've dialled them, which is what tells you when to stop */
+    label: "Attempts",
+    items: [1, 2, 3, 4, 5].map((n) => ({
+      key: `tries:${n}`,
+      label: n === 5 ? "5 or more attempts" : `${n} attempt${n === 1 ? "" : "s"}`,
+      test: (r) => (n === 5 ? r.calls >= 5 : r.calls === n),
+    })),
+  },
+  {
+    label: "Last call",
+    items: ["callback", "spoke", "voicemail", "noanswer", "gatekeeper", "notinterested"].map((k) => ({
+      key: `out:${k}`,
+      label: k === "callback" ? "Connected — asked to call back" : callOutcome(k).label,
+      test: (r) => r.lastOutcome === k,
+    })),
+  },
+  {
+    label: "Last conversation got to",
+    items: CALL_STAGES.map((x) => ({
+      key: `stage:${x.key}`,
+      label: x.key === "nostart" ? "Hung up straight away" : x.key === "booked" ? x.label : `${x.label}, then ended`,
+      test: (r) => r.talkStage === x.key,
+    })),
+  },
+];
+const CALL_FILTERS = CALL_FILTER_GROUPS.flatMap((g) => g.items);
+const callFilterOf = (k) => CALL_FILTERS.find((x) => x.key === k) || null;
 
 /* Call-back intervals. A caller who asked for "next week" needs a date, not a
    note buried in the log — this turns the answer into a scheduled follow-up so
@@ -2657,7 +2722,7 @@ function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, c
     ...c,
     /* every call is recorded, connected or not — the history and the call
        counts want the attempts too */
-    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: PHONE_TRACK, note, outcome, connected: reached }],
+    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: PHONE_TRACK, note, outcome, connected: reached, stage: st ? stage : "" }],
   };
   if (reached) {
     /* only a call that connected is contact — an untouched record starts here */
@@ -4089,6 +4154,7 @@ export default function FlightDeck() {
   const [poolSearch, setPoolSearch] = useState("");
   const [copyFilter, setCopyFilter] = useState("all");
   const [callSearch, setCallSearch] = useState("");
+  const [callFilter, setCallFilter] = useState("");
   /* choosing who goes in a CSV — local to this device, it's a one-off action */
   const [csvMode, setCsvMode] = useState(false);
   const [csvPick, setCsvPick] = useState(() => new Set());
@@ -10648,7 +10714,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
     const session = state.callSession || [];
     return rows
-      .map((r) => ({ ...r, calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact) || isCallDue(r.contact), dueDate: followUpOf(r.contact), dialable: hasPhone(r.contact), pick: session.indexOf(r.contact.id) }))
+      .map((r) => ({ ...r, ...callStanding(r.contact), callDue: isCallDue(r.contact), calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact) || isCallDue(r.contact), dueDate: followUpOf(r.contact), dialable: hasPhone(r.contact), pick: session.indexOf(r.contact.id) }))
       .sort(
         (a, b) =>
           /* anything you picked leads, in the order you picked it — a manual
@@ -10682,8 +10748,17 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       !q ||
       `${r.contact.name || ""} ${r.contact.position || ""} ${r.company || ""} ${r.contact.phone || ""}`.toLowerCase().includes(q);
     const run = callQueue.filter((r) => r.pick !== -1);
-    const rest = callQueue.filter((r) => r.pick === -1 && matches(r));
-    const hiddenBySearch = callQueue.filter((r) => r.pick === -1).length - rest.length;
+    /* like the search, the filter only narrows the unpicked remainder */
+    const activeFilter = callFilterOf(callFilter);
+    const unpicked = callQueue.filter((r) => r.pick === -1);
+    const rest = unpicked.filter((r) => matches(r) && (!activeFilter || activeFilter.test(r)));
+    const hiddenBySearch = unpicked.length - rest.length;
+    const narrowed = !!q || !!activeFilter;
+    const addShownToRun = () => {
+      const ids = rest.filter((r) => r.dialable).map((r) => r.contact.id);
+      if (!ids.length) return;
+      mutate((st) => ({ ...st, callSession: [...(st.callSession || []), ...ids.filter((id) => !(st.callSession || []).includes(id))] }), `${ids.length} added to this run`);
+    };
     /* Export works on what's on screen: the run plus whatever the search
        leaves. Only rows with a usable number can go in — a CSV of people to
        call with "0" in the number column is a broken import. */
@@ -10764,7 +10839,18 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             ) : (
               <span style={{ color: C.amber }}>{phoneNotFound(r.contact) ? "number not found" : "no usable number"}</span>
             )}
-            {r.calls === 0 ? " · never called" : ` · ${r.calls} call${r.calls === 1 ? "" : "s"}, last ${r.lastCall}`}
+            {r.calls === 0 ? (
+              " · never called"
+            ) : (
+              <>
+                {" · "}
+                {/* attempts are every dial; connected is how many reached them */}
+                <span style={{ color: r.calls >= 3 && !r.everConnected ? C.amber : C.ink, fontWeight: 700 }}>
+                  {r.calls} attempt{r.calls === 1 ? "" : "s"}
+                </span>
+                {` (${r.connectedCount} connected), last ${r.lastCall}`}
+              </>
+            )}
             {r.due && <span style={{ color: C.red, fontWeight: 800 }}> · ⚑ DUE {r.dueDate}</span>}
             {/* knowing you last died at the opener changes how you open
                 this one — that's the whole point of tracking it */}
@@ -10906,7 +10992,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                   </div>
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                     <Btn ghost onClick={() => setShown(!allShownChosen)} style={{ padding: "6px 11px", fontSize: 11 }}>
-                      {allShownChosen ? "Deselect all" : `Select all${q ? " matches" : ""} (${exportable.length})`}
+                      {allShownChosen ? "Deselect all" : `Select all${narrowed ? " matches" : ""} (${exportable.length})`}
                     </Btn>
                     {picked > 0 && (
                       <Btn
@@ -10946,7 +11032,8 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
 
             <div style={{ margin: "16px 0 8px" }}>
               {picked > 0 && <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", color: C.muted, marginBottom: 6 }}>REST OF QUEUE</div>}
-              <div style={{ position: "relative" }}>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <div style={{ position: "relative", flex: "1 1 220px", minWidth: 0 }}>
                 <input
                   value={callSearch}
                   onChange={(e) => setCallSearch(e.target.value)}
@@ -10963,17 +11050,54 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                   </button>
                 )}
               </div>
-              {q && (
-                <div style={{ fontSize: 11, color: C.muted, marginTop: 5 }}>
-                  {rest.length} {rest.length === 1 ? "match" : "matches"}
-                  {hiddenBySearch > 0 ? ` · ${hiddenBySearch} hidden` : ""}
-                  {picked > 0 ? " · your run stays above" : ""}
+              <select
+                value={callFilter}
+                onChange={(e) => setCallFilter(e.target.value)}
+                aria-label="Filter the queue by call status"
+                style={{ ...selectStyle, flex: "1 1 200px", minWidth: 0, width: "auto", fontSize: 13, padding: "9px 30px 9px 11px", border: `1px solid ${activeFilter ? C.amber : C.panelEdge}`, color: activeFilter ? C.amber : C.ink }}
+              >
+                <option value="">All call statuses ({unpicked.length})</option>
+                {CALL_FILTER_GROUPS.map((g) => (
+                  <optgroup key={g.label} label={g.label}>
+                    {g.items.map((x) => (
+                      <option key={x.key} value={x.key}>
+                        {x.label} ({unpicked.filter(x.test).length})
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              </div>
+              {narrowed && (
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 6 }}>
+                  <div style={{ fontSize: 11, color: C.muted }}>
+                    {rest.length} {rest.length === 1 ? "match" : "matches"}
+                    {hiddenBySearch > 0 ? ` · ${hiddenBySearch} hidden` : ""}
+                    {picked > 0 ? " · your run stays above" : ""}
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {rest.some((r) => r.dialable) && (
+                      <Btn ghost onClick={addShownToRun} style={{ padding: "5px 11px", fontSize: 11 }}>
+                        + Add {rest.filter((r) => r.dialable).length} to run
+                      </Btn>
+                    )}
+                    {activeFilter && (
+                      <Btn ghost onClick={() => setCallFilter("")} style={{ padding: "5px 11px", fontSize: 11 }}>
+                        Clear filter
+                      </Btn>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
 
             {/* numbering continues past the run so positions stay unique */}
             {rest.map((r, i) => callRow(r, picked + i))}
+            {!q && activeFilter && rest.length === 0 && (
+              <div style={{ color: C.muted, fontSize: 13, padding: "14px 4px", textAlign: "center", lineHeight: 1.6 }}>
+                Nobody left in the queue is &ldquo;{activeFilter.label}&rdquo;.
+              </div>
+            )}
             {q && rest.length === 0 && (
               <div style={{ color: C.muted, fontSize: 13, padding: "14px 4px", textAlign: "center", lineHeight: 1.6 }}>
                 Nobody in the queue matches &ldquo;{callSearch}&rdquo;. Only contacts with a phone number appear here.
