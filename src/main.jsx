@@ -2491,11 +2491,36 @@ function csvRowFromApplication(a) {
 function csvRowFromContact(accountCompany, c) {
   return { archivedDate: today(), type: "contact", company: accountCompany || "", role: c.position || "", contact: c.name || "", email: c.email || "", contactPhone: c.phone || "", contactLinkedin: c.linkedin || "", status: c.status || "", contacted: c.contacted || "", outreachKind: c.outreachKind || "", salary: "", source: "", touchpoints: summarizeTouchpoints(c.touchpoints), notes: c.notes || "" };
 }
-function rowsToCsv(rows) {
+function rowsToCsv(rows, columns = CSV_COLUMNS) {
   const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
-  const lines = [CSV_COLUMNS.join(","), ...rows.map((r) => CSV_COLUMNS.map((k) => esc(r[k])).join(","))];
+  const lines = [columns.join(","), ...rows.map((r) => columns.map((k) => esc(r[k])).join(","))];
   return lines.join("\n");
 }
+/* ---- call list export ----
+   The shape a dialler or contact importer expects: one person per row, name
+   split in two, a number with nothing in it but digits and a leading +. */
+const CALL_CSV_COLUMNS = ["firstName", "lastName", "number", "organization"];
+const NAME_TITLES = /^(dr|mr|mrs|ms|miss|mx|prof|professor|sir)\.?$/i;
+const NAME_LETTERS = /^(phd|mba|gaicd|faicd|maicd|cpa|ca|cissp|cism|cisa|pmp|msc|bsc|ba|ma|md|jd|esq)\.?$/i;
+/* "Dr Jane van der Berg, MBA" → ["Jane", "van der Berg"]. First word is the
+   first name and the rest the surname, after dropping a leading title, anything
+   past a comma, and trailing letters from a short known list. Never strips
+   below two words — a wrongly kept credential is better than a lost surname. */
+function splitName(name) {
+  let parts = String(name || "").split(",")[0].trim().split(/\s+/).filter(Boolean);
+  while (parts.length > 1 && NAME_TITLES.test(parts[0])) parts = parts.slice(1);
+  while (parts.length > 2 && NAME_LETTERS.test(parts[parts.length - 1])) parts = parts.slice(0, -1);
+  return [parts[0] || "", parts.slice(1).join(" ")];
+}
+/* spaces, dashes, brackets and dots out; a leading + kept */
+const csvPhone = (phone) => {
+  const t = String(phone || "").trim();
+  return (t.startsWith("+") ? "+" : "") + t.replace(/\D/g, "");
+};
+const callCsvRow = (contact, company) => {
+  const [firstName, lastName] = splitName(contact?.name);
+  return { firstName, lastName, number: csvPhone(contact?.phone), organization: company || "" };
+};
 /* ============================================================
    DAILY SNAPSHOTS
 
@@ -2548,8 +2573,8 @@ const snapshotSummary = (st) => ({
   copy: (st.copyDrafts || []).length,
 });
 
-function triggerCsvDownload(rows, filename) {
-  const csv = rowsToCsv(rows);
+function triggerCsvDownload(rows, filename, columns) {
+  const csv = rowsToCsv(rows, columns);
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -4064,6 +4089,16 @@ export default function FlightDeck() {
   const [poolSearch, setPoolSearch] = useState("");
   const [copyFilter, setCopyFilter] = useState("all");
   const [callSearch, setCallSearch] = useState("");
+  /* choosing who goes in a CSV — local to this device, it's a one-off action */
+  const [csvMode, setCsvMode] = useState(false);
+  const [csvPick, setCsvPick] = useState(() => new Set());
+  const toggleCsvPick = (id) =>
+    setCsvPick((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   /* one person's card, opened from the pool or the call queue — app-level so
      both can reach it */
   const [contactCard, setContactCard] = useState(null); /* { contact, company, accountId } */
@@ -10649,6 +10684,23 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const run = callQueue.filter((r) => r.pick !== -1);
     const rest = callQueue.filter((r) => r.pick === -1 && matches(r));
     const hiddenBySearch = callQueue.filter((r) => r.pick === -1).length - rest.length;
+    /* Export works on what's on screen: the run plus whatever the search
+       leaves. Only rows with a usable number can go in — a CSV of people to
+       call with "0" in the number column is a broken import. */
+    const exportable = [...run, ...rest].filter((r) => r.dialable);
+    const chosen = callQueue.filter((r) => r.dialable && csvPick.has(r.contact.id));
+    const allShownChosen = exportable.length > 0 && exportable.every((r) => csvPick.has(r.contact.id));
+    const setShown = (on) =>
+      setCsvPick((prev) => {
+        const next = new Set(prev);
+        exportable.forEach((r) => (on ? next.add(r.contact.id) : next.delete(r.contact.id)));
+        return next;
+      });
+    const downloadCallCsv = () => {
+      if (!chosen.length) return;
+      triggerCsvDownload(chosen.map((r) => callCsvRow(r.contact, r.company)), `call-list-${today()}.csv`, CALL_CSV_COLUMNS);
+      flash(`⬇ ${chosen.length} ${chosen.length === 1 ? "contact" : "contacts"} exported`);
+    };
 
     /* one row, used by both lists */
     const callRow = (r, i) => (
@@ -10672,6 +10724,31 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           alignItems: "center",
         }}
       >
+        {csvMode && (
+          <button
+            onClick={() => r.dialable && toggleCsvPick(r.contact.id)}
+            disabled={!r.dialable}
+            aria-label={csvPick.has(r.contact.id) ? "Remove from CSV" : "Add to CSV"}
+            title={r.dialable ? (csvPick.has(r.contact.id) ? "In the CSV — tap to remove" : "Add to the CSV") : "No usable number, so it can't be exported"}
+            style={{
+              width: 26,
+              height: 26,
+              flexShrink: 0,
+              borderRadius: 7,
+              border: `1px solid ${csvPick.has(r.contact.id) ? C.blue : C.panelEdge}`,
+              background: csvPick.has(r.contact.id) ? "rgba(96,165,250,0.16)" : "transparent",
+              color: C.blue,
+              fontSize: 14,
+              fontWeight: 800,
+              lineHeight: 1,
+              cursor: r.dialable ? "pointer" : "not-allowed",
+              opacity: r.dialable ? 1 : 0.35,
+              padding: 0,
+            }}
+          >
+            {csvPick.has(r.contact.id) ? "✓" : ""}
+          </button>
+        )}
         <div style={{ minWidth: 0, flex: 1, cursor: "pointer" }} onClick={() => setContactCard({ contact: r.contact, company: r.company, accountId: r.accountId })}>
           <div style={{ fontSize: 14, fontWeight: 700, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginRight: 7 }}>{i + 1}</span>
@@ -10809,6 +10886,55 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                 <div style={{ fontFamily: mono, fontSize: 20, fontWeight: 700, color: uncalled ? C.amber : C.green }}>{uncalled}</div>
               </div>
             </div>
+
+            {/* ---- CSV export ----
+                Off by default so the queue stays a calling screen. Turning it
+                on puts a tick box on every row; the bulk buttons act on what's
+                currently shown, so searching first is how you export a slice. */}
+            {!csvMode ? (
+              <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+                <Btn ghost onClick={() => setCsvMode(true)} style={{ padding: "7px 12px", fontSize: 12 }}>
+                  ⬇ Export CSV
+                </Btn>
+              </div>
+            ) : (
+              <div style={{ background: "rgba(96,165,250,0.07)", border: `1px solid ${C.blue}`, borderRadius: 12, padding: "10px 13px", marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.blue }}>
+                    {chosen.length} selected for CSV
+                    <span style={{ fontWeight: 400, color: C.muted, fontSize: 11 }}> · first name, last name, number, organization</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    <Btn ghost onClick={() => setShown(!allShownChosen)} style={{ padding: "6px 11px", fontSize: 11 }}>
+                      {allShownChosen ? "Deselect all" : `Select all${q ? " matches" : ""} (${exportable.length})`}
+                    </Btn>
+                    {picked > 0 && (
+                      <Btn
+                        ghost
+                        onClick={() => setCsvPick(new Set(run.filter((r) => r.dialable).map((r) => r.contact.id)))}
+                        style={{ padding: "6px 11px", fontSize: 11 }}
+                      >
+                        This run only
+                      </Btn>
+                    )}
+                    <Btn disabled={!chosen.length} onClick={downloadCallCsv} style={{ padding: "6px 12px", fontSize: 11 }}>
+                      ⬇ Download CSV{chosen.length ? ` (${chosen.length})` : ""}
+                    </Btn>
+                    <Btn
+                      ghost
+                      onClick={() => {
+                        setCsvMode(false);
+                        setCsvPick(new Set());
+                      }}
+                      style={{ padding: "6px 11px", fontSize: 11 }}
+                    >
+                      Done
+                    </Btn>
+                  </div>
+                </div>
+                {unreachable > 0 && <div style={{ fontSize: 11, color: C.muted, marginTop: 6 }}>Contacts without a usable number can&apos;t be ticked.</div>}
+              </div>
+            )}
 
             {/* Run and remainder are rendered as SEPARATE lists with the search
                 box between them. It used to sit inside a single map at the
