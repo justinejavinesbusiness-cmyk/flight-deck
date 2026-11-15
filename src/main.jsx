@@ -16389,7 +16389,13 @@ const AGENT_ACTION_DOC = `Actions (use ids exactly as they appear in the data):
 - {"type":"remove_followups","id":"<contact or lead id>","scope":"due"|"all_pending","track":"email"|"call"|"any"}   ("due" = pending and due today or earlier; ticked follow-ups are history and are never removed)
 - {"type":"start_review","focus":"what to judge, in the user's words","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true}}   (all scope keys optional)
   Use start_review when the user wants you to read their notes, judge who is worth following up, or asks about anything the CRM DATA doesn't show (what was said, notes, touch-point details). The app then sends you full notes and history 50 prospects at a time. It changes nothing and runs straight away.
-- {"type":"start_research","focus":"what to find, e.g. their industry","scope":{"noIndustry":true,"lists":["list"],"search":"company name","accountIds":["<account id>"]}}   (web research on companies, a few at a time; the app runs it straight away and turns findings into industry + tag changes for approval. Only when WEB SEARCH is available.)
+- {"type":"start_research","question":"what must be true, e.g. based in New York AND an MSP or IT services company","scope":{"criteria":{ same as find, e.g. {"phonePrefix":"+1"} },"noIndustry":true,"lists":["list"],"search":"company name","accountIds":["<account id>"]},"then":{"addToList":"US Tech List","removeNonMatchesFromList":"US Tech List","tag":["ny-msp"],"setIndustry":true}}
+  Web research on companies, 8 at a time, running through every batch on its own. Only when WEB SEARCH is available.
+  - question: each company is checked against it and comes back as matches true/false. Leave it out to just look up industry.
+  - scope.criteria: research the companies of the people a find would return ("all the +1 contacts").
+  - then: what to propose for the companies that MATCH (addToList — the list is created if it doesn't exist; tag — on their contacts), and removeNonMatchesFromList for the ones that clearly don't. setIndustry also proposes each company's industry.
+  For "search X, check whether Y, then put the ones that fit in list Z", use ONE start_research with scope.criteria = X, question = Y, then.addToList = Z. Don't run a separate find first.
+  To clean up a list that has the wrong companies in it ("it still has restaurants in it"), research the list itself — scope.lists = [that list], the same question — with then.removeNonMatchesFromList = that list.
 - {"type":"remove_followups_where","criteria":{ same as find, e.g. {"dueFollowUp":true} },"scope":"due"|"all_pending","olderThanDays":20,"track":"email"|"call"|"any"}   (bulk: removes, for every matching person, pending follow-ups due on or before today minus olderThanDays — "clear follow-ups more than 20 days overdue" = criteria {"overdueMinDays":20}, olderThanDays 20)
 - {"type":"add_followup","id":"<contact or lead id>","date":"YYYY-MM-DD"}  or  {"type":"add_followup","id":"...","inDays":7}   optional "channel": "Cold email" (default) | "LinkedIn" | "Phone call" | "Text/SMS" | "Facebook" | "Instagram"`;
 
@@ -16883,6 +16889,15 @@ function matchAccountCriteria(st, crit = {}) {
 const RESEARCH_BATCH = 8;
 function researchPool(st, scope = {}) {
   const k = scope || {};
+  /* "the +1 contacts' companies": accounts of whoever the search returns */
+  if (k.criteria && typeof k.criteria === "object") {
+    const seen = new Set();
+    return findPeople(st, { ...k.criteria, who: "contacts" })
+      .filter((p) => p.acc && !seen.has(p.acc.id) && seen.add(p.acc.id))
+      .map((p) => p.acc)
+      .sort((a, b) => (a.company || "").localeCompare(b.company || ""))
+      .map((a) => a.id);
+  }
   const ids = arr(k.accountIds);
   if (ids.length) return (st.accounts || []).filter((a) => ids.includes(String(a.id).toLowerCase())).map((a) => a.id);
   return matchAccountCriteria(st, { noIndustry: k.noIndustry !== false && !k.search && !arr(k.lists).length ? true : !!k.noIndustry, search: k.search, inLists: k.lists, accountStatus: "open" })
@@ -16898,7 +16913,7 @@ function companyBrief(st, id) {
 /* Findings → actions. Industry goes on the account; tags (or the industry
    itself when none are given) go on every live contact there, since tags
    live on people. */
-function parseResearchReply(raw, st, batchIds) {
+function parseResearchReply(raw, st, batchIds, { question = "", then = {} } = {}) {
   const text = String(raw || "").trim();
   const a = text.indexOf("{");
   const b = text.lastIndexOf("}");
@@ -16922,14 +16937,56 @@ function parseResearchReply(raw, st, batchIds) {
       summary: clip(r.summary, 220),
       confidence: ["high", "medium", "low"].includes(r.confidence) ? r.confidence : "low",
       sources: (Array.isArray(r.sources) ? r.sources : []).filter((u) => /^https?:\/\//.test(String(u))).slice(0, 3),
+      /* the user's question: true, false, or null when it couldn't tell */
+      matches: r.matches === true || r.matches === "true" ? true : r.matches === false || r.matches === "false" ? false : null,
+      location: clip(r.location, 80),
+      why: clip(r.why, 200),
     }));
   if (!results.length) throw new Error("None of the results matched the companies sent.");
+  if (question && results.every((r) => r.matches === null)) throw new Error("The reply didn't answer the question for any company.");
   const actions = [];
-  results.forEach((r) => {
+  const t = then || {};
+  /* ---- what to do with the answer ----
+     Only a company that MATCHES goes in the list or gets the tag; a clear
+     "no" is taken out of the list when asked. A low-confidence answer either
+     way is proposed unticked, so a guess never applies by default. */
+  if (question) {
+    const listRef = String(t.addToList || "").trim();
+    const matched = results.filter((r) => r.matches === true);
+    const target = listRef ? findList(st, listRef) : null;
+    /* already in the list → nothing to propose for them */
+    const toAdd = matched.filter((r) => !target || !(st.accounts || []).some((x) => x.id === r.accountId && (x.listIds || []).includes(target.id)));
+    if (listRef && toAdd.length) {
+      if (!target) actions.push({ type: "create_list", name: listRef, industry: "" });
+      const sure = toAdd.filter((r) => r.confidence !== "low").map((r) => r.accountId);
+      const unsure = toAdd.filter((r) => r.confidence === "low").map((r) => r.accountId);
+      if (sure.length) actions.push({ type: "add_to_list", list: listRef, accountIds: sure });
+      if (unsure.length) actions.push({ type: "add_to_list", list: listRef, accountIds: unsure, _unchecked: true });
+    }
+    const outRef = String(t.removeNonMatchesFromList || "").trim();
+    const outList = outRef ? findList(st, outRef) : null;
+    if (outList) {
+      const no = results.filter((r) => r.matches === false && r.confidence !== "low" && (st.accounts || []).some((x) => x.id === r.accountId && (x.listIds || []).includes(outList.id)));
+      if (no.length) actions.push({ type: "remove_from_list", list: outRef, accountIds: no.map((r) => r.accountId) });
+    }
+    const tags = arr(t.tag).map(normTag).filter(Boolean);
+    if (tags.length)
+      matched.forEach((r) => {
+        const acc = (st.accounts || []).find((x) => x.id === r.accountId);
+        liveContacts(acc).forEach((c) => {
+          const add = tags.filter((tg) => !tagsOf(c).includes(tg));
+          if (add.length) actions.push({ type: "tag", id: c.id, add, ...(r.confidence === "low" ? { _unchecked: true } : {}) });
+        });
+      });
+  }
+  /* industry and segment tags: the default when there's no question, or
+     when asked for alongside one */
+  if (!question || t.setIndustry) results.forEach((r) => {
     const acc = (st.accounts || []).find((x) => x.id === r.accountId);
     if (!acc || !r.industry || /^(unknown|n\/a|unclear)$/i.test(r.industry)) return;
     const unsure = r.confidence === "low";
     if ((acc.industry || "").trim().toLowerCase() !== r.industry.toLowerCase()) actions.push({ type: "set_industry", accountId: acc.id, industry: r.industry, ...(unsure ? { _unchecked: true } : {}) });
+    if (question) return; /* with a question, industry only — the tags are the user's call */
     const tags = r.tags.length ? r.tags : [normTag(r.industry)];
     liveContacts(acc).forEach((c) => {
       const add = tags.filter((t) => !tagsOf(c).includes(t));
@@ -17232,7 +17289,7 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
     const poolIds = research.poolIds || researchPool(state, research.scope);
     const offset = research.offset || 0;
     const batch = poolIds.slice(offset, offset + RESEARCH_BATCH).filter((id) => (state.accounts || []).some((a) => a.id === id));
-    const r = { focus: research.focus || "What industry is each company in? Tag them by it.", scope: research.scope || {}, poolIds, offset };
+    const r = { focus: research.focus || "What industry is each company in? Tag them by it.", question: String(research.question || "").trim(), then: research.then || {}, scope: research.scope || {}, poolIds, offset };
     if (!batch.length) {
       push(null, { role: "assistant", text: poolIds.length ? "That's every company — nothing left to research." : "No open accounts match — every account may already have an industry. Ask me to research specific companies by name." });
       return;
@@ -17249,15 +17306,22 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
             user: `TODAY: ${today()}
 TASK: Research these companies (${range}). The user's focus: "${r.focus}"
 
-For each company, search the web (use the website if given) and find what industry and segment it is in.
+For each company, search the web (use the website if given) and find what industry and segment it is in, and where it is based.${
+            r.question
+              ? `
+
+QUESTION — decide for each company whether this is TRUE: "${r.question}"
+Judge from what you find on the web, not from the company name or the person's phone number. "matches": true only when the evidence supports every part of the question; false when any part is clearly not true (e.g. a restaurant is not an IT company; a company headquartered elsewhere is not "based in New York"); null if you couldn't find enough.`
+              : ""
+          }
 Reply with ONE JSON object and nothing else:
-{"reply": "1–3 sentences on this batch", "results": [{"accountId": "<id>", "industry": "short industry label, e.g. Managed IT services", "tags": ["1-3 short lower-case segment tags, e.g. msp, cybersecurity"], "summary": "one line: what they do, size or region if found", "confidence": "high|medium|low", "sources": ["https://…"]}]}
+{"reply": "1–3 sentences on this batch", "results": [{"accountId": "<id>", "industry": "short industry label, e.g. Managed IT services", "tags": ["1-3 short lower-case segment tags, e.g. msp, cybersecurity"], "location": "city, state/country of HQ if found", ${r.question ? `"matches": true|false|null, "why": "short evidence for the answer", ` : ""}"summary": "one line: what they do, size or region if found", "confidence": "high|medium|low", "sources": ["https://…"]}]}
 Give a result for EVERY company below, using its id exactly. Reuse these existing tags where they fit: ${Array.from(new Set((state.accounts || []).flatMap((a) => liveContacts(a).flatMap(tagsOf)))).slice(0, 60).join(", ") || "(none yet)"}.
 
 COMPANIES:
 ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
           });
-          return parseResearchReply(raw, state, batch);
+          return parseResearchReply(raw, stateRef.current, batch, { question: r.question, then: r.then });
         },
         { onAttempt: attemptNote(`Researching ${range} on the web…`), signal: abortRef.current?.signal }
       );
@@ -17270,7 +17334,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
         } else await runResearch({ ...r, offset: offset + RESEARCH_BATCH });
       } else {
         if (offset > 0) push(null, { role: "assistant", text: `✓ Research finished — all ${poolIds.length} companies done.` });
-        notify("done", `Research finished — ${poolIds.length} companies looked up`);
+        notify("done", `Research finished — ${poolIds.length} companies looked up${r.question ? "; matches are ready to approve" : ""}`);
       }
     } catch (e) {
       if (isAbort(e)) {
@@ -17308,7 +17372,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
       if (!out.review && !out.research) notify("done", out.actions.length ? `CRM assistant has ${out.actions.length} ${out.actions.length === 1 ? "change" : "changes"} for you to approve` : "CRM assistant replied");
       /* the model asked to read the detail — run the first batch straight away */
       if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {} }, next);
-      if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, scope: out.research.scope || {} });
+      if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, question: out.research.question, then: out.research.then, scope: out.research.scope || {} });
     } catch (e) {
       if (isAbort(e)) {
         push(history, { role: "assistant", stopped: true, text: "■ Stopped.", retry: { kind: "chat" } });
@@ -17463,15 +17527,27 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                 )}
                 {m.results?.length > 0 && (
                   <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
+                    {m.research?.question && (
+                      <div style={{ fontSize: 11, color: C.muted, marginBottom: 6 }}>
+                        Checked: “{m.research.question}” — {m.results.filter((r) => r.matches === true).length} match, {m.results.filter((r) => r.matches === false).length} don&apos;t,{" "}
+                        {m.results.filter((r) => r.matches === null).length} unclear
+                      </div>
+                    )}
                     {m.results.map((r) => {
                       const acc = (state.accounts || []).find((x) => x.id === r.accountId);
                       const col = r.confidence === "high" ? C.green : r.confidence === "medium" ? C.amber : C.red;
                       return (
                         <div key={r.accountId} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 7 }}>
+                          {r.matches !== undefined && m.research?.question ? (
+                            <span style={{ fontWeight: 800, color: r.matches === true ? C.green : r.matches === false ? C.red : C.amber, marginRight: 4 }}>
+                              {r.matches === true ? "✓" : r.matches === false ? "✗" : "?"}
+                            </span>
+                          ) : null}
                           <span style={{ fontWeight: 700 }}>{acc?.company || "?"}</span> <span style={{ color: C.blue }}>· {r.industry || "not found"}</span>
+                          {r.location ? <span style={{ color: C.muted }}> · {r.location}</span> : null}
                           <span style={{ fontFamily: mono, fontSize: 9, color: col, marginLeft: 6 }}>{r.confidence.toUpperCase()}</span>
                           {r.tags.length > 0 && <span style={{ color: C.muted }}> {r.tags.map((t) => `#${t}`).join(" ")}</span>}
-                          {r.summary && <div style={{ color: C.muted, fontSize: 11 }}>{r.summary}</div>}
+                          {(r.why || r.summary) && <div style={{ color: C.muted, fontSize: 11 }}>{m.research?.question && r.why ? r.why : r.summary}</div>}
                           {r.sources.length > 0 && (
                             <div style={{ fontSize: 10 }}>
                               {r.sources.map((u, k) => (
