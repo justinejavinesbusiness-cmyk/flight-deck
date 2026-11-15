@@ -17055,6 +17055,8 @@ ACCOUNTS & CONTACTS:
 - {"type":"remove_followups","id":"<contact or lead id>","scope":"due"|"all_pending","track":"email"|"call"|"any"}   ("due" = pending and due today or earlier; ticked follow-ups are history and are never removed)
 - {"type":"start_review","focus":"what to judge, in the user's words","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true}}   (all scope keys optional)
   Use start_review when the user wants you to read their notes, judge who is worth following up, or asks about anything the CRM DATA doesn't show (what was said, notes, touch-point details). The app then sends you full notes and history 50 prospects at a time. It changes nothing and runs straight away.
+- {"type":"start_research","mode":"profile","scope":{"inRun":true} | {"accountIds":["<id>"]} | {"names":["Acme Pty Ltd"]} | {"lists":["…"]}}
+  COMPANY BRIEFINGS — "what does X do?", "research Acme", "brief me on my call run". Searches the web first, then the company's own website, and returns what they do, services, customers, size, location, recent news and call angles. Works for companies not in the CRM too (names). 5 per batch.
 - {"type":"segment_search","segment":"coaching","match":["coach","life coach","executive coaching"],"tag":"coaching","scope":{ optional: "lists", "criteria", "accountIds", "inRun" },"research":true,"addToList":"optional list name"}
   For ANY "find/show me <type> leads" request (coaching, cybersecurity, dentists, MSPs…): checks tags and industry first, then researches the companies nobody has classified yet, proposes their industry + segment tags (CRM hygiene), tags the matches, and lists the leads. Put synonyms in "match". Leave scope out to cover every open account.
 - {"type":"start_research","mode":"hours","scope":{"inRun":true,"onlyMissingTz":true}}   (CALLING HOURS: finds each company's HQ, decides the time zone to call on — favouring the HQ over the person's number — and opening hours. 10 per batch, no industry/tags. Use this for any "time zone / calling hours / when can I call" research.)
@@ -17581,7 +17583,8 @@ Reply with ONE JSON object and nothing else:
 ${AGENT_ACTION_DOC}
 
 Rules:
-- "Find/get/show me <segment> leads" → segment_search, not find. It runs on its own and reports back.
+- "Find/get/show me <segment> leads" → segment_search, not find.
+- "What does <company> do?", "research <company>", "tell me about my call run's companies" → start_research with mode "profile". Don't answer about a company from memory. It runs on its own and reports back.
 - Answer the user's actual request — never a generic reply. If the answer depends on notes, what was said on calls, touch-point details, or anyone not obvious from the CRM DATA table, use the read tools (query / get / stats) FIRST, then answer from what they return. Interpret loose wording sensibly ("prospects I sent an email to when I called them" = people who asked for an email on a call, or who were both called and emailed — query both if unsure and say which you used).
 - When you need tools, reply ONLY with {"tool_calls":[…]}. When you're done, reply with {"reply": …, "actions": [ … ]}. Quote names, dates and the user's own note wording in the reply; keep it skimmable (short lines, one person per line when listing).
 - Only use ids that appear in the CRM data. Never invent an id. If you can't find something, say so in reply and propose no action for it.
@@ -17782,13 +17785,21 @@ function matchAccountCriteria(st, crit = {}) {
    unticked, so a guess is never applied by default.
    ============================================================ */
 const RESEARCH_BATCH = 8;
-const RESEARCH_SCOPE_KEYS = ["criteria", "accountIds", "noIndustry", "lists", "search", "tzUnknown", "inRun", "onlyMissingTz"];
+const RESEARCH_SCOPE_KEYS = ["criteria", "accountIds", "noIndustry", "lists", "search", "tzUnknown", "inRun", "onlyMissingTz", "names"];
 function researchPool(st, scope = {}) {
   const k = scope || {};
   /* a scope with nothing this understands must not fall through to "every
      account" — that's how 36 became 316 */
   const keys = Object.keys(k).filter((x) => k[x] !== undefined && k[x] !== null && k[x] !== "" && k[x] !== false);
   if (keys.length && !keys.some((x) => RESEARCH_SCOPE_KEYS.includes(x))) return [];
+  /* companies by name — matched to an account when there is one, otherwise
+     looked up as an outsider ("name:Acme") with nothing to change after */
+  if (arr(k.names).length) {
+    return (Array.isArray(k.names) ? k.names : [k.names])
+      .map((n) => String(n || "").trim())
+      .filter(Boolean)
+      .map((n) => findAccount(st, n)?.id || `name:${n}`);
+  }
   /* only companies with no time zone set yet — used to skip what's known */
   const keepMissing = (ids) => (k.onlyMissingTz ? ids.filter((id) => !validTz((st.accounts || []).find((a) => a.id === id)?.timezone)) : ids);
   /* the companies of the people in the call run, in run order */
@@ -17819,6 +17830,63 @@ function researchPool(st, scope = {}) {
   return matchAccountCriteria(st, { noIndustry: k.noIndustry !== false && !k.search && !arr(k.lists).length ? true : !!k.noIndustry, search: k.search, inLists: k.lists, accountStatus: "open" })
     .sort((a, b) => ((a.industry || "").trim() ? 1 : 0) - ((b.industry || "").trim() ? 1 : 0) || (a.company || "").localeCompare(b.company || ""))
     .map((a) => a.id);
+}
+/* ---- company briefings ("what does this company do?") ---- */
+const PROFILE_BATCH = 5;
+function companyBriefProfile(st, id) {
+  if (String(id).startsWith("name:")) return `### ${id} | ${id.slice(5)} | not in the CRM`;
+  const a = (st.accounts || []).find((x) => x.id === id);
+  if (!a) return "";
+  const people = liveContacts(a).slice(0, 4).map((c) => `${c.name || "?"}${c.position ? ` (${c.position})` : ""}`);
+  return `### ${a.id} | ${a.company || "?"} | website: ${a.website || "unknown — find it"} | industry on file: ${a.industry || "-"} | people we know: ${people.join(", ") || "-"}`;
+}
+function parseProfileReply(raw, st, batchIds) {
+  const text = String(raw || "").trim();
+  const a = text.indexOf("{");
+  const b = text.lastIndexOf("}");
+  let j = null;
+  if (a !== -1 && b > a) {
+    try {
+      j = JSON.parse(text.slice(a, b + 1));
+    } catch (e) {
+      j = null;
+    }
+  }
+  if (!j || !Array.isArray(j.results)) throw new Error("The reply didn't contain company briefings.");
+  const ids = new Set(batchIds);
+  const seen = new Set();
+  const list = (v, n) => (Array.isArray(v) ? v : v ? [v] : []).map((x) => clip(x, 120)).filter(Boolean).slice(0, n);
+  const results = j.results
+    .filter((r) => r && ids.has(r.accountId) && !seen.has(r.accountId) && seen.add(r.accountId))
+    .map((r) => ({
+      accountId: r.accountId,
+      name: clip(r.name, 80),
+      website: clip(r.website, 120),
+      whatTheyDo: clip(r.whatTheyDo, 500),
+      services: list(r.services, 6),
+      customers: clip(r.customers, 200),
+      size: clip(r.size, 80),
+      location: clip(r.location, 80),
+      industry: clip(r.industry, 60),
+      timezone: validTz(r.timezone) ? r.timezone : "",
+      news: list(r.news, 3),
+      angles: list(r.angles, 3),
+      confidence: ["high", "medium", "low"].includes(r.confidence) ? r.confidence : "low",
+      sources: (Array.isArray(r.sources) ? r.sources : []).filter((u) => /^https?:\/\//.test(String(u))).slice(0, 4),
+    }));
+  if (!results.length) throw new Error("None of the briefings matched the companies asked about.");
+  /* light hygiene: fill what's blank; the briefing itself can be saved to
+     the account's notes, unticked so it's your choice */
+  const actions = [];
+  results.forEach((r) => {
+    const acc = (st.accounts || []).find((x) => x.id === r.accountId);
+    if (!acc) return;
+    const unsure = r.confidence === "low";
+    if (r.industry && !(acc.industry || "").trim()) actions.push({ type: "set_industry", accountId: acc.id, industry: r.industry, ...(unsure ? { _unchecked: true } : {}) });
+    if (r.timezone && !validTz(acc.timezone)) actions.push({ type: "set_timezone", account: acc.id, tz: r.timezone, ...(unsure ? { _unchecked: true } : {}) });
+    if (r.whatTheyDo) actions.push({ type: "note", id: acc.id, text: `What they do: ${clip(r.whatTheyDo, 300)}`, _unchecked: true });
+  });
+  return { reply: String(j.reply || "").trim(), results, actions, missing: batchIds.filter((id) => !seen.has(id)) };
 }
 function companyBriefHours(st, id) {
   const a = (st.accounts || []).find((x) => x.id === id);
@@ -18110,6 +18178,7 @@ const AGENT_STARTERS = [
   "Organise my accounts into lists by industry",
   "Find everyone with a +1 number",
   "Find me coaching leads",
+  "What do the companies in my call run do?",
   "Take numbers 31–36 out of my call run",
   "Who can I call right now? Put them first in my run",
   "Research the time zones of companies I can't place",
@@ -18177,6 +18246,14 @@ function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo
     return next;
   };
   const push = (_base, m) => commit([...msgsRef.current, m]);
+  /* puts a message just above the first research batch of a job, so a
+     search's matches stay together at the top and the research detail
+     collects underneath */
+  const pushAboveResearch = (jobId, m) => {
+    const cur = msgsRef.current;
+    const at = cur.findIndex((x) => x.kind === "research" && x.research?.jobId === jobId);
+    return commit(at === -1 ? [...cur, m] : [...cur.slice(0, at), m, ...cur.slice(at)]);
+  };
   const attemptNote = (label) => (n, tries) => setBusy(`${n === 1 ? label : `${label} (retry ${n - 1} of ${tries - 1})`}${stopRef.current ? " — stopping…" : ""}`);
 
   const runReview = async (review, base) => {
@@ -18250,9 +18327,10 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
     const offset = research.offset || 0;
     /* calling-hours research asks for less per company, so it takes more at once */
     const hoursOnly = research.mode === "hours";
-    const bs = hoursOnly ? 10 : RESEARCH_BATCH;
-    const batch = poolIds.slice(offset, offset + bs).filter((id) => (state.accounts || []).some((a) => a.id === id));
-    const r = { focus: research.focus || (hoursOnly ? "Where is each company based, and when is it open?" : "What industry is each company in? Tag them by it."), jobId: research.jobId || "", segment: research.segment || null, mode: research.mode || "", batchSize: bs, question: String(research.question || "").trim(), then: research.then || {}, scope: research.scope || {}, poolIds, offset };
+    const profile = research.mode === "profile";
+    const bs = hoursOnly ? 10 : profile ? PROFILE_BATCH : RESEARCH_BATCH;
+    const batch = poolIds.slice(offset, offset + bs).filter((id) => String(id).startsWith("name:") || (state.accounts || []).some((a) => a.id === id));
+    const r = { focus: research.focus || (profile ? "What does this company do?" : hoursOnly ? "Where is each company based, and when is it open?" : "What industry is each company in? Tag them by it."), jobId: research.jobId || "", segment: research.segment || null, mode: research.mode || "", batchSize: bs, question: String(research.question || "").trim(), then: research.then || {}, scope: research.scope || {}, poolIds, offset };
     if (!batch.length) {
       push(null, {
         role: "assistant",
@@ -18260,6 +18338,8 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
           ? "That's every company — nothing left to research."
           : hoursOnly
           ? "Every company in that set already has a time zone — nothing to look up."
+          : profile
+          ? "I couldn't tell which companies — name them, or say “the call run” or a list."
           : "No companies match that — say which ones (the call run, a list, a search, or names) and I'll research just those.",
       });
       return;
@@ -18268,6 +18348,29 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
     try {
       const out = await withRetry(
         async () => {
+          if (profile) {
+            const raw = await callAI({
+              ...ai,
+              signal: abortRef.current?.signal,
+              webSearch: true,
+              system: "You brief a salesperson on companies before they call. Use web search. Never describe a company from its name alone.",
+              user: `TODAY: ${today()}
+TASK: Brief me on these companies (${range}) — what does each one do?${r.focus && !/^what does/i.test(r.focus) ? ` The user asked: "${r.focus}"` : ""}
+
+For each company, in this order:
+1. Search the web for the company name (add the city or country if known) — the search results, Google Business / LinkedIn listings and directories tell you what it is and where.
+2. Then go to its own website (search site:<its domain>) — the home, about and services pages — for what it actually sells and to whom.
+3. Check for anything recent (news, hiring, launches, awards) in the last 12 months.
+
+Reply with ONE JSON object and nothing else:
+{"reply": "1–2 sentences on this batch", "results": [{"accountId": "<id exactly as given>", "name": "official company name", "website": "https://…", "whatTheyDo": "2–3 plain sentences: what they do, for whom, how", "services": ["main services/products"], "customers": "who they serve", "size": "staff count / revenue band if found", "location": "HQ city, country", "industry": "short label", "timezone": "IANA zone of HQ", "news": ["recent items, with month/year"], "angles": ["1–2 specific things worth mentioning on a call"], "confidence": "high|medium|low", "sources": ["https://… search result or page used"]}]}
+Give a result for EVERY company below, using its id exactly. Leave out anything you couldn't find rather than guessing.
+
+COMPANIES:
+${batch.map((id) => companyBriefProfile(state, id)).join("\n")}`,
+            });
+            return parseProfileReply(raw, stateRef.current, batch);
+          }
           const raw = hoursOnly
             ? await callAI({
                 ...ai,
@@ -18315,8 +18418,23 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
           });
           return parseResearchReply(raw, stateRef.current, batch, { question: r.question, then: r.then, hoursOnly });
         },
-        { onAttempt: attemptNote(`Researching ${range} on the web…`), signal: abortRef.current?.signal }
+        { onAttempt: attemptNote(profile ? `Briefing ${range} — searching, then their websites…` : `Researching ${range} on the web…`), signal: abortRef.current?.signal }
       );
+      /* for a segment search, this batch's new leads go out first; the
+         research detail and the changes to approve follow them */
+      if (r.segment) {
+        const hitAccs = out.results.filter((x) => x.matches === true).map((x) => (stateRef.current.accounts || []).find((a) => a.id === x.accountId)).filter(Boolean);
+        if (hitAccs.length) {
+          const ids = peopleAt(hitAccs);
+          pushAboveResearch(r.jobId, {
+            role: "assistant",
+            kind: "found",
+            criteria: { segment: r.segment.segment },
+            ids,
+            text: `🎯 +${ids.length} ${r.segment.segment} ${ids.length === 1 ? "lead" : "leads"} found (${hitAccs.map((a) => a.company).join(", ")}) — research ${range}`,
+          });
+        }
+      }
       push(null, { role: "assistant", kind: "research", text: out.reply || `Researched ${range}.`, results: out.results, missing: out.missing, actions: out.actions, research: { ...r, size: batch.length }, at: Date.now() });
       /* straight on to the next batch */
       if (offset + bs < poolIds.length) {
@@ -18355,12 +18473,13 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
     const accs = (st.accounts || []).filter((a) => knownIds.has(a.id) || matchedIds.has(a.id));
     const ids = [...peopleAt(accs), ...(seg.leadIds || [])];
     const fromResearch = accs.filter((a) => matchedIds.has(a.id) && !knownIds.has(a.id)).length;
+    /* the whole set once more, in one place, now that research is done */
     push(null, {
       role: "assistant",
       kind: "found",
       criteria: { segment: seg.segment },
       ids,
-      text: `🎯 ${seg.segment} leads${partial ? " (so far)" : ""} — ${ids.length} ${ids.length === 1 ? "person" : "people"} at ${accs.length} ${accs.length === 1 ? "company" : "companies"}: ${knownIds.size} already tagged${fromResearch ? `, ${fromResearch} found by research — approve the research changes above to tag them and set their industry` : ""}.`,
+      text: `✓ All ${seg.segment} leads${partial ? " so far (stopped)" : ""} — ${ids.length} ${ids.length === 1 ? "person" : "people"} at ${accs.length} ${accs.length === 1 ? "company" : "companies"}: ${knownIds.size} already tagged${fromResearch ? `, ${fromResearch} found by research — approve the research changes above to tag them and set their industry` : ""}.`,
     });
     notify("done", `${seg.segment} leads ready — ${ids.length} people at ${accs.length} companies`);
   };
@@ -18374,8 +18493,20 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
       kind: "tool",
       text: `🏷 Checked tags and industry for “${words.join("”, “")}” → ${known.length} ${known.length === 1 ? "company already matches" : "companies already match"}${leads.length ? `, plus ${leads.length} lead${leads.length === 1 ? "" : "s"}` : ""}\n${unclassified.length ? `🌐 ${unclassified.length} ${unclassified.length === 1 ? "company has" : "companies have"} no industry yet — ${seg.research === false ? "not researching (asked not to)" : canSearch ? "researching them now" : "web search isn't available, so they're skipped"}` : "Every company in scope is already classified."}`,
     });
-    if (seg.research === false || !canSearch || !unclassified.length) {
-      finishSegment({ segment: segInfo, jobId: "none" });
+    /* what's already known goes out first — no waiting on the web */
+    const knownPeople = [...peopleAt(known), ...leads.map((a) => a.id)];
+    const willResearch = seg.research !== false && canSearch && unclassified.length > 0;
+    push(null, {
+      role: "assistant",
+      kind: "found",
+      criteria: { segment: segInfo.segment },
+      ids: knownPeople,
+      text: knownPeople.length
+        ? `🎯 ${segInfo.segment} leads — ${knownPeople.length} ${knownPeople.length === 1 ? "person" : "people"} at ${known.length + leads.length} ${known.length + leads.length === 1 ? "place" : "places"}, from your tags and industries${willResearch ? `. Researching ${unclassified.length} unclassified ${unclassified.length === 1 ? "company" : "companies"} next — new matches will appear below as they're found.` : "."}`
+        : `No ${segInfo.segment} leads tagged yet.${willResearch ? ` Researching ${unclassified.length} unclassified ${unclassified.length === 1 ? "company" : "companies"} — matches will appear below as they're found.` : ""}`,
+    });
+    if (!willResearch) {
+      notify("done", `${segInfo.segment} leads ready — ${knownPeople.length} people`);
       return;
     }
     await runResearch({
@@ -18592,7 +18723,60 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                     {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} in this batch got no verdict — “Review again” to retry it.</div>}
                   </div>
                 )}
-                {m.results?.length > 0 && (
+                {m.research?.mode === "profile" && m.results?.length > 0 && (
+                  <div style={{ marginTop: 8, whiteSpace: "normal" }}>
+                    {m.results.map((r) => {
+                      const acc = (state.accounts || []).find((x) => x.id === r.accountId);
+                      const host = (() => {
+                        try {
+                          return r.website ? new URL(r.website).hostname.replace(/^www\./, "") : "";
+                        } catch (e) {
+                          return "";
+                        }
+                      })();
+                      return (
+                        <div key={r.accountId} style={{ borderTop: `1px solid ${C.panelEdge}`, padding: "8px 0" }}>
+                          <div style={{ fontSize: 13, fontWeight: 800, color: C.ink }}>
+                            {r.name || acc?.company || String(r.accountId).replace(/^name:/, "")}
+                            {host && (
+                              <a href={r.website} target="_blank" rel="noreferrer" style={{ fontSize: 11, fontWeight: 400, color: C.blue, marginLeft: 6 }}>
+                                {host}
+                              </a>
+                            )}
+                            <span style={{ fontFamily: mono, fontSize: 9, marginLeft: 6, color: r.confidence === "high" ? C.green : r.confidence === "medium" ? C.amber : C.red }}>{r.confidence.toUpperCase()}</span>
+                          </div>
+                          <div style={{ fontSize: 11, color: C.muted }}>{[r.industry, r.location, r.size].filter(Boolean).join(" · ")}</div>
+                          {r.whatTheyDo && <div style={{ fontSize: 12, color: C.ink, lineHeight: 1.5, marginTop: 4 }}>{r.whatTheyDo}</div>}
+                          {r.services.length > 0 && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>Services: {r.services.join(" · ")}</div>}
+                          {r.customers && <div style={{ fontSize: 11, color: C.muted }}>Serves: {r.customers}</div>}
+                          {r.news.length > 0 && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>📰 {r.news.join(" · ")}</div>}
+                          {r.angles.length > 0 && (
+                            <div style={{ fontSize: 11, color: C.green, marginTop: 3 }}>
+                              ☎ Worth mentioning: {r.angles.join(" · ")}
+                            </div>
+                          )}
+                          {r.sources.length > 0 && (
+                            <div style={{ fontSize: 10, marginTop: 3 }}>
+                              {r.sources.map((u, k) => (
+                                <a key={k} href={u} target="_blank" rel="noreferrer" style={{ color: C.blue, marginRight: 8 }}>
+                                  {(() => {
+                                    try {
+                                      return new URL(u).hostname.replace(/^www\./, "");
+                                    } catch (e) {
+                                      return "source";
+                                    }
+                                  })()}
+                                </a>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} came back without a briefing.</div>}
+                  </div>
+                )}
+                {m.research?.mode !== "profile" && m.results?.length > 0 && (
                   <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
                     {m.research?.question && (
                       <div style={{ fontSize: 11, color: C.muted, marginBottom: 6 }}>
