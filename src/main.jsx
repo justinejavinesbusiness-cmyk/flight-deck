@@ -4354,7 +4354,31 @@ export default function FlightDeck() {
   const [accFilter, setAccFilter] = useState("active");
   /* which list the Accounts tab is narrowed to: "" all, "none" unlisted, or a list id */
   const [accList, setAccList] = useState("");
-  const [agentOpen, setAgentOpen] = useState(false);
+  const [agentOpen, setAgentOpenRaw] = useState(false);
+  const agentOpenRef = useRef(false);
+  /* what the assistant is doing right now, shown on the 💬 button when closed */
+  const [agentBusy, setAgentBusy] = useState("");
+  /* unseen results while it was closed: { kind: "done"|"error", text, count } */
+  const [agentAlert, setAgentAlert] = useState(null);
+  const setAgentOpen = (v) => {
+    agentOpenRef.current = v;
+    setAgentOpenRaw(v);
+    if (v) setAgentAlert(null);
+  };
+  /* Tells you when a task finishes or fails while you're elsewhere: a toast,
+     a badge on the 💬 button, and — if the tab is in the background and
+     you've allowed it — a system notification. */
+  const onAgentEvent = (kind, text) => {
+    const hidden = typeof document !== "undefined" && document.hidden;
+    if (agentOpenRef.current && !hidden) return;
+    if (!agentOpenRef.current) setAgentAlert((p) => ({ kind: p?.kind === "error" || kind === "error" ? "error" : "done", text, count: (p?.count || 0) + 1 }));
+    flash(`${kind === "error" ? "⚠" : "💬"} ${text}`);
+    try {
+      if (hidden && typeof Notification !== "undefined" && Notification.permission === "granted") new Notification("Flight Deck", { body: text, tag: "fd-assistant" });
+    } catch (e) {
+      /* notifications unsupported here — the badge and toast still show */
+    }
+  };
   const [agentMsgs, setAgentMsgsRaw] = useState(readAgentChat);
   const setAgentMsgs = (m) => {
     setAgentMsgsRaw(m);
@@ -11795,31 +11819,90 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
 
       {/* ---- CRM assistant ---- */}
       {!agentOpen && (
-        <button
-          onClick={() => setAgentOpen(true)}
-          aria-label="Open the CRM assistant"
-          title="CRM assistant"
+        <div
           style={{
             position: "fixed",
             right: 16,
             bottom: `calc(env(safe-area-inset-bottom, 0px) + ${isDesktop ? 24 : MODES[mode] === "PIPELINE" ? 140 : 92}px)`,
-            width: 50,
-            height: 50,
-            borderRadius: 25,
-            border: `1px solid ${C.blue}`,
-            background: C.panel,
-            color: C.blue,
-            fontSize: 22,
-            cursor: "pointer",
             zIndex: 45,
-            boxShadow: "0 6px 18px rgba(0,0,0,0.35)",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
           }}
         >
-          💬
-        </button>
+          {/* progress or the latest result, readable without opening */}
+          {(agentBusy || agentAlert) && (
+            <button
+              onClick={() => setAgentOpen(true)}
+              style={{
+                maxWidth: isDesktop ? 340 : 220,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                background: C.panel,
+                border: `1px solid ${agentBusy ? C.amber : agentAlert?.kind === "error" ? C.red : C.green}`,
+                color: agentBusy ? C.amber : agentAlert?.kind === "error" ? C.red : C.green,
+                borderRadius: 16,
+                padding: "6px 11px",
+                fontSize: 11,
+                fontWeight: 700,
+                cursor: "pointer",
+                boxShadow: "0 6px 18px rgba(0,0,0,0.35)",
+              }}
+            >
+              {agentBusy ? `⏳ ${agentBusy}` : `${agentAlert.kind === "error" ? "⚠" : "✓"} ${agentAlert.text}`}
+            </button>
+          )}
+          <button
+            onClick={() => setAgentOpen(true)}
+            aria-label="Open the CRM assistant"
+            title="CRM assistant"
+            style={{
+              position: "relative",
+              width: 50,
+              height: 50,
+              borderRadius: 25,
+              border: `${agentBusy ? 2 : 1}px solid ${agentBusy ? C.amber : C.blue}`,
+              background: C.panel,
+              color: C.blue,
+              fontSize: 22,
+              cursor: "pointer",
+              boxShadow: "0 6px 18px rgba(0,0,0,0.35)",
+              flexShrink: 0,
+            }}
+          >
+            💬
+            {agentAlert && (
+              <span
+                style={{
+                  position: "absolute",
+                  top: -4,
+                  right: -4,
+                  minWidth: 18,
+                  height: 18,
+                  borderRadius: 9,
+                  background: agentAlert.kind === "error" ? C.red : C.green,
+                  color: "#0b1a10",
+                  fontFamily: mono,
+                  fontSize: 10,
+                  fontWeight: 800,
+                  lineHeight: "18px",
+                  padding: "0 5px",
+                  boxSizing: "border-box",
+                }}
+              >
+                {agentAlert.kind === "error" ? "!" : agentAlert.count}
+              </span>
+            )}
+          </button>
+        </div>
       )}
-      {agentOpen && (
+      {/* always mounted so a running task survives closing the panel */}
+      {(
         <AgentPanel
+          open={agentOpen}
+          onBusy={setAgentBusy}
+          onEvent={onAgentEvent}
           state={state}
           msgs={agentMsgs}
           setMsgs={setAgentMsgs}
@@ -16807,7 +16890,16 @@ const AGENT_STARTERS = [
    applied, how many went through. Review replies also carry their batch
    position, so "next 50" picks up where the last one stopped, and failed
    requests carry what they were, so Retry sends exactly that again. */
-function AgentPanel({ state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canUndo, onClose, isDesktop }) {
+/* asked once, from a tap that starts a long task — browsers only allow the
+   prompt from a user gesture */
+const askNotifyPermission = () => {
+  try {
+    if (typeof Notification !== "undefined" && Notification.permission === "default") Notification.requestPermission().catch(() => {});
+  } catch (e) {
+    /* unsupported (some mobile browsers) — the in-app badge still works */
+  }
+};
+function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canUndo, onClose, isDesktop, onBusy, onEvent }) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState("");
   const [picks, setPicks] = useState({});
@@ -16822,8 +16914,13 @@ function AgentPanel({ state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canU
   /* set by Stop; the batch in flight finishes, the next one doesn't start */
   const stopRef = useRef(false);
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
-  }, [msgs.length, busy]);
+    if (open) endRef.current?.scrollIntoView({ block: "end" });
+  }, [msgs.length, busy, open]);
+  /* the app shows progress on the 💬 button while the panel is closed */
+  useEffect(() => {
+    onBusy && onBusy(busy);
+  }, [busy]);
+  const notify = (kind, text) => onEvent && onEvent(kind, text);
   /* Every write goes through the ref first, so a reply that lands after an
      Apply (or a second batch after the first) appends to the real latest
      list instead of an older copy captured when the request started. */
@@ -16875,11 +16972,17 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
       push(base, { role: "assistant", kind: "review", text: out.reply || `Reviewed ${range}.`, verdicts: out.verdicts, missing: out.missing, actions: out.actions, review: { ...r, size: batch.length }, at: Date.now() });
       /* straight on to the next 50 until the list is done or you press Stop */
       if (offset + REVIEW_BATCH < poolIds.length) {
-        if (stopRef.current) push(null, { role: "assistant", text: `Stopped after ${range}. “Review next” picks up from here.` });
-        else await runReview({ ...r, offset: offset + REVIEW_BATCH });
-      } else if (offset > 0) push(null, { role: "assistant", text: `✓ Review finished — all ${poolIds.length} prospects done.` });
+        if (stopRef.current) {
+          push(null, { role: "assistant", text: `Stopped after ${range}. “Review next” picks up from here.` });
+          notify("done", `Review stopped after ${range}`);
+        } else await runReview({ ...r, offset: offset + REVIEW_BATCH });
+      } else {
+        if (offset > 0) push(null, { role: "assistant", text: `✓ Review finished — all ${poolIds.length} prospects done.` });
+        notify("done", `Review finished — ${poolIds.length} prospects reviewed`);
+      }
     } catch (e) {
       push(base, { role: "assistant", error: true, text: `⚠ Review of ${range} failed: ${e.message || "no reply"}`, retry: { kind: "review", review: r } });
+      notify("error", `Review of ${range} failed — open the assistant to retry`);
     }
   };
 
@@ -16887,6 +16990,7 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
     const state = stateRef.current;
     if (!canSearch) {
       push(null, { role: "assistant", text: "Web research needs MiniMax or Anthropic as the AI provider, with web search switched on in Settings → AI provider." });
+      notify("error", "Web research isn't available with the current AI provider");
       return;
     }
     const poolIds = research.poolIds || researchPool(state, research.scope);
@@ -16923,11 +17027,17 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
       push(null, { role: "assistant", kind: "research", text: out.reply || `Researched ${range}.`, results: out.results, missing: out.missing, actions: out.actions, research: { ...r, size: batch.length }, at: Date.now() });
       /* straight on to the next 8 */
       if (offset + RESEARCH_BATCH < poolIds.length) {
-        if (stopRef.current) push(null, { role: "assistant", text: `Stopped after ${range}. “Research next” picks up from here.` });
-        else await runResearch({ ...r, offset: offset + RESEARCH_BATCH });
-      } else if (offset > 0) push(null, { role: "assistant", text: `✓ Research finished — all ${poolIds.length} companies done.` });
+        if (stopRef.current) {
+          push(null, { role: "assistant", text: `Stopped after ${range}. “Research next” picks up from here.` });
+          notify("done", `Research stopped after ${range}`);
+        } else await runResearch({ ...r, offset: offset + RESEARCH_BATCH });
+      } else {
+        if (offset > 0) push(null, { role: "assistant", text: `✓ Research finished — all ${poolIds.length} companies done.` });
+        notify("done", `Research finished — ${poolIds.length} companies looked up`);
+      }
     } catch (e) {
       push(null, { role: "assistant", error: true, text: `⚠ Research of ${range} failed: ${e.message || "no reply"}`, retry: { kind: "research", research: r } });
+      notify("error", `Research of ${range} failed — open the assistant to retry`);
     }
   };
 
@@ -16948,17 +17058,20 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
         { onAttempt: attemptNote("Thinking…") }
       );
       const next = push(history, { role: "assistant", text: out.reply || "(no reply)", actions: out.actions, at: Date.now() });
+      if (!out.review && !out.research) notify("done", out.actions.length ? `CRM assistant has ${out.actions.length} ${out.actions.length === 1 ? "change" : "changes"} for you to approve` : "CRM assistant replied");
       /* the model asked to read the detail — run the first batch straight away */
       if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {} }, next);
       if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, scope: out.research.scope || {} });
     } catch (e) {
       push(history, { role: "assistant", error: true, text: `⚠ ${e.message || "Couldn't reach the AI provider."}`, retry: { kind: "chat" } });
+      notify("error", "CRM assistant: the request failed — open it to retry");
     }
   };
 
   const guard = async (fn) => {
     if (busy) return;
     stopRef.current = false;
+    askNotifyPermission();
     setBusy("Thinking…");
     try {
       await fn();
@@ -16987,6 +17100,9 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
   });
   const startReview = () => guard(() => runReview({ focus: "Which of these are worth following up, and what should I do next with each?", scope: {} }, push(msgsRef.current, { role: "user", text: "🔍 Review my prospects — who's worth following up?" })));
 
+  /* Closing only hides the panel: it stays mounted, so a review or research
+     run keeps going in the background and reports back when it's done. */
+  if (!open) return null;
   const shell = isDesktop ? { position: "fixed", top: 0, right: 0, bottom: 0, width: 440, borderLeft: `1px solid ${C.panelEdge}` } : { position: "fixed", inset: 0 };
   const smallBtn = { background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 8, fontSize: 11, padding: "4px 9px", cursor: "pointer" };
   const lastReviewIdx = msgs.map((m) => m.kind === "review").lastIndexOf(true);
@@ -16995,7 +17111,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", borderBottom: `1px solid ${C.panelEdge}`, flexShrink: 0, gap: 8 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 15, fontWeight: 800, color: C.ink }}>💬 CRM assistant</div>
-          <div style={{ fontSize: 11, color: C.muted }}>Reads your notes, organises, builds call runs — you approve every change.</div>
+          <div style={{ fontSize: 11, color: C.muted }}>Reads your notes, organises, builds call runs — you approve every change. Close it any time; it keeps working.</div>
         </div>
         <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
           <button onClick={startReview} disabled={!!busy} title={`Read notes and history ${REVIEW_BATCH} prospects at a time`} style={{ ...smallBtn, color: C.green, borderColor: C.green, opacity: busy ? 0.5 : 1 }}>
