@@ -2690,6 +2690,22 @@ function splitName(name) {
   while (parts.length > 2 && NAME_LETTERS.test(parts[parts.length - 1])) parts = parts.slice(0, -1);
   return [parts[0] || "", parts.slice(1).join(" ")];
 }
+/* ---- searching by number ----
+   "+1" means numbers that START with the US/Canada code — a plain substring
+   test would also hit "+61 1…" or a 1 anywhere in the number. Anything
+   number-like without a + ("415", "0917 123") matches digits anywhere, once
+   there are at least three of them. Formatting never matters either way. */
+const normPhoneQ = (p) => {
+  const t = String(p || "").trim();
+  return (t.startsWith("+") ? "+" : "") + t.replace(/\D/g, "");
+};
+const phoneMatches = (phone, q) => {
+  const qq = String(q || "").trim();
+  if (!phone || !qq) return false;
+  if (/^\+[\d\s().-]*\d[\d\s().-]*$/.test(qq)) return normPhoneQ(phone).startsWith(normPhoneQ(qq));
+  const d = qq.replace(/\D/g, "");
+  return /^[\d\s().-]+$/.test(qq) && d.length >= 3 && normPhoneQ(phone).replace("+", "").includes(d);
+};
 /* spaces, dashes, brackets and dots out; a leading + kept */
 const csvPhone = (phone) => {
   const t = String(phone || "").trim();
@@ -3579,7 +3595,7 @@ async function withTokenBackoff(cap, fn) {
     try {
       return await fn(n);
     } catch (e) {
-      if (!isTooManyTokens(e) || n <= 8000) throw e;
+      if (isAbort(e) || !isTooManyTokens(e) || n <= 8000) throw e;
       n = Math.max(8000, Math.floor(n / 2));
     }
   }
@@ -3589,11 +3605,12 @@ async function withTokenBackoff(cap, fn) {
    the assistant turn and the request is resent, as MiniMax documents. The
    answer is the text AFTER the last search result — text before it is the
    model's lead-in, not the reply. */
-async function callMiniMax({ baseUrl, key, model, system, user, webSearch, cap }) {
+async function callMiniMax({ baseUrl, key, model, system, user, webSearch, cap, signal }) {
   let messages = [{ role: "user", content: user }];
   for (let turn = 0; turn < 4; turn++) {
     const res = await fetch(minimaxMessagesUrl(baseUrl), {
       method: "POST",
+      signal,
       headers: { "content-type": "application/json", "x-api-key": key, authorization: `Bearer ${key}`, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({ model: model || AI_PROVIDERS.minimax.defaultModel, max_tokens: cap, system, messages, ...(webSearch ? { tools: [{ type: "web_search_20250305", name: "web_search" }] } : {}) }),
     });
@@ -3613,17 +3630,20 @@ async function callMiniMax({ baseUrl, key, model, system, user, webSearch, cap }
   }
   throw new Error("The search kept pausing without finishing — try again.");
 }
-async function callAI({ provider, model, baseUrl, key, system, user, webSearch, maxTokens }) {
+/* a Stop pressed mid-request: never retried, never treated as a failure */
+const isAbort = (e) => e?.name === "AbortError" || /aborted/i.test(e?.message || "");
+async function callAI({ provider, model, baseUrl, key, system, user, webSearch, maxTokens, signal }) {
   const prov = provider || "builtin";
   const mm = isMiniMaxCfg({ provider: prov, baseUrl, model });
   const cap = resolveTokens(mm ? "max" : maxTokens, mm ? "minimax" : prov);
   if (mm) {
     if (!key) throw new Error("No API key saved — add one in Settings.");
     try {
-      return await withTokenBackoff(cap, (n) => callMiniMax({ baseUrl, key, model, system, user, webSearch, cap: n }));
+      return await withTokenBackoff(cap, (n) => callMiniMax({ baseUrl, key, model, system, user, webSearch, cap: n, signal }));
     } catch (e) {
+      if (isAbort(e)) throw e;
       /* a model without the search tool: same request, no tool */
-      if (webSearch && /web_search|tool|not support|unsupported/i.test(e.message || "")) return withTokenBackoff(cap, (n) => callMiniMax({ baseUrl, key, model, system, user, webSearch: false, cap: n }));
+      if (webSearch && /web_search|tool|not support|unsupported/i.test(e.message || "")) return withTokenBackoff(cap, (n) => callMiniMax({ baseUrl, key, model, system, user, webSearch: false, cap: n, signal }));
       /* the browser couldn't reach that endpoint at all (blocked, offline) —
          fall through to the plain OpenAI-compatible call, minus web search */
       if (!(e instanceof TypeError) || prov !== "custom") throw e;
@@ -3632,6 +3652,7 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch, 
   if (prov === "builtin") {
     const res = await fetch("/api/coach", {
       method: "POST",
+      signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt: `${system}\n\n${user}` }),
     });
@@ -3649,6 +3670,7 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch, 
   if (prov === "anthropic") {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
+      signal,
       headers: {
         "content-type": "application/json",
         "x-api-key": key,
@@ -3683,10 +3705,11 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch, 
 
   /* openai and custom share the chat-completions shape */
   const url = (prov === "custom" ? (baseUrl || "").replace(/\/$/, "") : "https://api.openai.com/v1") + "/chat/completions";
-  return withTokenBackoff(cap, (n) => callChatCompletions({ url, key, model, system, user, cap: n }));
+  return withTokenBackoff(cap, (n) => callChatCompletions({ url, key, model, system, user, cap: n, signal }));
 }
-async function callChatCompletions({ url, key, model, system, user, cap }) {
+async function callChatCompletions({ url, key, model, system, user, cap, signal }) {
   const res = await fetch(url, {
+    signal,
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
     body: JSON.stringify({
@@ -4360,6 +4383,8 @@ export default function FlightDeck() {
   const [agentBusy, setAgentBusy] = useState("");
   /* unseen results while it was closed: { kind: "done"|"error", text, count } */
   const [agentAlert, setAgentAlert] = useState(null);
+  /* the panel registers its stop() here, so the closed-state pill can stop it */
+  const agentControl = useRef(null);
   const setAgentOpen = (v) => {
     agentOpenRef.current = v;
     setAgentOpenRaw(v);
@@ -8087,6 +8112,10 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .filter((a) => {
         if (!pipeSearch.trim()) return true;
         const q = pipeSearch.trim().toLowerCase();
+        if (phoneMatches(a.contactPhone, pipeSearch)) return true;
+        /* a "+1"-style query is a number search only — matching it as text
+           would hit "+61" rows too */
+        if (/^\+\d/.test(q)) return false;
         return [a.company, a.contact, a.email, a.contactPhone, a.contactLinkedin, a.notes, a.jobBoardName, a.website, a.role]
           .filter(Boolean)
           .some((f) => f.toLowerCase().includes(q));
@@ -8350,7 +8379,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             <input
               value={pipeSearch}
               onChange={(e) => setPipeSearch(e.target.value)}
-              placeholder="🔎 Search company, contact, email, notes…"
+              placeholder="🔎 Search company, contact, email, notes, number (+1…)"
               style={{ ...inputStyle, flex: 1 }}
             />
             {pipeSearch && (
@@ -9405,7 +9434,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .filter((acc) => {
         if (!accSearch.trim()) return true;
         const q = accSearch.trim().toLowerCase();
-        const contactMatch = (acc.contacts || []).some((c) => [c.name, c.email, c.position, c.linkedin, ...tagsOf(c)].filter(Boolean).some((f) => f.toLowerCase().includes(q)));
+        const contactMatch = (acc.contacts || []).some((c) => phoneMatches(c.phone, accSearch) || [c.name, c.email, c.position, c.linkedin, ...tagsOf(c)].filter(Boolean).some((f) => f.toLowerCase().includes(q)));
         return [acc.company, acc.website, acc.industry, acc.notes].filter(Boolean).some((f) => f.toLowerCase().includes(q)) || contactMatch;
       })
       .slice()
@@ -9470,7 +9499,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           .filter((c) => {
             if (!accSearch.trim()) return true;
             const q = accSearch.trim().toLowerCase();
-            return [c.name, c.email, c.position, c._company, c.linkedin, ...tagsOf(c)].filter(Boolean).some((f) => f.toLowerCase().includes(q));
+            return phoneMatches(c.phone, accSearch) || [c.name, c.email, c.position, c._company, c.linkedin, ...tagsOf(c)].filter(Boolean).some((f) => f.toLowerCase().includes(q));
           })
           /* Due contacts is a work queue too — most overdue first. The
              Outreached list stays alphabetical by company for browsing. */
@@ -9495,7 +9524,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           <input
             value={accSearch}
             onChange={(e) => setAccSearch(e.target.value)}
-            placeholder="🔎 Search company, contact name, email…"
+            placeholder="🔎 Search company, contact, email, number (+1, 0917…)"
             style={{ ...inputStyle, flex: 1 }}
           />
           {accSearch && (
@@ -11151,7 +11180,8 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const q = callSearch.trim().toLowerCase();
     const matches = (r) =>
       !q ||
-      `${r.contact.name || ""} ${r.contact.position || ""} ${r.company || ""} ${r.contact.phone || ""} ${r.industry || ""} ${tagsOf(r.contact).join(" ")}`.toLowerCase().includes(q);
+      phoneMatches(r.contact.phone, q) ||
+      (!/^\+\d/.test(q) && `${r.contact.name || ""} ${r.contact.position || ""} ${r.company || ""} ${r.contact.phone || ""} ${r.industry || ""} ${tagsOf(r.contact).join(" ")}`.toLowerCase().includes(q));
     const run = callQueue.filter((r) => r.pick !== -1);
     /* like the search, the filter only narrows the unpicked remainder */
     const activeFilter = callFilterOf(callFilter);
@@ -11853,6 +11883,16 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
               {agentBusy ? `⏳ ${agentBusy}` : `${agentAlert.kind === "error" ? "⚠" : "✓"} ${agentAlert.text}`}
             </button>
           )}
+          {agentBusy && (
+            <button
+              onClick={() => agentControl.current?.stop()}
+              aria-label="Stop the assistant"
+              title="Stop"
+              style={{ width: 32, height: 32, borderRadius: 16, border: `1px solid ${C.red}`, background: C.panel, color: C.red, fontSize: 12, cursor: "pointer", boxShadow: "0 6px 18px rgba(0,0,0,0.35)", flexShrink: 0 }}
+            >
+              ■
+            </button>
+          )}
           <button
             onClick={() => setAgentOpen(true)}
             aria-label="Open the CRM assistant"
@@ -11901,6 +11941,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       {(
         <AgentPanel
           open={agentOpen}
+          controlRef={agentControl}
           onBusy={setAgentBusy}
           onEvent={onAgentEvent}
           state={state}
@@ -16118,8 +16159,9 @@ function regapFollowUps(rec, kept) {
   });
 }
 /* Drops PENDING entries that match; ticked ones are history and stay. */
-function removePendingFollowUps(rec, { scope = "due", track = "any" } = {}) {
-  const t = today();
+function removePendingFollowUps(rec, { scope = "due", track = "any", olderThanDays = null } = {}) {
+  /* "older than N days": due on or before N days ago */
+  const t = num(olderThanDays) != null && num(olderThanDays) > 0 ? addDays(today(), -Math.round(num(olderThanDays))) : today();
   const onTrack = (f) => track === "any" || (track === "call" ? isPhoneFu(f) : !isPhoneFu(f));
   const dated = datedFollowUps(rec);
   const gone = dated.filter(({ f, date }) => !f.done && onTrack(f) && (scope === "all_pending" || (date && date <= t)));
@@ -16192,6 +16234,7 @@ const CALL_CRITERIA_DOC = `{"type":"add_to_run_where","criteria":{ ...any of the
   lists: ["list name or id"]  (account is in any of these)
   industry: "text"  (account industry contains this)
   search: "text"  (name, position or company contains this)
+  phonePrefix: "+1"  (number starts with this code)   text: "words" (also searches email, notes, tags)
   order: "queue" (default: due, never-called, hottest, longest since last call) | "hottest" | "fewest_attempts" | "most_attempts" | "longest_since_call"
   limit: N  (cap how many are added)`;
 const TEMP_RANK = { hot: 0, warm: 1, cold: 2 };
@@ -16217,7 +16260,7 @@ function callFacts(acc, c) {
     written: tps.filter((t) => !isCallTouch(t)).length,
   };
 }
-function matchCallCriteria(st, crit = {}) {
+function matchCallCriteria(st, crit = {}, { anyone = false } = {}) {
   const k = crit || {};
   const temps = arr(k.temperature);
   const outcomes = arr(k.lastOutcome);
@@ -16235,7 +16278,9 @@ function matchCallCriteria(st, crit = {}) {
   const inRun = new Set(st.callSession || []);
   const between = (v, lo, hi) => (num(lo) == null || v >= num(lo)) && (num(hi) == null || v <= num(hi));
   let rows = (st.accounts || [])
-    .flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt && !c.tombstoned && hasPhone(c) && c.status !== "closed" && !inRun.has(c.id)).map((c) => callFacts(acc, c)))
+    .flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt && !c.tombstoned && (anyone || (hasPhone(c) && c.status !== "closed" && !inRun.has(c.id)))).map((c) => callFacts(acc, c)))
+    .filter((r) => !k.phonePrefix || phoneMatches(r.c.phone, String(k.phonePrefix).startsWith("+") ? k.phonePrefix : `+${k.phonePrefix}`))
+    .filter((r) => !k.text || [r.c.name, r.c.position, r.acc.company, r.c.email, r.c.notes, ...tagsOf(r.c)].filter(Boolean).join(" ").toLowerCase().includes(String(k.text).toLowerCase()))
     .filter((r) => !temps.length || temps.includes(r.temp))
     .filter((r) => between(r.attempts, k.attemptsMin, k.attemptsMax))
     .filter((r) => k.connected == null || k.connected === "" || (k.connected === true || k.connected === "true" ? r.everConnected : r.attempts > 0 && !r.everConnected))
@@ -16313,9 +16358,23 @@ function criteriaSummary(st, crit = {}) {
    hand and harmless to get slightly wrong. Statuses, follow-ups and deletes
    stay with you, because those move your numbers.
    ============================================================ */
+const FIND_DOC = `{"type":"find","criteria":{ ...any of these, all must match... }}   (searches and SHOWS results immediately; changes nothing)
+  text: "words"  (anywhere: name, position, company, email, number, notes, tags, touch-point notes, industry)
+  phonePrefix: "+1"  (number starts with this country/area code — "+1" US/Canada, "+44" UK, "+61" Australia, "+63" Philippines)
+  phoneContains: "415"  (digits anywhere in the number)
+  emailDomain: "gmail.com"
+  hasPhone / hasEmail / hasLinkedIn: true|false
+  dueFollowUp: true  (has a follow-up due today or overdue — exactly the people in the app's DUE count)
+  overdueMinDays / overdueMaxDays: N  (their oldest due follow-up was due at least / at most N days ago; implies dueFollowUp)
+  who: "contacts" | "leads" | "all" (default all)   includeClosed: true (default false)
+  plus any add_to_run_where criteria: temperature, attemptsMin/Max, connected, lastOutcome, lastStage, callDue, touchesMin/Max, sent, wantsEmail, qualified, status, tags, lists, industry
+  limit: N`;
 const AGENT_ACTION_DOC = `Actions (use ids exactly as they appear in the data):
 - {"type":"tag","id":"<contact or lead id>","add":["tag"],"remove":["tag"]}
 - {"type":"temperature","id":"<contact or lead id>","value":"cold"|"warm"|"hot"|""}
+- {"type":"tag_where","criteria":{ same as find },"add":["tag"],"remove":["tag"]}   (tags everyone a find would return — use this instead of listing many ids)
+- ${FIND_DOC}
+  Use find whenever the user asks to search, look up, list or count people ("anyone with a +1 number", "who's at gmail", "contacts whose notes mention pricing"). Say what you searched for in reply; the app shows the matches.
 - {"type":"create_list","name":"AU MSPs","industry":"IT services"}
 - {"type":"add_to_list","list":"<list id or exact list name>","accountIds":["<account id>"]}
 - {"type":"remove_from_list","list":"<list id or name>","accountIds":["<account id>"]}
@@ -16331,6 +16390,7 @@ const AGENT_ACTION_DOC = `Actions (use ids exactly as they appear in the data):
 - {"type":"start_review","focus":"what to judge, in the user's words","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true}}   (all scope keys optional)
   Use start_review when the user wants you to read their notes, judge who is worth following up, or asks about anything the CRM DATA doesn't show (what was said, notes, touch-point details). The app then sends you full notes and history 50 prospects at a time. It changes nothing and runs straight away.
 - {"type":"start_research","focus":"what to find, e.g. their industry","scope":{"noIndustry":true,"lists":["list"],"search":"company name","accountIds":["<account id>"]}}   (web research on companies, a few at a time; the app runs it straight away and turns findings into industry + tag changes for approval. Only when WEB SEARCH is available.)
+- {"type":"remove_followups_where","criteria":{ same as find, e.g. {"dueFollowUp":true} },"scope":"due"|"all_pending","olderThanDays":20,"track":"email"|"call"|"any"}   (bulk: removes, for every matching person, pending follow-ups due on or before today minus olderThanDays — "clear follow-ups more than 20 days overdue" = criteria {"overdueMinDays":20}, olderThanDays 20)
 - {"type":"add_followup","id":"<contact or lead id>","date":"YYYY-MM-DD"}  or  {"type":"add_followup","id":"...","inDays":7}   optional "channel": "Cold email" (default) | "LinkedIn" | "Phone call" | "Text/SMS" | "Facebook" | "Instagram"`;
 
 /* every record the assistant may point at, by id */
@@ -16351,7 +16411,7 @@ const recordLabel = (r) => (!r ? "?" : r.kind === "account" ? r.acc.company || "
    mirror an account contact, are left out — the contact is the record to
    change, and listing both would invite the model to edit the copy. */
 function crmDigest(st) {
-  const lines = [`TODAY: ${today()}`];
+  const lines = [`TODAY: ${today()}`, dueDigestLine(st)];
   const lists = st.accountLists || [];
   lines.push(`\nLISTS (id | name | industry | accounts):`);
   if (!lists.length) lines.push("(none)");
@@ -16390,6 +16450,14 @@ function describeAgentAction(st, a, plannedLists = new Set()) {
       const rm = (a.remove || []).map(normTag).filter(Boolean);
       if (!add.length && !rm.length) return bad("Tag: nothing to add or remove");
       return { ok: true, text: `${recordLabel(r)}: ${[add.length ? `tag ${add.map((t) => `#${t}`).join(" ")}` : "", rm.length ? `untag ${rm.map((t) => `#${t}`).join(" ")}` : ""].filter(Boolean).join(", ")}` };
+    }
+    case "tag_where": {
+      const ppl = findPeople(st, a.criteria);
+      const add = (a.add || []).map(normTag).filter(Boolean);
+      const rm = (a.remove || []).map(normTag).filter(Boolean);
+      if (!add.length && !rm.length) return bad("Tag: nothing to add or remove");
+      if (!ppl.length) return bad(`Tag: nobody matches ${findSummary(a.criteria, st)}`);
+      return { ok: true, text: `${[add.length ? `tag ${add.map((t) => `#${t}`).join(" ")}` : "", rm.length ? `untag ${rm.map((t) => `#${t}`).join(" ")}` : ""].filter(Boolean).join(", ")} on ${ppl.length} ${ppl.length === 1 ? "person" : "people"} (${findSummary(a.criteria, st)}): ${ppl.slice(0, 6).map((p) => p.name || "Unnamed").join(", ")}${ppl.length > 6 ? ` +${ppl.length - 6} more` : ""}` };
     }
     case "temperature": {
       const r = locateRecord(st, a.id);
@@ -16448,11 +16516,23 @@ function describeAgentAction(st, a, plannedLists = new Set()) {
       if (!callable.length) return bad("Call run: none of those contacts has a number you can dial");
       return { ok: true, text: `☎ Add ${callable.length} to the call run: ${callable.slice(0, 6).map(recordLabel).join(", ")}${callable.length > 6 ? ` +${callable.length - 6} more` : ""}${rs.length > callable.length ? ` (${rs.length - callable.length} skipped, no number)` : ""}` };
     }
+    case "remove_followups_where": {
+      const opts = { scope: a.scope === "all_pending" ? "all_pending" : "due", track: ["email", "call"].includes(a.track) ? a.track : "any", olderThanDays: a.olderThanDays };
+      const hits = findPeople(st, { ...a.criteria, includeClosed: true })
+        .map((p) => ({ p, removed: removePendingFollowUps(p.rec, opts).removed }))
+        .filter((x) => x.removed.length);
+      if (!hits.length) return bad(`Follow-ups: nothing ${num(a.olderThanDays) ? `due ${num(a.olderThanDays)}+ days ago` : "due"} for ${findSummary(a.criteria, st)}`);
+      const n = hits.reduce((sum, x) => sum + x.removed.length, 0);
+      return {
+        ok: true,
+        text: `Remove ${n} ${opts.scope === "all_pending" ? "pending" : "due"} follow-up${n === 1 ? "" : "s"}${num(a.olderThanDays) ? ` due ${num(a.olderThanDays)}+ days ago` : ""} from ${hits.length} ${hits.length === 1 ? "person" : "people"} (${findSummary(a.criteria, st)}): ${hits.slice(0, 6).map((x) => x.p.name || x.p.company).join(", ")}${hits.length > 6 ? ` +${hits.length - 6} more` : ""}`,
+      };
+    }
     case "remove_followups": {
       const r = locateRecord(st, a.id);
       if (!r || r.kind === "account") return bad(`Follow-ups: no contact or lead with id ${a.id}`);
       const rec = r.kind === "contact" ? r.c : r.app;
-      const { removed } = removePendingFollowUps(rec, { scope: a.scope === "all_pending" ? "all_pending" : "due", track: ["email", "call"].includes(a.track) ? a.track : "any" });
+      const { removed } = removePendingFollowUps(rec, { scope: a.scope === "all_pending" ? "all_pending" : "due", track: ["email", "call"].includes(a.track) ? a.track : "any", olderThanDays: a.olderThanDays });
       if (!removed.length) return bad(`${recordLabel(r)}: no ${a.scope === "all_pending" ? "pending" : "due"} follow-ups to remove`);
       return { ok: true, text: `${recordLabel(r)}: remove ${removed.length} ${a.scope === "all_pending" ? "pending" : "due"} follow-up${removed.length === 1 ? "" : "s"} (${removed.map((x) => `${x.date ? x.date.slice(5) : "undated"} ${FU_TRACK_NAME(x.f)}`).join(", ")})` };
     }
@@ -16519,6 +16599,9 @@ function runAgentActions(st0, reviewed) {
       case "tag":
         patchRecord(r, (x) => withTags(x, a.add || [], a.remove || []));
         break;
+      case "tag_where":
+        findPeople(st, a.criteria).forEach((p) => patchRecord(locateRecord(st, p.id), (x) => withTags(x, a.add || [], a.remove || [])));
+        break;
       case "temperature":
         patchRecord(r, (x) => ({ ...x, temperature: a.value || "", temperatureAt: a.value ? today() : "" }));
         break;
@@ -16575,8 +16658,13 @@ function runAgentActions(st0, reviewed) {
         break;
       }
       case "remove_followups":
-        patchRecord(r, (x) => removePendingFollowUps(x, { scope: a.scope === "all_pending" ? "all_pending" : "due", track: ["email", "call"].includes(a.track) ? a.track : "any" }).rec);
+        patchRecord(r, (x) => removePendingFollowUps(x, { scope: a.scope === "all_pending" ? "all_pending" : "due", track: ["email", "call"].includes(a.track) ? a.track : "any", olderThanDays: a.olderThanDays }).rec);
         break;
+      case "remove_followups_where": {
+        const opts = { scope: a.scope === "all_pending" ? "all_pending" : "due", track: ["email", "call"].includes(a.track) ? a.track : "any", olderThanDays: a.olderThanDays };
+        findPeople(st, { ...a.criteria, includeClosed: true }).forEach((p) => patchRecord(locateRecord(st, p.id), (x) => removePendingFollowUps(x, opts).rec));
+        break;
+      }
       case "add_followup": {
         const out = addFollowUpOn(r.kind === "contact" ? r.c : r.app, resolveFuDate(a), a.channel);
         if (out.error) return;
@@ -16609,14 +16697,15 @@ function parseAgentReply(raw) {
         const all = Array.isArray(j.actions) ? j.actions : [];
         const review = all.find((x) => x?.type === "start_review") || null;
         const research = all.find((x) => x?.type === "start_research") || null;
-        const actions = all.filter((x) => x?.type !== "start_review" && x?.type !== "start_research");
-        return { reply: String(j.reply || "").trim() || (actions.length ? "Here's what I'd change:" : review ? "Reviewing…" : research ? "Researching…" : ""), actions, review, research };
+        const finds = all.filter((x) => x?.type === "find");
+        const actions = all.filter((x) => !["start_review", "start_research", "find"].includes(x?.type));
+        return { reply: String(j.reply || "").trim() || (actions.length ? "Here's what I'd change:" : review ? "Reviewing…" : research ? "Researching…" : finds.length ? "Here's what I found:" : ""), actions, review, research, finds };
       }
     } catch (e) {
       /* fall through to plain text */
     }
   }
-  return { reply: text, actions: [], review: null, research: null };
+  return { reply: text, actions: [], review: null, research: null, finds: [] };
 }
 
 const AGENT_SYSTEM = `You are the CRM assistant inside Flight Deck, a job-search and outreach CRM. You help organise accounts, contacts and leads: tagging, lead temperature, account lists by industry or segment, industries, notes, and building call runs. You answer questions about the data too.
@@ -16633,11 +16722,128 @@ Rules:
 - Tags are short lower-case labels. Reuse existing tags where they fit.
 - "temp" is lead temperature (how keen); it is separate from outreach status.
 - Conditions inside one add_to_run_where must ALL match. For "X, plus Y" or "hot first, then warm", use one add_to_run_where per group, in the order the user wants them called. Someone already added isn't added twice.
+- For any question or change about due/overdue follow-ups across many people, use find (dueFollowUp, overdueMinDays) or remove_followups_where. The FOLLOW-UPS DUE line at the top is the true count — quote it, don't recount from the table.
 - You can add or remove PENDING follow-ups. "fu" in the data lists each one as date + channel, with DUE when it's due today or earlier. You cannot tick a follow-up as done, or remove ticked ones.
 - A written follow-up needs the person to have been contacted already ("contacted" date or a status other than "not contacted"); a call follow-up doesn't.
 - To organise lists: create lists, rename them, set their industry, delete empty or redundant ones, and fill them with add_to_list_where (by industry, segment, temperature…). Propose a whole reorganisation in one reply so the user approves it at once.
 - You cannot change statuses, phone numbers or delete accounts, contacts or leads. If asked, say the user needs to do that themselves.
 - Keep reply under 120 words. Mention counts ("tagged 12 contacts") rather than listing everyone.`;
+
+/* ---- finding people ----
+   One search over every contact and lead, for "everyone with a +1 number",
+   "who's at a gmail address", "contacts whose notes mention budget". The
+   model writes the criteria; this code does the matching, so a count of 23
+   is 23 and nobody is invented. */
+
+function findPeople(st, crit = {}) {
+  const k = crit || {};
+  const who = k.who || "all";
+  const text = String(k.text || "").trim().toLowerCase();
+  const domain = String(k.emailDomain || "").trim().toLowerCase().replace(/^@/, "");
+  const yes = (v) => v === true || v === "true";
+  const no = (v) => v === false || v === "false";
+  const people = [];
+  if (who !== "leads")
+    (st.accounts || []).forEach((acc) =>
+      (acc.contacts || [])
+        .filter((c) => !c.archivedAt && !c.tombstoned && (yes(k.includeClosed) || c.status !== "closed"))
+        .forEach((c) => people.push({ kind: "contact", id: c.id, rec: c, acc, name: c.name, company: acc.company, phone: c.phone, email: c.email, linkedin: c.linkedin, industry: acc.industry, extra: `${acc.notes || ""} ${acc.website || ""}` }))
+    );
+  if (who !== "contacts")
+    (st.applications || [])
+      .filter((a) => !a.fromAccountContact && !a.archivedAt && (yes(k.includeClosed) || isOpenApp(a)))
+      .forEach((a) => people.push({ kind: "lead", id: a.id, rec: a, acc: null, name: a.contact || "", company: a.company, phone: a.contactPhone, email: a.email, linkedin: a.contactLinkedin, industry: a.industry, extra: `${a.role || ""} ${a.website || ""}` }));
+  /* the call-run criteria apply to people too, minus its callable-only rule */
+  const callKeys = ["temperature", "attemptsMin", "attemptsMax", "connected", "lastOutcome", "lastStage", "callDue", "notCalledForDays", "touchesMin", "touchesMax", "writtenTouchesMin", "writtenTouchesMax", "sent", "wantsEmail", "qualified", "status", "tags", "lists", "industry"];
+  const callCrit = Object.fromEntries(callKeys.filter((x) => k[x] !== undefined && k[x] !== "" && k[x] !== null).map((x) => [x, k[x]]));
+  const needCall = Object.keys(callCrit).length > 0;
+  const callOk = needCall ? new Set(matchCallCriteria({ ...st, callSession: [] }, callCrit, { anyone: true }).map((r) => r.c.id)) : null;
+  const wantDue = yes(k.dueFollowUp) || num(k.overdueMinDays) != null || num(k.overdueMaxDays) != null;
+  const dueMap = wantDue ? new Map(dueFollowUpPeople(st).map((d) => [d.id, d])) : null;
+  let out = people.filter((p) => {
+    if (wantDue) {
+      const d = dueMap.get(p.id);
+      if (!d) return false;
+      if (num(k.overdueMinDays) != null && d.overdueDays < num(k.overdueMinDays)) return false;
+      if (num(k.overdueMaxDays) != null && d.overdueDays > num(k.overdueMaxDays)) return false;
+    }
+    if (k.phonePrefix && !phoneMatches(p.phone, String(k.phonePrefix).startsWith("+") ? k.phonePrefix : `+${k.phonePrefix}`)) return false;
+    if (k.phoneContains && !phoneMatches(p.phone, String(k.phoneContains).replace(/^\+/, ""))) return false;
+    if (domain && !(p.email || "").toLowerCase().endsWith(`@${domain}`) && !(p.email || "").toLowerCase().endsWith(`.${domain}`)) return false;
+    if (yes(k.hasPhone) && !hasPhone({ phone: p.phone })) return false;
+    if (no(k.hasPhone) && hasPhone({ phone: p.phone })) return false;
+    if (yes(k.hasEmail) && !(p.email || "").trim()) return false;
+    if (no(k.hasEmail) && (p.email || "").trim()) return false;
+    if (yes(k.hasLinkedIn) && !(p.linkedin || "").trim()) return false;
+    if (no(k.hasLinkedIn) && (p.linkedin || "").trim()) return false;
+    if (needCall && (p.kind !== "contact" || !callOk.has(p.id))) return false;
+    if (text) {
+      const hay = [p.name, p.rec.position, p.company, p.email, p.phone, p.rec.notes, p.industry, p.extra, ...tagsOf(p.rec), ...(p.rec.touchpoints || []).map((t) => t.note)].filter(Boolean).join(" ").toLowerCase();
+      if (!hay.includes(text) && !phoneMatches(p.phone, k.text)) return false;
+    }
+    return true;
+  });
+  const lim = num(k.limit);
+  if (lim != null && lim >= 0) out = out.slice(0, Math.round(lim));
+  return out;
+}
+
+/* ---- due follow-ups, counted the way the DUE badge counts them ----
+   Open leads that are due (not archived, not the pipeline copy of a contact)
+   plus account contacts that are due. Each carries its OLDEST overdue date,
+   so "older than 20 days" means the follow-up was due 20+ days ago. Asking
+   the model to spot these in a long table found one out of 98; this is the
+   list it now works from instead. */
+function dueFollowUpPeople(st) {
+  const t = today();
+  const oldestDue = (rec) => {
+    const d = datedFollowUps(rec).filter((x) => !x.f.done && x.date && x.date <= t).map((x) => x.date).sort()[0];
+    return d || t;
+  };
+  const days = (d) => Math.round((new Date(t) - new Date(d)) / 86400000);
+  const out = [];
+  (st.applications || [])
+    .filter((a) => isDue(a) && !a.archivedAt && !a.fromAccountContact)
+    .forEach((a) => {
+      const d = oldestDue(a);
+      out.push({ kind: "lead", id: a.id, rec: a, acc: null, name: a.contact || a.role || "", company: a.company, dueSince: d, overdueDays: days(d) });
+    });
+  (st.accounts || []).forEach((acc) =>
+    (acc.contacts || [])
+      .filter((c) => isContactDue(c) && !c.archivedAt)
+      .forEach((c) => {
+        const d = oldestDue(c);
+        out.push({ kind: "contact", id: c.id, rec: c, acc, name: c.name || "", company: acc.company, dueSince: d, overdueDays: days(d) });
+      })
+  );
+  return out.sort((a, b) => b.overdueDays - a.overdueDays);
+}
+function dueDigestLine(st) {
+  const due = dueFollowUpPeople(st);
+  const band = (lo, hi) => due.filter((x) => x.overdueDays >= lo && x.overdueDays <= hi).length;
+  return `FOLLOW-UPS DUE: ${due.length} people (this is the app's DUE badge). Overdue by 0–6 days: ${band(0, 6)} · 7–13: ${band(7, 13)} · 14–29: ${band(14, 29)} · 30–59: ${band(30, 59)} · 60+: ${band(60, 100000)}. Use find with dueFollowUp / overdueMinDays, or remove_followups_where, for anything about these — never count them by reading the table.`;
+}
+
+/* the search read back in words */
+function findSummary(crit = {}, st = { accountLists: [] }) {
+  const k = crit || {};
+  const parts = [];
+  if (k.text) parts.push(`“${k.text}”`);
+  if (k.phonePrefix) parts.push(`numbers starting ${String(k.phonePrefix).startsWith("+") ? k.phonePrefix : `+${k.phonePrefix}`}`);
+  if (k.phoneContains) parts.push(`numbers containing ${k.phoneContains}`);
+  if (k.emailDomain) parts.push(`@${String(k.emailDomain).replace(/^@/, "")}`);
+  ["hasPhone", "hasEmail", "hasLinkedIn"].forEach((x) => {
+    if (k[x] === true || k[x] === "true") parts.push(`with ${x.slice(3).toLowerCase()}`);
+    if (k[x] === false || k[x] === "false") parts.push(`no ${x.slice(3).toLowerCase()}`);
+  });
+  if (k.who && k.who !== "all") parts.push(`${k.who} only`);
+  if (k.dueFollowUp === true || k.dueFollowUp === "true") parts.push("follow-up due");
+  if (num(k.overdueMinDays) != null || num(k.overdueMaxDays) != null)
+    parts.push(num(k.overdueMaxDays) == null ? `overdue ${num(k.overdueMinDays)}+ days` : `overdue ${num(k.overdueMinDays) ?? 0}–${num(k.overdueMaxDays)} days`);
+  const rest = criteriaSummary(st, { ...k, text: undefined, search: undefined });
+  if (rest !== "anyone callable") parts.push(rest);
+  return parts.join(", ") || "everyone";
+}
 
 /* ---- accounts by criteria, for filling lists ---- */
 function matchAccountCriteria(st, crit = {}) {
@@ -16842,16 +17048,30 @@ function parseReviewReply(raw, batchIds) {
    reply — with a growing pause. A missing key or a refused request fails at
    once, since asking again would only repeat it. */
 const isRetryable = (e) => !/No API key|invalid x-api-key|authentication|permission|credit balance|not_found_error|model:/i.test(e?.message || "");
-async function withRetry(fn, { tries = 3, onAttempt } = {}) {
+async function withRetry(fn, { tries = 3, onAttempt, signal } = {}) {
   let last;
+  const stopped = () => {
+    const e = new Error("Stopped");
+    e.name = "AbortError";
+    return e;
+  };
   for (let n = 1; n <= tries; n++) {
+    if (signal?.aborted) throw stopped();
     try {
       onAttempt && onAttempt(n, tries);
       return await fn(n);
     } catch (e) {
       last = e;
+      if (isAbort(e) || signal?.aborted) throw stopped();
       if (n === tries || !isRetryable(e)) break;
-      await new Promise((res) => setTimeout(res, n === 1 ? 1500 : 4000));
+      /* the pause between attempts ends early on Stop */
+      await new Promise((res) => {
+        const t = setTimeout(res, n === 1 ? 1500 : 4000);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(t);
+          res();
+        });
+      });
     }
   }
   throw last;
@@ -16882,6 +17102,7 @@ const AGENT_STARTERS = [
   "Clear every overdue follow-up older than two weeks",
   "Read my notes and tell me who's actually worth following up",
   "Organise my accounts into lists by industry",
+  "Find everyone with a +1 number",
   "Research what industry my untagged accounts are in and tag them",
 ];
 
@@ -16899,7 +17120,7 @@ const askNotifyPermission = () => {
     /* unsupported (some mobile browsers) — the in-app badge still works */
   }
 };
-function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canUndo, onClose, isDesktop, onBusy, onEvent }) {
+function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canUndo, onClose, isDesktop, onBusy, onEvent, controlRef }) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState("");
   const [picks, setPicks] = useState({});
@@ -16911,8 +17132,17 @@ function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo
      starts, so anything applied meanwhile is what the next batch sees. */
   const stateRef = useRef(state);
   stateRef.current = state;
-  /* set by Stop; the batch in flight finishes, the next one doesn't start */
+  /* Stop cancels the request in flight (a MiniMax batch can think for
+     minutes, so waiting for it to finish isn't stopping) and nothing after it
+     starts. */
   const stopRef = useRef(false);
+  const abortRef = useRef(null);
+  const stop = () => {
+    stopRef.current = true;
+    abortRef.current?.abort();
+    setBusy((b) => (b && !b.includes("stopping") ? `${b} — stopping…` : b));
+  };
+  if (controlRef) controlRef.current = { stop };
   useEffect(() => {
     if (open) endRef.current?.scrollIntoView({ block: "end" });
   }, [msgs.length, busy, open]);
@@ -16930,7 +17160,7 @@ function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo
     return next;
   };
   const push = (_base, m) => commit([...msgsRef.current, m]);
-  const attemptNote = (label) => (n, tries) => setBusy(`${n === 1 ? label : `${label} (retry ${n - 1} of ${tries - 1})`}${stopRef.current ? " — stopping after this batch" : ""}`);
+  const attemptNote = (label) => (n, tries) => setBusy(`${n === 1 ? label : `${label} (retry ${n - 1} of ${tries - 1})`}${stopRef.current ? " — stopping…" : ""}`);
 
   const runReview = async (review, base) => {
     const state = stateRef.current;
@@ -16948,6 +17178,7 @@ function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo
         async () => {
           const raw = await callAI({
             ...ai,
+            signal: abortRef.current?.signal,
             system: AGENT_SYSTEM,
             user: `TODAY: ${today()}
 TASK: Review these prospects (${range}). The user's focus: "${r.focus}"
@@ -16967,7 +17198,7 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
           });
           return parseReviewReply(raw, batch);
         },
-        { onAttempt: attemptNote(`Reviewing ${range}…`) }
+        { onAttempt: attemptNote(`Reviewing ${range}…`), signal: abortRef.current?.signal }
       );
       push(base, { role: "assistant", kind: "review", text: out.reply || `Reviewed ${range}.`, verdicts: out.verdicts, missing: out.missing, actions: out.actions, review: { ...r, size: batch.length }, at: Date.now() });
       /* straight on to the next 50 until the list is done or you press Stop */
@@ -16981,6 +17212,11 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
         notify("done", `Review finished — ${poolIds.length} prospects reviewed`);
       }
     } catch (e) {
+      if (isAbort(e)) {
+        push(base, { role: "assistant", stopped: true, text: `■ Stopped during ${range}.`, retry: { kind: "review", review: r } });
+        notify("done", `Review stopped during ${range}`);
+        return;
+      }
       push(base, { role: "assistant", error: true, text: `⚠ Review of ${range} failed: ${e.message || "no reply"}`, retry: { kind: "review", review: r } });
       notify("error", `Review of ${range} failed — open the assistant to retry`);
     }
@@ -17007,6 +17243,7 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
         async () => {
           const raw = await callAI({
             ...ai,
+            signal: abortRef.current?.signal,
             webSearch: true,
             system: "You research companies on the web for a sales CRM. Use web search to check each company before answering. Never guess from the name alone; if you can't find it, say so with low confidence.",
             user: `TODAY: ${today()}
@@ -17022,7 +17259,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
           });
           return parseResearchReply(raw, state, batch);
         },
-        { onAttempt: attemptNote(`Researching ${range} on the web…`) }
+        { onAttempt: attemptNote(`Researching ${range} on the web…`), signal: abortRef.current?.signal }
       );
       push(null, { role: "assistant", kind: "research", text: out.reply || `Researched ${range}.`, results: out.results, missing: out.missing, actions: out.actions, research: { ...r, size: batch.length }, at: Date.now() });
       /* straight on to the next 8 */
@@ -17036,6 +17273,11 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
         notify("done", `Research finished — ${poolIds.length} companies looked up`);
       }
     } catch (e) {
+      if (isAbort(e)) {
+        push(null, { role: "assistant", stopped: true, text: `■ Stopped during ${range}.`, retry: { kind: "research", research: r } });
+        notify("done", `Research stopped during ${range}`);
+        return;
+      }
       push(null, { role: "assistant", error: true, text: `⚠ Research of ${range} failed: ${e.message || "no reply"}`, retry: { kind: "research", research: r } });
       notify("error", `Research of ${range} failed — open the assistant to retry`);
     }
@@ -17048,21 +17290,30 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
         async () => {
           const convo = history
             .slice(-10)
-            .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.error ? "(failed request)" : m.text}${m.actions?.length ? ` [proposed ${m.actions.length} actions${m.applied ? `, ${m.applied} applied` : ", not applied"}]` : ""}`)
+            .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.error ? "(failed request)" : m.text}${m.kind === "found" ? ` [find criteria ${JSON.stringify(m.criteria)} — reuse them for tag_where / add_to_run_where]` : ""}${m.actions?.length ? ` [proposed ${m.actions.length} actions${m.applied ? `, ${m.applied} applied` : ", not applied"}]` : ""}`)
             .join("\n");
-          const raw = await callAI({ ...ai, system: AGENT_SYSTEM, user: `WEB SEARCH: ${canSearch ? "available (use start_research)" : "not available with the current AI provider"}\n\nCRM DATA:\n${crmDigest(state)}\n\nCONVERSATION:\n${convo}\n\nReply to the last user message as JSON.` });
+          const raw = await callAI({ ...ai, signal: abortRef.current?.signal, system: AGENT_SYSTEM, user: `WEB SEARCH: ${canSearch ? "available (use start_research)" : "not available with the current AI provider"}\n\nCRM DATA:\n${crmDigest(state)}\n\nCONVERSATION:\n${convo}\n\nReply to the last user message as JSON.` });
           const parsed = parseAgentReply(raw);
-          if (!parsed.reply && !parsed.actions.length && !parsed.review && !parsed.research) throw new Error("Empty reply.");
+          if (!parsed.reply && !parsed.actions.length && !parsed.review && !parsed.research && !parsed.finds.length) throw new Error("Empty reply.");
           return parsed;
         },
-        { onAttempt: attemptNote("Thinking…") }
+        { onAttempt: attemptNote("Thinking…"), signal: abortRef.current?.signal }
       );
       const next = push(history, { role: "assistant", text: out.reply || "(no reply)", actions: out.actions, at: Date.now() });
+      /* searches run here, against the live CRM, and show their matches */
+      out.finds.forEach((fd) => {
+        const found = findPeople(stateRef.current, fd.criteria);
+        push(null, { role: "assistant", kind: "found", criteria: fd.criteria || {}, ids: found.map((p) => p.id), text: `${found.length} ${found.length === 1 ? "match" : "matches"} — ${findSummary(fd.criteria, stateRef.current)}` });
+      });
       if (!out.review && !out.research) notify("done", out.actions.length ? `CRM assistant has ${out.actions.length} ${out.actions.length === 1 ? "change" : "changes"} for you to approve` : "CRM assistant replied");
       /* the model asked to read the detail — run the first batch straight away */
       if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {} }, next);
       if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, scope: out.research.scope || {} });
     } catch (e) {
+      if (isAbort(e)) {
+        push(history, { role: "assistant", stopped: true, text: "■ Stopped.", retry: { kind: "chat" } });
+        return;
+      }
       push(history, { role: "assistant", error: true, text: `⚠ ${e.message || "Couldn't reach the AI provider."}`, retry: { kind: "chat" } });
       notify("error", "CRM assistant: the request failed — open it to retry");
     }
@@ -17071,6 +17322,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
   const guard = async (fn) => {
     if (busy) return;
     stopRef.current = false;
+    abortRef.current = new AbortController();
     askNotifyPermission();
     setBusy("Thinking…");
     try {
@@ -17177,13 +17429,14 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                   </div>
                 )}
                 {m.text}
-                {m.error && m.retry && (
+                {(m.error || m.stopped) && m.retry && i === msgs.length - 1 && (
                   <div style={{ marginTop: 6 }}>
                     <button onClick={() => retry(i)} disabled={!!busy} style={{ ...smallBtn, color: C.amber, borderColor: C.amber }}>
-                      ↻ Retry
+                      {m.stopped ? "▶ Resume from here" : "↻ Retry"}
                     </button>
                   </div>
                 )}
+                {m.kind === "found" && <FoundList ids={m.ids} state={state} onApply={onApply} />}
                 {/* verdicts, grouped so the ones worth chasing come first */}
                 {m.verdicts?.length > 0 && (
                   <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
@@ -17305,17 +17558,9 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
         {busy && (
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: C.muted, padding: "4px 2px" }}>
             <span>{busy}</span>
-            {/^(Reviewing|Researching)/.test(busy) && (
-              <button
-                onClick={() => {
-                  stopRef.current = true;
-                  setBusy((b) => (b.includes("stopping") ? b : `${b} — stopping after this batch`));
-                }}
-                style={smallBtn}
-              >
-                ■ Stop
-              </button>
-            )}
+            <button onClick={stop} style={{ ...smallBtn, color: C.red, borderColor: C.red }}>
+              ■ Stop
+            </button>
           </div>
         )}
         <div ref={endRef} />
@@ -17337,6 +17582,71 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
         <Btn disabled={!!busy || !draft.trim()} onClick={() => send()} style={{ padding: "0 16px" }}>
           Send
         </Btn>
+      </div>
+    </div>
+  );
+}
+
+/* A search result in the chat: who matched, plus the three things you'd
+   usually do next with them — call them, export them, or tag them. */
+function FoundList({ ids, state, onApply }) {
+  const [all, setAll] = useState(false);
+  const [tag, setTag] = useState("");
+  const [done, setDone] = useState("");
+  const rows = ids.map((id) => locateRecord(state, id)).filter(Boolean);
+  const callable = rows.filter((r) => r.kind === "contact" && hasPhone(r.c) && r.c.status !== "closed");
+  const shown = all ? rows : rows.slice(0, 25);
+  const small = { background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 8, fontSize: 11, padding: "4px 9px", cursor: "pointer" };
+  if (!rows.length) return null;
+  return (
+    <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
+      {shown.map((r) => {
+        const x = r.kind === "contact" ? r.c : r.app;
+        return (
+          <div key={x.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 3 }}>
+            <span style={{ fontWeight: 700 }}>{r.kind === "contact" ? x.name || "Unnamed" : x.contact || x.role || "Lead"}</span>
+            <span style={{ color: C.muted }}> · {r.kind === "contact" ? r.acc.company : x.company}</span>
+            {(r.kind === "contact" ? x.phone : x.contactPhone) && <span style={{ fontFamily: mono, fontSize: 11, color: C.blue }}> · {r.kind === "contact" ? x.phone : x.contactPhone}</span>}
+            {x.status && <span style={{ fontSize: 10, color: C.muted }}> · {x.status}</span>}
+          </div>
+        );
+      })}
+      {rows.length > 25 && (
+        <button onClick={() => setAll(!all)} style={{ ...small, marginTop: 2 }}>
+          {all ? "Show fewer" : `Show all ${rows.length}`}
+        </button>
+      )}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
+        {callable.length > 0 && (
+          <button
+            onClick={() => {
+              const n = onApply([{ type: "add_to_run", contactIds: callable.map((r) => r.c.id) }]);
+              setDone(n ? `☎ Added to the call run` : "Already in the run");
+            }}
+            style={{ ...small, color: C.green, borderColor: C.green }}
+          >
+            ☎ Add {callable.length} to run
+          </button>
+        )}
+        {callable.length > 0 && (
+          <button onClick={() => triggerCsvDownload(callable.map((r) => callCsvRow(r.c, r.acc.company)), `call-list-${today()}.csv`, CALL_CSV_COLUMNS)} style={small}>
+            ⬇ CSV ({callable.length})
+          </button>
+        )}
+        <input value={tag} onChange={(e) => setTag(e.target.value)} placeholder="tag all…" aria-label="Tag everyone found" style={{ fontFamily: mono, fontSize: 11, width: 90, padding: "4px 7px", borderRadius: 8, border: `1px dashed ${C.panelEdge}`, background: "transparent", color: C.ink, outline: "none" }} />
+        {normTag(tag) && (
+          <button
+            onClick={() => {
+              onApply(rows.map((r) => ({ type: "tag", id: (r.kind === "contact" ? r.c : r.app).id, add: [tag] })));
+              setDone(`Tagged ${rows.length} #${normTag(tag)}`);
+              setTag("");
+            }}
+            style={{ ...small, color: C.blue, borderColor: C.blue }}
+          >
+            Tag {rows.length}
+          </button>
+        )}
+        {done && <span style={{ fontSize: 11, color: C.green, fontWeight: 700 }}>✓ {done}</span>}
       </div>
     </div>
   );
