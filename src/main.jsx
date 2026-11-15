@@ -3683,11 +3683,63 @@ const writeAiKey = (v) => {
 };
 const AI_PROVIDERS = {
   builtin: { label: "Built-in", sub: "No key needed — uses Flight Deck's own endpoint", needsKey: false, defaultModel: "" },
-  anthropic: { label: "Anthropic", sub: "Your own Claude API key", needsKey: true, defaultModel: "claude-sonnet-4-5" },
-  openai: { label: "OpenAI", sub: "Your own OpenAI API key", needsKey: true, defaultModel: "gpt-4o-mini" },
-  minimax: { label: "MiniMax", sub: "Your MiniMax key — thinking kept out of the answer, web search available", needsKey: true, defaultModel: "MiniMax-M3" },
+  anthropic: { label: "Anthropic", sub: "Your own Claude API key", needsKey: true, defaultModel: "claude-sonnet-5-5" },
+  openai: { label: "OpenAI", sub: "Your own OpenAI API key", needsKey: true, defaultModel: "gpt-6.1-terra" },
+  minimax: { label: "MiniMax", sub: "Your MiniMax key — thinking kept out of the answer, web search available", needsKey: true, defaultModel: "MiniMax-M3.1-Flash" },
   custom: { label: "Custom", sub: "Any OpenAI-compatible endpoint (OpenRouter, Groq, local…)", needsKey: true, defaultModel: "" },
 };
+/* ---- recommended models, per provider ----
+   The first entry is the recommended pick and the provider's default. The
+   lists are what each provider offered in Nov 2026 — "Other model…" in the
+   picker still takes any ID, so a newer model never needs a code change.
+   Retired IDs map to their replacement so a saved one can be flagged and
+   swapped in one tap instead of failing at the next draft. */
+const AI_MODEL_CHOICES = {
+  anthropic: [
+    { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", note: "Recommended — strong writing and research at a mid price" },
+    { id: "claude-opus-5-5", label: "Claude Opus 5.5", note: "Most capable — best for long note reviews and research; costs more" },
+    { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", note: "Fastest and cheapest — fine for quick drafts and tagging" },
+    { id: "claude-fable-5-1", label: "Claude Fable 5.1", note: "Top tier — the priciest; overkill for most CRM work" },
+  ],
+  openai: [
+    { id: "gpt-6.1-terra", label: "GPT-6.1 Terra", note: "Recommended — good writing, fast, low cost" },
+    { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", note: "Stronger reasoning for reviews and research; about 2× Terra's price" },
+    { id: "gpt-6-astra", label: "GPT-6 Astra", note: "OpenAI's most capable — expensive" },
+    { id: "gpt-6-luna", label: "GPT-6 Luna", note: "Cheapest — simple drafts only" },
+  ],
+  minimax: [
+    { id: "MiniMax-M3.1-Flash", label: "MiniMax M3.1 Flash", note: "Recommended — MiniMax's current model, 1M context, web search" },
+    { id: "MiniMax-M3", label: "MiniMax M3", note: "Previous model — still available" },
+  ],
+};
+const AI_RETIRED_MODELS = {
+  "minimax-m2.7": "MiniMax-M3.1-Flash",
+  "minimax-m2.7-highspeed": "MiniMax-M3.1-Flash",
+  "minimax-m2.5": "MiniMax-M3.1-Flash",
+  "minimax-m2.5-highspeed": "MiniMax-M3.1-Flash",
+  "minimax-m2.1": "MiniMax-M3.1-Flash",
+  "minimax-m2.1-highspeed": "MiniMax-M3.1-Flash",
+  "minimax-m2": "MiniMax-M3.1-Flash",
+  "m2-her": "MiniMax-M3.1-Flash",
+};
+/* which list applies: Custom pointed at a known host gets that host's list */
+const modelChoicesFor = ({ provider, baseUrl } = {}) => {
+  if (provider === "custom") {
+    if (/minimax/i.test(baseUrl || "")) return AI_MODEL_CHOICES.minimax;
+    if (/api\.openai\.com/i.test(baseUrl || "")) return AI_MODEL_CHOICES.openai;
+    return [];
+  }
+  return AI_MODEL_CHOICES[provider] || [];
+};
+/* true when the ID is on the target's list, or the target has no list (any
+   Custom endpoint takes any ID) */
+const modelBelongsTo = (model, target) => {
+  const list = modelChoicesFor(target);
+  if (target.provider === "custom" && !list.length) return true;
+  return list.some((m) => m.id.toLowerCase() === String(model || "").trim().toLowerCase());
+};
+const retiredModelSwap = (model) => AI_RETIRED_MODELS[String(model || "").trim().toLowerCase()] || null;
+
 /* ---- MiniMax ----
    MiniMax's own docs recommend its Anthropic-compatible endpoint, and it's
    the better one here for two reasons: reasoning comes back as separate
@@ -3860,23 +3912,36 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch, 
 
   /* openai and custom share the chat-completions shape */
   const url = (prov === "custom" ? (baseUrl || "").replace(/\/$/, "") : "https://api.openai.com/v1") + "/chat/completions";
-  return withTokenBackoff(cap, (n) => callChatCompletions({ url, key, model, system, user, cap: n, signal }));
+  return withTokenBackoff(cap, (n) => callChatCompletions({ url, key, model, system, user, cap: n, signal, tokenField: prov === "openai" ? "max_completion_tokens" : "max_tokens" }));
 }
-async function callChatCompletions({ url, key, model, system, user, cap, signal }) {
-  const res = await fetch(url, {
-    signal,
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model: model || AI_PROVIDERS.openai.defaultModel,
-      max_tokens: cap,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-    }),
-  });
-  const data = await res.json();
+/* OpenAI's reasoning-era models refuse max_tokens and want
+   max_completion_tokens; some OpenAI-compatible hosts only know max_tokens.
+   Send the likely one and swap once if the provider names the other. */
+async function callChatCompletions({ url, key, model, system, user, cap, signal, tokenField = "max_tokens" }) {
+  const send = (field) =>
+    fetch(url, {
+      signal,
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: model || AI_PROVIDERS.openai.defaultModel,
+        [field]: cap,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+      }),
+    });
+  let res = await send(tokenField);
+  let data = await res.json();
+  if (!res.ok) {
+    const msg = String(data?.error?.message || "");
+    const other = tokenField === "max_tokens" ? "max_completion_tokens" : "max_tokens";
+    if (res.status === 400 && msg.includes(tokenField) && msg.includes(other)) {
+      res = await send(other);
+      data = await res.json();
+    }
+  }
   if (!res.ok) throw new Error(data?.error?.message || `Provider error ${res.status}`);
   /* note: only `content` is read. Providers that expose the scratchpad in a
      separate `reasoning` / `reasoning_content` field are ignored by design. */
@@ -12522,6 +12587,78 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
   );
 }
 /* ---------- edit modal (centered) ---------- */
+/* Model dropdown: the provider's recommended models, plus whatever is saved
+   if it isn't one of them, plus "Other model…" for any ID. A retired model is
+   flagged with a one-tap swap. Custom endpoints with no known list stay a
+   plain text box. */
+function ModelPicker({ provider, baseUrl, value, onChange }) {
+  const choices = modelChoicesFor({ provider, baseUrl });
+  const cur = String(value || "").trim();
+  const match = choices.find((m) => m.id.toLowerCase() === cur.toLowerCase());
+  const [other, setOther] = useState(() => !!cur && !match && !retiredModelSwap(cur) && choices.length > 0);
+  const swap = retiredModelSwap(cur);
+  const swapTo = swap && (choices.find((m) => m.id === swap) || { id: swap, label: swap });
+  const OTHER = "__other__";
+  const selected = other ? OTHER : match ? match.id : cur || (choices[0] && choices[0].id) || "";
+  const pick = choices.find((m) => m.id === selected);
+  const lab = { fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 8 };
+  if (!choices.length)
+    return (
+      <>
+        <div style={lab}>Model</div>
+        <input value={value} onChange={(e) => onChange(e.target.value)} placeholder={AI_PROVIDERS[provider]?.defaultModel || "model name, e.g. vendor/model"} style={{ ...inputStyle, fontFamily: mono, fontSize: 12 }} />
+        {provider === "custom" && <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>Type the model ID your endpoint uses — a MiniMax or OpenAI base URL shows a list to pick from.</div>}
+      </>
+    );
+  return (
+    <>
+      <div style={lab}>Model</div>
+      <select
+        data-model-picker
+        value={selected}
+        onChange={(e) => {
+          if (e.target.value === OTHER) {
+            setOther(true);
+            return;
+          }
+          setOther(false);
+          onChange(e.target.value);
+        }}
+        style={{ ...inputStyle, fontSize: 13, cursor: "pointer" }}
+      >
+        {choices.map((m, i) => (
+          <option key={m.id} value={m.id}>
+            {m.label}
+            {i === 0 ? " — recommended" : ""}
+          </option>
+        ))}
+        {!!cur && !match && (
+          <option value={cur}>
+            {cur}
+            {swap ? " — retired" : " — your model"}
+          </option>
+        )}
+        <option value={OTHER}>Other model…</option>
+      </select>
+      {other ? (
+        <input autoFocus value={value} onChange={(e) => onChange(e.target.value)} placeholder="exact model ID" style={{ ...inputStyle, fontFamily: mono, fontSize: 12, marginTop: 6 }} />
+      ) : pick ? (
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 4, lineHeight: 1.45 }}>
+          {pick.note} · <span style={{ fontFamily: mono }}>{pick.id}</span>
+        </div>
+      ) : null}
+      {swap && !other && (
+        <div style={{ marginTop: 6, padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.amber}`, background: "rgba(251,191,36,0.08)", fontSize: 12, color: C.amber, lineHeight: 1.45 }}>
+          ⚠ {cur} has been retired by the provider, so drafts and the assistant will fail with it.{" "}
+          <button onClick={() => onChange(swapTo.id)} style={{ background: "transparent", border: `1px solid ${C.amber}`, color: C.amber, borderRadius: 6, padding: "2px 8px", fontSize: 12, cursor: "pointer" }}>
+            Switch to {swapTo.label}
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
 function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft, isDesktop, snapshots, onRestoreSnapshot, onExportSnapshot, onDeleteSnapshot, onExportCurrent, onImportBackup, onCallLogged }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
@@ -13999,7 +14136,13 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
               {Object.entries(AI_PROVIDERS).map(([key, prov]) => (
                 <button
                   key={key}
-                  onClick={() => set("aiProvider")(key)}
+                  onClick={() => {
+                    if (key === f.aiProvider) return;
+                    set("aiProvider")(key);
+                    /* a model ID belongs to its provider — carrying "MiniMax-M3" over to
+                       Anthropic just fails, so fall back to the new provider's pick */
+                    if (f.aiModel && !modelBelongsTo(f.aiModel, { provider: key, baseUrl: f.aiBaseUrl })) set("aiModel")("");
+                  }}
                   style={{
                     width: "100%",
                     boxSizing: "border-box",
@@ -14030,19 +14173,13 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     style={{ ...inputStyle, fontFamily: mono, fontSize: 12 }}
                     autoComplete="off"
                   />
-                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 8 }}>Model</div>
-                  <input
-                    value={f.aiModel}
-                    onChange={(e) => set("aiModel")(e.target.value)}
-                    placeholder={AI_PROVIDERS[f.aiProvider]?.defaultModel || "model name"}
-                    style={{ ...inputStyle, fontFamily: mono, fontSize: 12 }}
-                  />
                   {f.aiProvider === "custom" && (
                     <>
                       <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 8 }}>Base URL (OpenAI-compatible, without /chat/completions)</div>
                       <input value={f.aiBaseUrl} onChange={(e) => set("aiBaseUrl")(e.target.value)} placeholder="https://openrouter.ai/api/v1" style={{ ...inputStyle, fontFamily: mono, fontSize: 12 }} />
                     </>
                   )}
+                  <ModelPicker key={f.aiProvider} provider={f.aiProvider} baseUrl={f.aiBaseUrl} value={f.aiModel} onChange={set("aiModel")} />
                 </>
               )}
 
