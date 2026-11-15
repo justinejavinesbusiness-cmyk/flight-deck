@@ -209,8 +209,8 @@ const TOUCHPOINT_CHANNELS = ["Facebook", "Instagram", "LinkedIn", "Cold email", 
    Every callable person gets a time zone, so the queue can say whether it's
    a sensible moment to ring them. In order of trust:
      1. one set on the contact (by you or the assistant)
-     2. their number — a US/Canada area code, or a single-zone country code
-     3. the company's time zone (set on the account, or found by research)
+     2. the company's HQ time zone (set on the account, or found by research)
+     3. their number — a US/Canada area code, or a single-zone country code
      4. a country code that spans several zones (Australia, Brazil…) — a guess
      5. the website's country domain (.com.au, .co.uk…) — a guess
    Windows, in their time: Mon–Fri 9–5 is business hours, the two hours
@@ -281,9 +281,11 @@ function tzFromWebsite(site) {
 /* the zone to use for one contact, and where it came from */
 function tzOf(c, acc) {
   if (validTz(c?.timezone)) return { tz: c.timezone, source: "set on contact" };
+  /* the company's HQ comes first: you're calling a business, and its hours
+     are the ones that decide whether anyone picks up */
+  if (validTz(acc?.timezone)) return { tz: acc.timezone, source: "company HQ" };
   const ph = tzFromPhone(c?.phone);
   if (ph && ph.how !== "guess") return { tz: ph.tz, source: ph.how === "area" ? "area code" : "country code" };
-  if (validTz(acc?.timezone)) return { tz: acc.timezone, source: "company" };
   if (ph) return { tz: ph.tz, source: "country code (guess)", guess: true };
   const w = tzFromWebsite(acc?.website);
   if (w) return { tz: w, source: "website (guess)", guess: true };
@@ -11373,12 +11375,12 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           /* a due row is never dimmed — dimming the thing you're overdue on is
              the opposite of highlighting it */
           opacity: picked > 0 && r.pick === -1 && !r.due ? 0.72 : 1,
-          borderRadius: 12,
-          padding: "11px 13px",
-          marginBottom: 6,
+          borderRadius: 10,
+          padding: "7px 10px",
+          marginBottom: 4,
           display: "flex",
           justifyContent: "space-between",
-          gap: 10,
+          gap: 8,
           alignItems: "center",
         }}
       >
@@ -11408,19 +11410,21 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           </button>
         )}
         <div style={{ minWidth: 0, flex: 1, cursor: "pointer" }} onClick={() => setContactCard({ contact: r.contact, company: r.company, accountId: r.accountId })}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginRight: 7 }}>{i + 1}</span>
-            <ConnDot contact={r.contact} />
-            {r.contact.name || "Unnamed"}
+          {/* line 1: who, and whether now is a time to ring them */}
+          <div style={{ display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 }}>
+            <span style={{ fontSize: 14, fontWeight: 700, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+              <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, marginRight: 6 }}>{i + 1}</span>
+              <ConnDot contact={r.contact} />
+              {r.contact.name || "Unnamed"}
+            </span>
+            <CallWindowMark contact={r.contact} account={r.account} now={clockNow} short={!isDesktop} />
           </div>
-          <div style={{ fontSize: 11, color: C.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {/* line 2: everything else that matters, on one line */}
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {[r.contact.position, r.company].filter(Boolean).join(" · ")}
           </div>
-          <div style={{ marginTop: 3 }}>
-            <CallWindowBadge contact={r.contact} account={r.account} now={clockNow} />
-          </div>
-          <ContactBadges contact={r.contact} />
-          <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 3 }}>
+          <ContactBadges contact={r.contact} compact />
+          <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {r.dialable ? (
               r.contact.phone
             ) : (
@@ -11451,8 +11455,8 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             onClick={() => toggleCallSession(r.contact.id)}
             title={r.pick !== -1 ? `#${r.pick + 1} in this run — tap to remove` : "Add to this run"}
             style={{
-              width: 34,
-              height: 42,
+              width: 30,
+              height: 34,
               background: "transparent",
               border: `1px solid ${r.pick !== -1 ? C.amber : C.panelEdge}`,
               color: r.pick !== -1 ? C.amber : C.muted,
@@ -11475,8 +11479,8 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              width: 42,
-              height: 42,
+              width: 36,
+              height: 34,
               border: `1px solid ${r.dialable ? C.green : C.panelEdge}`,
               color: r.dialable ? C.green : C.muted,
               borderRadius: 10,
@@ -11488,7 +11492,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           >
             ☎
           </a>
-          <Btn ghost onClick={() => setCallQueueContact(r)} style={{ padding: "0 10px", height: 42, fontSize: 12, flexShrink: 0 }}>
+          <Btn ghost onClick={() => setCallQueueContact(r)} style={{ padding: "0 9px", height: 34, fontSize: 11, flexShrink: 0 }}>
             Log
           </Btn>
         </div>
@@ -11542,9 +11546,29 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                   </div>
                   <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.45, marginTop: 1 }}>Work down from the top. Numbers are the order you picked.</div>
                 </div>
-                <Btn ghost onClick={clearCallSession} style={{ padding: "6px 11px", fontSize: 11, flexShrink: 0 }}>
-                  Clear
-                </Btn>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  {canWebSearch(state.settings) &&
+                    (() => {
+                      /* companies in the run whose zone is only a guess or unknown */
+                      const unsure = new Set(run.filter((r) => !validTz(r.account?.timezone)).map((r) => r.accountId)).size;
+                      return unsure > 0 ? (
+                        <Btn
+                          ghost
+                          onClick={() => {
+                            agentControl.current?.researchRunHours();
+                            flash(`🕐 Looking up ${unsure} ${unsure === 1 ? "company" : "companies"} — the 💬 button shows progress`);
+                          }}
+                          style={{ padding: "6px 11px", fontSize: 11 }}
+                          title="Find each company's HQ, time zone and opening hours on the web — only the companies in this run"
+                        >
+                          🕐 Find time zones ({unsure})
+                        </Btn>
+                      ) : null;
+                    })()}
+                  <Btn ghost onClick={clearCallSession} style={{ padding: "6px 11px", fontSize: 11, flexShrink: 0 }}>
+                    Clear
+                  </Btn>
+                </div>
               </div>
             )}
 
@@ -16696,9 +16720,11 @@ ACCOUNTS & CONTACTS:
 - {"type":"remove_followups","id":"<contact or lead id>","scope":"due"|"all_pending","track":"email"|"call"|"any"}   ("due" = pending and due today or earlier; ticked follow-ups are history and are never removed)
 - {"type":"start_review","focus":"what to judge, in the user's words","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true}}   (all scope keys optional)
   Use start_review when the user wants you to read their notes, judge who is worth following up, or asks about anything the CRM DATA doesn't show (what was said, notes, touch-point details). The app then sends you full notes and history 50 prospects at a time. It changes nothing and runs straight away.
-- {"type":"start_research","question":"what must be true, e.g. based in New York AND an MSP or IT services company","scope":{"criteria":{ same as find, e.g. {"phonePrefix":"+1"} },"tzUnknown":true,"noIndustry":true,"lists":["list"],"search":"company name","accountIds":["<account id>"]},"then":{"addToList":"US Tech List","removeNonMatchesFromList":"US Tech List","tag":["ny-msp"],"setIndustry":true}}
+- {"type":"start_research","mode":"hours","scope":{"inRun":true,"onlyMissingTz":true}}   (CALLING HOURS: finds each company's HQ, decides the time zone to call on — favouring the HQ over the person's number — and opening hours. 10 per batch, no industry/tags. Use this for any "time zone / calling hours / when can I call" research.)
+- {"type":"start_research","question":"what must be true, e.g. based in New York AND an MSP or IT services company","scope":{"inRun":true,"criteria":{ same as find, e.g. {"phonePrefix":"+1"} },"tzUnknown":true,"onlyMissingTz":true,"noIndustry":true,"lists":["list"],"search":"company name","accountIds":["<account id>"]},"then":{"addToList":"US Tech List","removeNonMatchesFromList":"US Tech List","tag":["ny-msp"],"setIndustry":true}}
   Web research on companies, 8 at a time, running through every batch on its own. Only when WEB SEARCH is available.
   - question: each company is checked against it and comes back as matches true/false. Leave it out to just look up industry.
+  - scope is REQUIRED and must be exactly what the user asked for — research only those companies, never the whole CRM. "the call run" → {"inRun":true}; a list → {"lists":[…]}; named companies → {"accountIds":[…]}; people matching something → {"criteria":{…}}. Add "onlyMissingTz":true to skip companies whose time zone is already set.
   - scope.criteria: research the companies of the people a find would return ("all the +1 contacts").
   - scope.tzUnknown: companies whose callable people have no time zone or only a guessed one. Every research run also proposes each company's time zone and opening hours.
   - then: what to propose for the companies that MATCH (addToList — the list is created if it doesn't exist; tag — on their contacts), and removeNonMatchesFromList for the ones that clearly don't. setIndustry also proposes each company's industry.
@@ -17387,8 +17413,20 @@ function matchAccountCriteria(st, crit = {}) {
    unticked, so a guess is never applied by default.
    ============================================================ */
 const RESEARCH_BATCH = 8;
+const RESEARCH_SCOPE_KEYS = ["criteria", "accountIds", "noIndustry", "lists", "search", "tzUnknown", "inRun", "onlyMissingTz"];
 function researchPool(st, scope = {}) {
   const k = scope || {};
+  /* a scope with nothing this understands must not fall through to "every
+     account" — that's how 36 became 316 */
+  const keys = Object.keys(k).filter((x) => k[x] !== undefined && k[x] !== null && k[x] !== "" && k[x] !== false);
+  if (keys.length && !keys.some((x) => RESEARCH_SCOPE_KEYS.includes(x))) return [];
+  /* only companies with no time zone set yet — used to skip what's known */
+  const keepMissing = (ids) => (k.onlyMissingTz ? ids.filter((id) => !validTz((st.accounts || []).find((a) => a.id === id)?.timezone)) : ids);
+  /* the companies of the people in the call run, in run order */
+  if (k.inRun) {
+    const seen = new Set();
+    return keepMissing(runOrder(st).map((r) => r.acc.id).filter((id) => !seen.has(id) && seen.add(id)));
+  }
   /* "the +1 contacts' companies": accounts of whoever the search returns */
   /* companies where at least one callable person has no zone, or only a guess */
   if (k.tzUnknown) {
@@ -17399,17 +17437,31 @@ function researchPool(st, scope = {}) {
   }
   if (k.criteria && typeof k.criteria === "object") {
     const seen = new Set();
-    return findPeople(st, { ...k.criteria, who: "contacts" })
-      .filter((p) => p.acc && !seen.has(p.acc.id) && seen.add(p.acc.id))
-      .map((p) => p.acc)
-      .sort((a, b) => (a.company || "").localeCompare(b.company || ""))
-      .map((a) => a.id);
+    return keepMissing(
+      findPeople(st, { ...k.criteria, who: "contacts" })
+        .filter((p) => p.acc && !seen.has(p.acc.id) && seen.add(p.acc.id))
+        .map((p) => p.acc)
+        .sort((a, b) => (a.company || "").localeCompare(b.company || ""))
+        .map((a) => a.id)
+    );
   }
   const ids = arr(k.accountIds);
   if (ids.length) return (st.accounts || []).filter((a) => ids.includes(String(a.id).toLowerCase())).map((a) => a.id);
   return matchAccountCriteria(st, { noIndustry: k.noIndustry !== false && !k.search && !arr(k.lists).length ? true : !!k.noIndustry, search: k.search, inLists: k.lists, accountStatus: "open" })
     .sort((a, b) => ((a.industry || "").trim() ? 1 : 0) - ((b.industry || "").trim() ? 1 : 0) || (a.company || "").localeCompare(b.company || ""))
     .map((a) => a.id);
+}
+function companyBriefHours(st, id) {
+  const a = (st.accounts || []).find((x) => x.id === id);
+  if (!a) return "";
+  const people = liveContacts(a)
+    .filter((c) => (c.phone || "").trim())
+    .slice(0, 4)
+    .map((c) => {
+      const ph = tzFromPhone(c.phone);
+      return `${c.name || "?"} ${c.phone}${ph ? ` (number suggests ${ph.tz}${ph.how === "guess" ? ", country-level guess" : ""})` : " (number gives no zone)"}`;
+    });
+  return `### ${a.id} | ${a.company || "?"} | website: ${a.website || "-"} | current zone: ${a.timezone || "-"} | people: ${people.join("; ") || "-"}`;
 }
 function companyBrief(st, id) {
   const a = (st.accounts || []).find((x) => x.id === id);
@@ -17420,7 +17472,7 @@ function companyBrief(st, id) {
 /* Findings → actions. Industry goes on the account; tags (or the industry
    itself when none are given) go on every live contact there, since tags
    live on people. */
-function parseResearchReply(raw, st, batchIds, { question = "", then = {} } = {}) {
+function parseResearchReply(raw, st, batchIds, { question = "", then = {}, hoursOnly = false } = {}) {
   const text = String(raw || "").trim();
   const a = text.indexOf("{");
   const b = text.lastIndexOf("}");
@@ -17501,7 +17553,7 @@ function parseResearchReply(raw, st, batchIds, { question = "", then = {} } = {}
   });
   /* industry and segment tags: the default when there's no question, or
      when asked for alongside one */
-  if (!question || t.setIndustry) results.forEach((r) => {
+  if (!hoursOnly && (!question || t.setIndustry)) results.forEach((r) => {
     const acc = (st.accounts || []).find((x) => x.id === r.accountId);
     if (!acc || !r.industry || /^(unknown|n\/a|unclear)$/i.test(r.industry)) return;
     const unsure = r.confidence === "low";
@@ -17723,7 +17775,13 @@ function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo
     abortRef.current?.abort();
     setBusy((b) => (b && !b.includes("stopping") ? `${b} — stopping…` : b));
   };
-  if (controlRef) controlRef.current = { stop };
+  /* the Calls page can start a calling-hours lookup for the run directly */
+  const researchRunHours = () =>
+    guard(async () => {
+      push(null, { role: "user", text: "🕐 Find time zones and opening hours for the companies in my call run" });
+      await runResearch({ mode: "hours", scope: { inRun: true, onlyMissingTz: true } });
+    });
+  if (controlRef) controlRef.current = { stop, researchRunHours, busy: !!busy };
   useEffect(() => {
     if (open) endRef.current?.scrollIntoView({ block: "end" });
   }, [msgs.length, busy, open]);
@@ -17812,17 +17870,49 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
     }
     const poolIds = research.poolIds || researchPool(state, research.scope);
     const offset = research.offset || 0;
-    const batch = poolIds.slice(offset, offset + RESEARCH_BATCH).filter((id) => (state.accounts || []).some((a) => a.id === id));
-    const r = { focus: research.focus || "What industry is each company in? Tag them by it.", question: String(research.question || "").trim(), then: research.then || {}, scope: research.scope || {}, poolIds, offset };
+    /* calling-hours research asks for less per company, so it takes more at once */
+    const hoursOnly = research.mode === "hours";
+    const bs = hoursOnly ? 10 : RESEARCH_BATCH;
+    const batch = poolIds.slice(offset, offset + bs).filter((id) => (state.accounts || []).some((a) => a.id === id));
+    const r = { focus: research.focus || (hoursOnly ? "Where is each company based, and when is it open?" : "What industry is each company in? Tag them by it."), mode: research.mode || "", batchSize: bs, question: String(research.question || "").trim(), then: research.then || {}, scope: research.scope || {}, poolIds, offset };
     if (!batch.length) {
-      push(null, { role: "assistant", text: poolIds.length ? "That's every company — nothing left to research." : "No open accounts match — every account may already have an industry. Ask me to research specific companies by name." });
+      push(null, {
+        role: "assistant",
+        text: poolIds.length
+          ? "That's every company — nothing left to research."
+          : hoursOnly
+          ? "Every company in that set already has a time zone — nothing to look up."
+          : "No companies match that — say which ones (the call run, a list, a search, or names) and I'll research just those.",
+      });
       return;
     }
     const range = `${offset + 1}–${offset + batch.length} of ${poolIds.length}`;
     try {
       const out = await withRetry(
         async () => {
-          const raw = await callAI({
+          const raw = hoursOnly
+            ? await callAI({
+                ...ai,
+                signal: abortRef.current?.signal,
+                webSearch: true,
+                system: "You find where companies are based and when they're open, for a sales team deciding when to phone them. Use web search. Never guess a location from a name alone.",
+                user: `TODAY: ${today()}
+TASK: Calling hours for these companies (${range}).
+
+For each company:
+1. Find where it is based — its HQ (use the website if given; check the contact page, footer, Google/LinkedIn listing).
+2. Look at the people's numbers listed with it.
+3. Decide the time zone to use for calling. Favour the HQ. Only pick the number's zone instead when the evidence shows the company itself operates from there (e.g. its only office is in that city).
+4. If the company publishes opening hours, give them in its own local time. Never guess hours — leave openHour/closeHour out if not published.
+
+Reply with ONE JSON object and nothing else:
+{"reply": "1–2 sentences on this batch", "results": [{"accountId": "<id>", "location": "HQ city, state/country", "timezone": "IANA zone to use for calling, e.g. America/New_York", "why": "HQ, or why the number's zone was used instead", "openHour": 9, "closeHour": 17, "openDays": ["Mon","Tue","Wed","Thu","Fri"], "confidence": "high|medium|low", "sources": ["https://…"]}]}
+Give a result for EVERY company below, using its id exactly.
+
+COMPANIES:
+${batch.map((id) => companyBriefHours(state, id)).join("\n")}`,
+              })
+            : await callAI({
             ...ai,
             signal: abortRef.current?.signal,
             webSearch: true,
@@ -17845,20 +17935,20 @@ Give a result for EVERY company below, using its id exactly. Reuse these existin
 COMPANIES:
 ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
           });
-          return parseResearchReply(raw, stateRef.current, batch, { question: r.question, then: r.then });
+          return parseResearchReply(raw, stateRef.current, batch, { question: r.question, then: r.then, hoursOnly });
         },
         { onAttempt: attemptNote(`Researching ${range} on the web…`), signal: abortRef.current?.signal }
       );
       push(null, { role: "assistant", kind: "research", text: out.reply || `Researched ${range}.`, results: out.results, missing: out.missing, actions: out.actions, research: { ...r, size: batch.length }, at: Date.now() });
-      /* straight on to the next 8 */
-      if (offset + RESEARCH_BATCH < poolIds.length) {
+      /* straight on to the next batch */
+      if (offset + bs < poolIds.length) {
         if (stopRef.current) {
           push(null, { role: "assistant", text: `Stopped after ${range}. “Research next” picks up from here.` });
           notify("done", `Research stopped after ${range}`);
-        } else await runResearch({ ...r, offset: offset + RESEARCH_BATCH });
+        } else await runResearch({ ...r, offset: offset + bs });
       } else {
         if (offset > 0) push(null, { role: "assistant", text: `✓ Research finished — all ${poolIds.length} companies done.` });
-        notify("done", `Research finished — ${poolIds.length} companies looked up${r.question ? "; matches are ready to approve" : ""}`);
+        notify("done", `Research finished — ${poolIds.length} companies looked up${r.question ? "; matches are ready to approve" : hoursOnly ? "; time zones are ready to approve" : ""}`);
       }
     } catch (e) {
       if (isAbort(e)) {
@@ -17896,7 +17986,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
       if (!out.review && !out.research) notify("done", out.actions.length ? `CRM assistant has ${out.actions.length} ${out.actions.length === 1 ? "change" : "changes"} for you to approve` : "CRM assistant replied");
       /* the model asked to read the detail — run the first batch straight away */
       if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {} }, next);
-      if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, question: out.research.question, then: out.research.then, scope: out.research.scope || {} });
+      if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, mode: out.research.mode, question: out.research.question, then: out.research.then, scope: out.research.scope || {} });
     } catch (e) {
       if (isAbort(e)) {
         push(history, { role: "assistant", stopped: true, text: "■ Stopped.", retry: { kind: "chat" } });
@@ -17933,7 +18023,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
   };
   const reviewNext = (m) => guard(() => runReview({ ...m.review, offset: m.review.offset + REVIEW_BATCH }, msgsRef.current));
   const reviewAgain = (m) => guard(() => runReview(m.review, msgsRef.current));
-  const researchNext = (m) => guard(() => runResearch({ ...m.research, offset: m.research.offset + RESEARCH_BATCH }));
+  const researchNext = (m) => guard(() => runResearch({ ...m.research, offset: m.research.offset + (m.research.batchSize || RESEARCH_BATCH) }));
   const startResearch = () => guard(async () => {
     push(null, { role: "user", text: "🌐 Research my accounts' industries and tag them" });
     await runResearch({ focus: "What industry is each company in? Tag them by it.", scope: {} });
@@ -18067,7 +18157,8 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                               {r.matches === true ? "✓" : r.matches === false ? "✗" : "?"}
                             </span>
                           ) : null}
-                          <span style={{ fontWeight: 700 }}>{acc?.company || "?"}</span> <span style={{ color: C.blue }}>· {r.industry || "not found"}</span>
+                          <span style={{ fontWeight: 700 }}>{acc?.company || "?"}</span>
+                          {m.research?.mode !== "hours" && <span style={{ color: C.blue }}> · {r.industry || "not found"}</span>}
                           {r.location ? <span style={{ color: C.muted }}> · {r.location}</span> : null}
                           {r.timezone ? (
                             <span style={{ color: C.muted }}>
@@ -18078,7 +18169,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                           ) : null}
                           <span style={{ fontFamily: mono, fontSize: 9, color: col, marginLeft: 6 }}>{r.confidence.toUpperCase()}</span>
                           {r.tags.length > 0 && <span style={{ color: C.muted }}> {r.tags.map((t) => `#${t}`).join(" ")}</span>}
-                          {(r.why || r.summary) && <div style={{ color: C.muted, fontSize: 11 }}>{m.research?.question && r.why ? r.why : r.summary}</div>}
+                          {(r.why || r.summary) && <div style={{ color: C.muted, fontSize: 11 }}>{(m.research?.question || m.research?.mode === "hours") && r.why ? r.why : r.summary}</div>}
                           {r.sources.length > 0 && (
                             <div style={{ fontSize: 10 }}>
                               {r.sources.map((u, k) => (
@@ -18101,10 +18192,10 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                     {m.actions?.some((x) => x._unchecked) && <div style={{ fontSize: 11, color: C.muted }}>Low-confidence findings are listed unticked below.</div>}
                   </div>
                 )}
-                {!busy && m.research && i === msgs.map((x) => x.kind === "research").lastIndexOf(true) && m.research.poolIds.length - (m.research.offset + (m.research.size || RESEARCH_BATCH)) > 0 && (
+                {!busy && m.research && i === msgs.map((x) => x.kind === "research").lastIndexOf(true) && m.research.poolIds.length - (m.research.offset + (m.research.size || m.research.batchSize || RESEARCH_BATCH)) > 0 && (
                   <div style={{ marginTop: 6 }}>
                     <Btn onClick={() => researchNext(m)} disabled={!!busy} style={{ padding: "6px 11px", fontSize: 11 }}>
-                      Research next {Math.min(RESEARCH_BATCH, m.research.poolIds.length - (m.research.offset + m.research.size))} ({m.research.poolIds.length - (m.research.offset + m.research.size)} left)
+                      Research next {Math.min(m.research.batchSize || RESEARCH_BATCH, m.research.poolIds.length - (m.research.offset + m.research.size))} ({m.research.poolIds.length - (m.research.offset + m.research.size)} left)
                     </Btn>
                   </div>
                 )}
@@ -18365,15 +18456,17 @@ function ListManager({ lists, counts, onCreate, onUpdate, onDelete }) {
    they're waiting on an email, what you've sent them, and their tags. Renders
    nothing when there's nothing to say, so it costs no space on bare rows. */
 const TONE_COL = { blue: C.blue, amber: C.amber, red: C.red, green: C.green };
-function ContactBadges({ contact, style }) {
+function ContactBadges({ contact, style, compact }) {
   const t = leadTemp(contact?.temperature);
   const sent = sentKindsOf(contact);
-  const tags = tagsOf(contact);
+  const allTags = tagsOf(contact);
+  /* the queue shows two tags and a count; the card shows them all */
+  const tags = compact ? allTags.slice(0, 2) : allTags;
   const email = emailRequestOpen(contact);
-  if (!t && !sent.length && !tags.length && !email) return null;
-  const chip = (col) => ({ fontFamily: mono, fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 8, border: `1px solid ${col}`, color: col, whiteSpace: "nowrap" });
+  if (!t && !sent.length && !allTags.length && !email) return null;
+  const chip = (col) => ({ fontFamily: mono, fontSize: compact ? 8 : 9, fontWeight: 700, padding: compact ? "0 5px" : "1px 6px", borderRadius: 8, border: `1px solid ${col}`, color: col, whiteSpace: "nowrap", lineHeight: compact ? "14px" : undefined });
   return (
-    <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 3, ...style }}>
+    <div style={{ display: "flex", gap: 3, flexWrap: compact ? "nowrap" : "wrap", overflow: "hidden", marginTop: compact ? 2 : 3, ...style }}>
       {t && (
         <span style={chip(TONE_COL[t.tone])} title={`Lead temperature${contact.temperatureAt ? ` · set ${contact.temperatureAt}` : ""}`}>
           {t.icon} {t.label.toUpperCase()}
@@ -18394,10 +18487,28 @@ function ContactBadges({ contact, style }) {
           #{tg}
         </span>
       ))}
+      {allTags.length > tags.length && <span style={{ ...chip(C.muted), border: "none" }}>+{allTags.length - tags.length}</span>}
     </div>
   );
 }
 
+/* Beside the name: a green ☎ in their business hours, an amber ☎ in the two
+   hours after, no phone when they're closed — then their clock, small. */
+function CallWindowMark({ contact, account, now, short }) {
+  const w = callWindowOf(contact, account, now);
+  const col = w.window === "business" ? C.green : w.window === "after" ? C.amber : C.muted;
+  const title = w.tz
+    ? `${CALL_WINDOWS[w.window].label} — ${w.local} in ${tzCity(w.tz)} (${w.source})${w.hours ? ` · company hours ${w.hours.open}:00–${w.hours.close}:00` : " · Mon–Fri 9–5"}${w.guess ? " · a guess: set the company's time zone or research it" : ""}`
+    : "Time zone unknown — research the company or set its time zone";
+  return (
+    <span title={title} style={{ display: "inline-flex", alignItems: "baseline", gap: 4, flexShrink: 0, whiteSpace: "nowrap" }}>
+      {(w.window === "business" || w.window === "after") && <span style={{ color: col, fontSize: 13, lineHeight: 1 }}>☎</span>}
+      <span style={{ fontFamily: mono, fontSize: 9, color: col, opacity: w.window === "closed" ? 0.75 : 1 }}>
+        {w.local ? (short ? `${w.local.split(" ")[1]}${w.guess ? "?" : ""}` : `${w.local} ${tzCity(w.tz)}${w.guess ? "?" : ""}`) : "tz ?"}
+      </span>
+    </span>
+  );
+}
 /* their local time and whether to call now, for the queue and the run */
 function CallWindowBadge({ contact, account, now }) {
   const w = callWindowOf(contact, account, now);
