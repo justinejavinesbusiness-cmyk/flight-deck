@@ -3514,8 +3514,31 @@ const AI_PROVIDERS = {
   builtin: { label: "Built-in", sub: "No key needed — uses Flight Deck's own endpoint", needsKey: false, defaultModel: "" },
   anthropic: { label: "Anthropic", sub: "Your own Claude API key", needsKey: true, defaultModel: "claude-sonnet-4-5" },
   openai: { label: "OpenAI", sub: "Your own OpenAI API key", needsKey: true, defaultModel: "gpt-4o-mini" },
+  minimax: { label: "MiniMax", sub: "Your MiniMax key — thinking kept out of the answer, web search available", needsKey: true, defaultModel: "MiniMax-M3" },
   custom: { label: "Custom", sub: "Any OpenAI-compatible endpoint (OpenRouter, Groq, local…)", needsKey: true, defaultModel: "" },
 };
+/* ---- MiniMax ----
+   MiniMax's own docs recommend its Anthropic-compatible endpoint, and it's
+   the better one here for two reasons: reasoning comes back as separate
+   "thinking" blocks instead of inline in the answer, and it hosts a
+   server-side web_search tool. A Custom provider pointed at api.minimax.io
+   is treated as MiniMax too, so an existing setup gets both without
+   changing anything. */
+const isMiniMaxCfg = ({ provider, baseUrl, model } = {}) => provider === "minimax" || (provider === "custom" && (/minimax/i.test(baseUrl || "") || /^minimax/i.test(model || "")));
+const minimaxMessagesUrl = (baseUrl) => {
+  try {
+    const u = new URL(/minimax/i.test(baseUrl || "") ? baseUrl : "https://api.minimax.io");
+    return `${u.origin}/anthropic/v1/messages`;
+  } catch (e) {
+    return "https://api.minimax.io/anthropic/v1/messages";
+  }
+};
+/* web search runs only where a provider actually hosts it */
+const canWebSearch = (settings) =>
+  settings?.aiWebSearch !== false && (settings?.aiProvider === "anthropic" || isMiniMaxCfg({ provider: settings?.aiProvider, baseUrl: settings?.aiBaseUrl, model: settings?.aiModel }));
+/* the most each provider will take in one reply — thinking counts against it,
+   so a tight cap is what produces answers cut off mid-thought */
+const AI_TOKEN_CEILING = { anthropic: 32000, minimax: 64000, openai: 16384, custom: 32000 };
 
 /* Reasoning models (DeepSeek R1, QwQ, and most "thinking" variants on
    OpenRouter) emit their scratchpad inline before the answer. Strip it — you
@@ -3542,10 +3565,70 @@ function stripReasoning(raw) {
    thinking before they write anything; a tight cap produced responses that
    were ONLY scratchpad, with the email never reaching the page. */
 const AI_MAX_TOKENS_DEFAULT = 4000;
-const clampTokens = (n) => Math.max(500, Math.min(16000, +n || AI_MAX_TOKENS_DEFAULT));
+const clampTokens = (n) => Math.max(500, Math.min(64000, +n || AI_MAX_TOKENS_DEFAULT));
+/* "max" asks for the provider's ceiling; anything else is clamped to it */
+const resolveTokens = (maxTokens, provKey) => {
+  const ceiling = AI_TOKEN_CEILING[provKey] || 16000;
+  return maxTokens === "max" ? ceiling : Math.min(ceiling, clampTokens(maxTokens));
+};
+/* a provider that refuses the size says so in the error — halve and retry */
+const isTooManyTokens = (e) => /max_tokens|max tokens|maximum.*tokens|output tokens|too large|exceed/i.test(e?.message || "");
+async function withTokenBackoff(cap, fn) {
+  let n = cap;
+  for (;;) {
+    try {
+      return await fn(n);
+    } catch (e) {
+      if (!isTooManyTokens(e) || n <= 8000) throw e;
+      n = Math.max(8000, Math.floor(n / 2));
+    }
+  }
+}
+/* One MiniMax request through its Anthropic-compatible endpoint. A search
+   that hits its limit stops with pause_turn; the reply so far goes back as
+   the assistant turn and the request is resent, as MiniMax documents. The
+   answer is the text AFTER the last search result — text before it is the
+   model's lead-in, not the reply. */
+async function callMiniMax({ baseUrl, key, model, system, user, webSearch, cap }) {
+  let messages = [{ role: "user", content: user }];
+  for (let turn = 0; turn < 4; turn++) {
+    const res = await fetch(minimaxMessagesUrl(baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": key, authorization: `Bearer ${key}`, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: model || AI_PROVIDERS.minimax.defaultModel, max_tokens: cap, system, messages, ...(webSearch ? { tools: [{ type: "web_search_20250305", name: "web_search" }] } : {}) }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data?.type === "error") throw new Error(data?.error?.message || data?.base_resp?.status_msg || `MiniMax error ${res.status}`);
+    const content = Array.isArray(data.content) ? data.content : [];
+    if (data.stop_reason === "pause_turn") {
+      messages = [...messages, { role: "assistant", content }];
+      continue;
+    }
+    const lastTool = content.map((b) => b.type !== "text" && b.type !== "thinking").lastIndexOf(true);
+    const after = content.slice(lastTool + 1).filter((b) => b.type === "text");
+    const text = stripReasoning((after.length ? after : content.filter((b) => b.type === "text")).map((b) => b.text).join("\n"));
+    if (!text && data.stop_reason === "max_tokens") throw new Error(`Hit the ${cap}-token limit while thinking, before writing an answer.`);
+    if (!text) throw new Error("The model returned nothing usable. Try again, or a different model.");
+    return text;
+  }
+  throw new Error("The search kept pausing without finishing — try again.");
+}
 async function callAI({ provider, model, baseUrl, key, system, user, webSearch, maxTokens }) {
-  const cap = clampTokens(maxTokens);
   const prov = provider || "builtin";
+  const mm = isMiniMaxCfg({ provider: prov, baseUrl, model });
+  const cap = resolveTokens(mm ? "max" : maxTokens, mm ? "minimax" : prov);
+  if (mm) {
+    if (!key) throw new Error("No API key saved — add one in Settings.");
+    try {
+      return await withTokenBackoff(cap, (n) => callMiniMax({ baseUrl, key, model, system, user, webSearch, cap: n }));
+    } catch (e) {
+      /* a model without the search tool: same request, no tool */
+      if (webSearch && /web_search|tool|not support|unsupported/i.test(e.message || "")) return withTokenBackoff(cap, (n) => callMiniMax({ baseUrl, key, model, system, user, webSearch: false, cap: n }));
+      /* the browser couldn't reach that endpoint at all (blocked, offline) —
+         fall through to the plain OpenAI-compatible call, minus web search */
+      if (!(e instanceof TypeError) || prov !== "custom") throw e;
+    }
+  }
   if (prov === "builtin") {
     const res = await fetch("/api/coach", {
       method: "POST",
@@ -3600,6 +3683,9 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch, 
 
   /* openai and custom share the chat-completions shape */
   const url = (prov === "custom" ? (baseUrl || "").replace(/\/$/, "") : "https://api.openai.com/v1") + "/chat/completions";
+  return withTokenBackoff(cap, (n) => callChatCompletions({ url, key, model, system, user, cap: n }));
+}
+async function callChatCompletions({ url, key, model, system, user, cap }) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
@@ -6001,7 +6087,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const hook = (item.hook || "").trim();
     const personMode = isGenericPersonHook(hook);
     const generic = isGenericHook(hook) || personMode;
-    const canSearch = state.settings?.aiProvider === "anthropic" && state.settings?.aiWebSearch !== false;
+    const canSearch = canWebSearch(state.settings);
     const secs = normDraftSections(state.settings?.draftSections);
     const e = item.entry || ref.entry;
     /* the item already names one person, so the draft is addressed to them
@@ -11738,7 +11824,8 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           msgs={agentMsgs}
           setMsgs={setAgentMsgs}
           isDesktop={isDesktop}
-          ai={{ provider: state.settings?.aiProvider, model: state.settings?.aiModel, baseUrl: state.settings?.aiBaseUrl, key: readAiKey(), maxTokens: state.settings?.aiMaxTokens }}
+          ai={{ provider: state.settings?.aiProvider, model: state.settings?.aiModel, baseUrl: state.settings?.aiBaseUrl, key: readAiKey(), maxTokens: "max" }}
+          canSearch={canWebSearch(state.settings)}
           canUndo={undoCount > 0}
           onUndo={undo}
           onClose={() => setAgentOpen(false)}
@@ -13530,7 +13617,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 </>
               )}
 
-              {f.aiProvider === "anthropic" && (
+              {(f.aiProvider === "anthropic" || isMiniMaxCfg({ provider: f.aiProvider, baseUrl: f.aiBaseUrl, model: f.aiModel })) && (
                 <>
                   <div style={{ fontSize: 11, color: C.muted, marginBottom: 4, marginTop: 10 }}>Let it research</div>
                   <button
@@ -13551,8 +13638,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     {f.aiWebSearch ? "◉ Web search on" : "○ Web search off"}
                   </button>
                   <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginTop: 4 }}>
-                    When a hook is set to &ldquo;generic&rdquo;, the model searches for a real one and writes the email around it. Billed as extra usage on your key. Only
-                    Anthropic supports this here — the other providers are told not to invent anything instead.
+                    When a hook is set to &ldquo;generic&rdquo;, the model searches for a real one and writes the email around it, and the CRM assistant can look up
+                    companies&apos; industries. Billed as extra usage on your key. Anthropic and MiniMax support this here — the other providers are told not to invent
+                    anything instead.
                   </div>
                 </>
               )}
@@ -16148,6 +16236,9 @@ const AGENT_ACTION_DOC = `Actions (use ids exactly as they appear in the data):
 - {"type":"create_list","name":"AU MSPs","industry":"IT services"}
 - {"type":"add_to_list","list":"<list id or exact list name>","accountIds":["<account id>"]}
 - {"type":"remove_from_list","list":"<list id or name>","accountIds":["<account id>"]}
+- {"type":"update_list","list":"<list id or name>","name":"new name (optional)","industry":"new industry (optional)"}
+- {"type":"delete_list","list":"<list id or name>"}   (the list only — its accounts stay)
+- {"type":"add_to_list_where","list":"<list id or name, may be created earlier in the same reply>","criteria":{"industry":"text","search":"text","notInAnyList":true,"inLists":["list"],"accountStatus":"open"|"closed"|"any","contactTemperature":["hot"],"contactTags":["tag"],"hasCallable":true,"noIndustry":true}}   (the app picks the matching accounts — use this instead of listing many ids)
 - {"type":"set_industry","accountId":"<account id>","industry":"Fintech"}
 - {"type":"add_to_run","contactIds":["<contact id>"]}   (call run, specific people; only contacts with a phone number)
 - ${CALL_CRITERIA_DOC}
@@ -16156,6 +16247,7 @@ const AGENT_ACTION_DOC = `Actions (use ids exactly as they appear in the data):
 - {"type":"remove_followups","id":"<contact or lead id>","scope":"due"|"all_pending","track":"email"|"call"|"any"}   ("due" = pending and due today or earlier; ticked follow-ups are history and are never removed)
 - {"type":"start_review","focus":"what to judge, in the user's words","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true}}   (all scope keys optional)
   Use start_review when the user wants you to read their notes, judge who is worth following up, or asks about anything the CRM DATA doesn't show (what was said, notes, touch-point details). The app then sends you full notes and history 50 prospects at a time. It changes nothing and runs straight away.
+- {"type":"start_research","focus":"what to find, e.g. their industry","scope":{"noIndustry":true,"lists":["list"],"search":"company name","accountIds":["<account id>"]}}   (web research on companies, a few at a time; the app runs it straight away and turns findings into industry + tag changes for approval. Only when WEB SEARCH is available.)
 - {"type":"add_followup","id":"<contact or lead id>","date":"YYYY-MM-DD"}  or  {"type":"add_followup","id":"...","inDays":7}   optional "channel": "Cold email" (default) | "LinkedIn" | "Phone call" | "Text/SMS" | "Facebook" | "Instagram"`;
 
 /* every record the assistant may point at, by id */
@@ -16235,6 +16327,26 @@ function describeAgentAction(st, a, plannedLists = new Set()) {
       const names = accs.map(recordLabel);
       return { ok: true, text: `${a.type === "add_to_list" ? "Add" : "Remove"} ${accs.length} ${accs.length === 1 ? "account" : "accounts"} ${a.type === "add_to_list" ? "to" : "from"} ${listName(l)}: ${names.slice(0, 6).join(", ")}${names.length > 6 ? ` +${names.length - 6} more` : ""}` };
     }
+    case "update_list": {
+      const l = listRef(a.list);
+      if (!l) return bad(`No list called “${a.list}”`);
+      const changes = [a.name && String(a.name).trim() && String(a.name).trim() !== listName(l) ? `rename to “${String(a.name).trim()}”` : "", a.industry !== undefined && String(a.industry || "").trim() !== (l.industry || "") ? `industry → ${String(a.industry || "").trim() || "blank"}` : ""].filter(Boolean);
+      if (!changes.length) return bad(`${listName(l)}: nothing to change`);
+      return { ok: true, text: `List ${listName(l)}: ${changes.join(", ")}` };
+    }
+    case "delete_list": {
+      const l = findList(st, a.list);
+      if (!l) return bad(`No list called “${a.list}”`);
+      return { ok: true, text: `Delete list ${listName(l)} (${accountsInList(st, l.id).length} accounts stay, just unlisted)` };
+    }
+    case "add_to_list_where": {
+      const l = listRef(a.list);
+      if (!l) return bad(`No list called “${a.list}”`);
+      const accs = matchAccountCriteria(st, a.criteria).filter((x) => !(l.id && (x.listIds || []).includes(l.id)));
+      if (!accs.length) return bad(`${listName(l)}: no accounts match (or they're already in it)`);
+      const names = accs.map((x) => x.company || "Unnamed");
+      return { ok: true, text: `Add ${accs.length} ${accs.length === 1 ? "account" : "accounts"} to ${listName(l)}: ${names.slice(0, 8).join(", ")}${names.length > 8 ? ` +${names.length - 8} more` : ""}` };
+    }
     case "set_industry": {
       const r = locateRecord(st, a.accountId);
       if (r?.kind !== "account") return bad(`Industry: no account with id ${a.accountId}`);
@@ -16285,18 +16397,14 @@ function describeAgentAction(st, a, plannedLists = new Set()) {
 /* the checked actions for a whole reply, in order */
 function reviewAgentActions(st, actions) {
   const planned = new Set();
-  /* run additions are checked against the run as earlier actions in the
-     same reply will leave it, so "hot ones, then everyone due" doesn't
-     count the same person twice in the preview */
+  /* Each action is checked against the CRM as the earlier actions in the
+     same reply will leave it — a list created or renamed above can be filled
+     below, and "hot ones, then everyone due" doesn't count anyone twice. */
   let sim = st;
   return (actions || []).map((a) => {
     const d = describeAgentAction(sim, a, planned);
     if (d.ok && a.type === "create_list") planned.add(String(a.name).trim().toLowerCase());
-    if (d.ok && (a.type === "add_to_run_where" || a.type === "add_to_run")) {
-      const cur = sim.callSession || [];
-      const add = a.type === "add_to_run_where" ? matchCallCriteria(sim, a.criteria).map((r) => r.c.id) : (a.contactIds || []).filter((id) => { const r = locateRecord(sim, id); return r?.kind === "contact" && hasPhone(r.c) && r.c.status !== "closed"; });
-      sim = { ...sim, callSession: [...cur, ...add.filter((id) => !cur.includes(id))] };
-    }
+    if (d.ok) sim = runAgentActions(sim, [{ action: a, ok: true }]).st;
     return { action: a, ...d };
   });
 }
@@ -16306,6 +16414,10 @@ const stampNote = (old, text) => `${(old || "").trim() ? `${old.trim()}\n` : ""}
 /* Applies actions in order and reports what it touched, so the caller can
    re-sync pipeline rows for any account whose contacts changed. */
 function applyAgentActions(st0, actions) {
+  return runAgentActions(st0, reviewAgentActions(st0, actions));
+}
+/* the actual changes, for actions already checked */
+function runAgentActions(st0, reviewed) {
   let st = st0;
   const touchedAccounts = new Set();
   let applied = 0;
@@ -16317,7 +16429,7 @@ function applyAgentActions(st0, actions) {
     st = { ...st, applications: (st.applications || []).map((a) => (a.id === id ? fn(a) : a)) };
   };
   const patchRecord = (r, fn) => (r.kind === "contact" ? patchContact(r.acc.id, r.c.id, fn) : r.kind === "lead" ? patchApp(r.app.id, fn) : null);
-  reviewAgentActions(st0, actions).forEach(({ action: a, ok }) => {
+  reviewed.forEach(({ action: a, ok }) => {
     if (!ok) return;
     const r = a.id ? locateRecord(st, a.id) : null;
     switch (a.type) {
@@ -16335,6 +16447,31 @@ function applyAgentActions(st0, actions) {
         const l = findList(st, a.list);
         if (!l) return;
         st = a.type === "add_to_list" ? addAccountsToList(st, l.id, a.accountIds || []) : removeAccountsFromList(st, l.id, a.accountIds || []);
+        break;
+      }
+      case "update_list": {
+        const l = findList(st, a.list);
+        if (!l) return;
+        const patch = {};
+        if (a.name && String(a.name).trim()) patch.name = String(a.name).trim();
+        if (a.industry !== undefined) patch.industry = String(a.industry || "").trim();
+        st = { ...st, accountLists: (st.accountLists || []).map((x) => (x.id === l.id ? { ...x, ...patch } : x)) };
+        break;
+      }
+      case "delete_list": {
+        const l = findList(st, a.list);
+        if (!l) return;
+        st = {
+          ...removeAccountsFromList(st, l.id, (st.accounts || []).map((x) => x.id)),
+          accountLists: (st.accountLists || []).filter((x) => x.id !== l.id),
+          deletedIds: [{ id: l.id, at: today() }, ...(st.deletedIds || [])],
+        };
+        break;
+      }
+      case "add_to_list_where": {
+        const l = findList(st, a.list);
+        if (!l) return;
+        st = addAccountsToList(st, l.id, matchAccountCriteria(st, a.criteria).map((x) => x.id));
         break;
       }
       case "set_industry":
@@ -16388,14 +16525,15 @@ function parseAgentReply(raw) {
       if (j && typeof j === "object") {
         const all = Array.isArray(j.actions) ? j.actions : [];
         const review = all.find((x) => x?.type === "start_review") || null;
-        const actions = all.filter((x) => x?.type !== "start_review");
-        return { reply: String(j.reply || "").trim() || (actions.length ? "Here's what I'd change:" : review ? "Reviewing…" : ""), actions, review };
+        const research = all.find((x) => x?.type === "start_research") || null;
+        const actions = all.filter((x) => x?.type !== "start_review" && x?.type !== "start_research");
+        return { reply: String(j.reply || "").trim() || (actions.length ? "Here's what I'd change:" : review ? "Reviewing…" : research ? "Researching…" : ""), actions, review, research };
       }
     } catch (e) {
       /* fall through to plain text */
     }
   }
-  return { reply: text, actions: [], review: null };
+  return { reply: text, actions: [], review: null, research: null };
 }
 
 const AGENT_SYSTEM = `You are the CRM assistant inside Flight Deck, a job-search and outreach CRM. You help organise accounts, contacts and leads: tagging, lead temperature, account lists by industry or segment, industries, notes, and building call runs. You answer questions about the data too.
@@ -16414,8 +16552,103 @@ Rules:
 - Conditions inside one add_to_run_where must ALL match. For "X, plus Y" or "hot first, then warm", use one add_to_run_where per group, in the order the user wants them called. Someone already added isn't added twice.
 - You can add or remove PENDING follow-ups. "fu" in the data lists each one as date + channel, with DUE when it's due today or earlier. You cannot tick a follow-up as done, or remove ticked ones.
 - A written follow-up needs the person to have been contacted already ("contacted" date or a status other than "not contacted"); a call follow-up doesn't.
-- You cannot change statuses, phone numbers or delete records. If asked, say the user needs to do that themselves.
+- To organise lists: create lists, rename them, set their industry, delete empty or redundant ones, and fill them with add_to_list_where (by industry, segment, temperature…). Propose a whole reorganisation in one reply so the user approves it at once.
+- You cannot change statuses, phone numbers or delete accounts, contacts or leads. If asked, say the user needs to do that themselves.
 - Keep reply under 120 words. Mention counts ("tagged 12 contacts") rather than listing everyone.`;
+
+/* ---- accounts by criteria, for filling lists ---- */
+function matchAccountCriteria(st, crit = {}) {
+  const k = crit || {};
+  const industry = String(k.industry || "").trim().toLowerCase();
+  const search = String(k.search || "").trim().toLowerCase();
+  const inLists = arr(k.inLists).map((ref) => findList(st, ref)).filter(Boolean).map((l) => l.id);
+  const temps = arr(k.contactTemperature);
+  const tags = arr(k.contactTags).map(normTag);
+  const listIds = new Set((st.accountLists || []).map((l) => l.id));
+  const status = k.accountStatus || "open";
+  return (st.accounts || []).filter((a) => {
+    const live = liveContacts(a);
+    if (status === "open" && !isAccountOpen(a)) return false;
+    if (status === "closed" && isAccountOpen(a)) return false;
+    if (industry && !(a.industry || "").toLowerCase().includes(industry)) return false;
+    if (k.noIndustry && (a.industry || "").trim()) return false;
+    if (search && !`${a.company || ""} ${a.website || ""} ${a.notes || ""}`.toLowerCase().includes(search)) return false;
+    if (k.notInAnyList && (a.listIds || []).some((id) => listIds.has(id))) return false;
+    if (arr(k.inLists).length && !(a.listIds || []).some((id) => inLists.includes(id))) return false;
+    if (temps.length && !live.some((c) => temps.includes(c.temperature || "none"))) return false;
+    if (tags.length && !live.some((c) => tagsOf(c).some((t) => tags.includes(t)))) return false;
+    if (k.hasCallable && !live.some((c) => hasPhone(c) && c.status !== "closed")) return false;
+    return true;
+  });
+}
+
+/* ============================================================
+   COMPANY RESEARCH (web search)
+
+   Looks companies up on the web a few at a time — searches are slow and
+   billed per call — and asks for their industry plus a couple of segment
+   tags. Findings come back as ordinary proposed changes: the account's
+   industry, and the tags on its contacts. Low-confidence findings arrive
+   unticked, so a guess is never applied by default.
+   ============================================================ */
+const RESEARCH_BATCH = 8;
+function researchPool(st, scope = {}) {
+  const k = scope || {};
+  const ids = arr(k.accountIds);
+  if (ids.length) return (st.accounts || []).filter((a) => ids.includes(String(a.id).toLowerCase())).map((a) => a.id);
+  return matchAccountCriteria(st, { noIndustry: k.noIndustry !== false && !k.search && !arr(k.lists).length ? true : !!k.noIndustry, search: k.search, inLists: k.lists, accountStatus: "open" })
+    .sort((a, b) => ((a.industry || "").trim() ? 1 : 0) - ((b.industry || "").trim() ? 1 : 0) || (a.company || "").localeCompare(b.company || ""))
+    .map((a) => a.id);
+}
+function companyBrief(st, id) {
+  const a = (st.accounts || []).find((x) => x.id === id);
+  if (!a) return "";
+  const people = liveContacts(a).slice(0, 4).map((c) => `${c.name || "?"}${c.position ? ` (${c.position})` : ""}`);
+  return `### ${a.id} | ${a.company || "?"} | website: ${a.website || "-"} | current industry: ${a.industry || "-"} | people: ${people.join(", ") || "-"}${(a.notes || "").trim() ? ` | notes: ${clip(a.notes, 160)}` : ""}`;
+}
+/* Findings → actions. Industry goes on the account; tags (or the industry
+   itself when none are given) go on every live contact there, since tags
+   live on people. */
+function parseResearchReply(raw, st, batchIds) {
+  const text = String(raw || "").trim();
+  const a = text.indexOf("{");
+  const b = text.lastIndexOf("}");
+  let j = null;
+  if (a !== -1 && b > a) {
+    try {
+      j = JSON.parse(text.slice(a, b + 1));
+    } catch (e) {
+      j = null;
+    }
+  }
+  if (!j || !Array.isArray(j.results)) throw new Error("The reply didn't contain research results.");
+  const ids = new Set(batchIds);
+  const seen = new Set();
+  const results = j.results
+    .filter((r) => r && ids.has(r.accountId) && !seen.has(r.accountId) && seen.add(r.accountId))
+    .map((r) => ({
+      accountId: r.accountId,
+      industry: clip(r.industry, 60),
+      tags: arr(r.tags).map(normTag).filter(Boolean).slice(0, 4),
+      summary: clip(r.summary, 220),
+      confidence: ["high", "medium", "low"].includes(r.confidence) ? r.confidence : "low",
+      sources: (Array.isArray(r.sources) ? r.sources : []).filter((u) => /^https?:\/\//.test(String(u))).slice(0, 3),
+    }));
+  if (!results.length) throw new Error("None of the results matched the companies sent.");
+  const actions = [];
+  results.forEach((r) => {
+    const acc = (st.accounts || []).find((x) => x.id === r.accountId);
+    if (!acc || !r.industry || /^(unknown|n\/a|unclear)$/i.test(r.industry)) return;
+    const unsure = r.confidence === "low";
+    if ((acc.industry || "").trim().toLowerCase() !== r.industry.toLowerCase()) actions.push({ type: "set_industry", accountId: acc.id, industry: r.industry, ...(unsure ? { _unchecked: true } : {}) });
+    const tags = r.tags.length ? r.tags : [normTag(r.industry)];
+    liveContacts(acc).forEach((c) => {
+      const add = tags.filter((t) => !tagsOf(c).includes(t));
+      if (add.length) actions.push({ type: "tag", id: c.id, add, ...(unsure ? { _unchecked: true } : {}) });
+    });
+  });
+  return { reply: String(j.reply || "").trim(), results, actions, missing: batchIds.filter((id) => !seen.has(id)) };
+}
 
 /* ============================================================
    PROSPECT REVIEW
@@ -16518,7 +16751,7 @@ function parseReviewReply(raw, batchIds) {
   return {
     reply: String(j.reply || "").trim(),
     verdicts,
-    actions: Array.isArray(j.actions) ? j.actions.filter((x) => x?.type !== "start_review") : [],
+    actions: Array.isArray(j.actions) ? j.actions.filter((x) => x?.type !== "start_review" && x?.type !== "start_research") : [],
     missing: batchIds.filter((id) => !seen.has(id)),
   };
 }
@@ -16565,6 +16798,8 @@ const AGENT_STARTERS = [
   "Call run: everyone who hung up after the pitch, plus anyone I've tried 3+ times without reaching",
   "Clear every overdue follow-up older than two weeks",
   "Read my notes and tell me who's actually worth following up",
+  "Organise my accounts into lists by industry",
+  "Research what industry my untagged accounts are in and tag them",
 ];
 
 /* The chat panel. Messages live with the app so closing the panel doesn't
@@ -16572,7 +16807,7 @@ const AGENT_STARTERS = [
    applied, how many went through. Review replies also carry their batch
    position, so "next 50" picks up where the last one stopped, and failed
    requests carry what they were, so Retry sends exactly that again. */
-function AgentPanel({ state, msgs, setMsgs, ai, onApply, onUndo, canUndo, onClose, isDesktop }) {
+function AgentPanel({ state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canUndo, onClose, isDesktop }) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState("");
   const [picks, setPicks] = useState({});
@@ -16580,6 +16815,12 @@ function AgentPanel({ state, msgs, setMsgs, ai, onApply, onUndo, canUndo, onClos
   /* latest messages, for async steps that finish after a re-render */
   const msgsRef = useRef(msgs);
   msgsRef.current = msgs;
+  /* Batches run back to back for minutes; each reads the CRM as it is when it
+     starts, so anything applied meanwhile is what the next batch sees. */
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  /* set by Stop; the batch in flight finishes, the next one doesn't start */
+  const stopRef = useRef(false);
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
   }, [msgs.length, busy]);
@@ -16592,9 +16833,10 @@ function AgentPanel({ state, msgs, setMsgs, ai, onApply, onUndo, canUndo, onClos
     return next;
   };
   const push = (_base, m) => commit([...msgsRef.current, m]);
-  const attemptNote = (label) => (n, tries) => setBusy(n === 1 ? label : `${label} (retry ${n - 1} of ${tries - 1})`);
+  const attemptNote = (label) => (n, tries) => setBusy(`${n === 1 ? label : `${label} (retry ${n - 1} of ${tries - 1})`}${stopRef.current ? " — stopping after this batch" : ""}`);
 
   const runReview = async (review, base) => {
+    const state = stateRef.current;
     const poolIds = review.poolIds || reviewPool(state, review.scope);
     const offset = review.offset || 0;
     const batch = poolIds.slice(offset, offset + REVIEW_BATCH).filter((id) => locateRecord(state, id));
@@ -16609,7 +16851,6 @@ function AgentPanel({ state, msgs, setMsgs, ai, onApply, onUndo, canUndo, onClos
         async () => {
           const raw = await callAI({
             ...ai,
-            maxTokens: Math.max(+ai.maxTokens || 0, 8000),
             system: AGENT_SYSTEM,
             user: `TODAY: ${today()}
 TASK: Review these prospects (${range}). The user's focus: "${r.focus}"
@@ -16632,12 +16873,66 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
         { onAttempt: attemptNote(`Reviewing ${range}…`) }
       );
       push(base, { role: "assistant", kind: "review", text: out.reply || `Reviewed ${range}.`, verdicts: out.verdicts, missing: out.missing, actions: out.actions, review: { ...r, size: batch.length }, at: Date.now() });
+      /* straight on to the next 50 until the list is done or you press Stop */
+      if (offset + REVIEW_BATCH < poolIds.length) {
+        if (stopRef.current) push(null, { role: "assistant", text: `Stopped after ${range}. “Review next” picks up from here.` });
+        else await runReview({ ...r, offset: offset + REVIEW_BATCH });
+      } else if (offset > 0) push(null, { role: "assistant", text: `✓ Review finished — all ${poolIds.length} prospects done.` });
     } catch (e) {
       push(base, { role: "assistant", error: true, text: `⚠ Review of ${range} failed: ${e.message || "no reply"}`, retry: { kind: "review", review: r } });
     }
   };
 
+  const runResearch = async (research) => {
+    const state = stateRef.current;
+    if (!canSearch) {
+      push(null, { role: "assistant", text: "Web research needs MiniMax or Anthropic as the AI provider, with web search switched on in Settings → AI provider." });
+      return;
+    }
+    const poolIds = research.poolIds || researchPool(state, research.scope);
+    const offset = research.offset || 0;
+    const batch = poolIds.slice(offset, offset + RESEARCH_BATCH).filter((id) => (state.accounts || []).some((a) => a.id === id));
+    const r = { focus: research.focus || "What industry is each company in? Tag them by it.", scope: research.scope || {}, poolIds, offset };
+    if (!batch.length) {
+      push(null, { role: "assistant", text: poolIds.length ? "That's every company — nothing left to research." : "No open accounts match — every account may already have an industry. Ask me to research specific companies by name." });
+      return;
+    }
+    const range = `${offset + 1}–${offset + batch.length} of ${poolIds.length}`;
+    try {
+      const out = await withRetry(
+        async () => {
+          const raw = await callAI({
+            ...ai,
+            webSearch: true,
+            system: "You research companies on the web for a sales CRM. Use web search to check each company before answering. Never guess from the name alone; if you can't find it, say so with low confidence.",
+            user: `TODAY: ${today()}
+TASK: Research these companies (${range}). The user's focus: "${r.focus}"
+
+For each company, search the web (use the website if given) and find what industry and segment it is in.
+Reply with ONE JSON object and nothing else:
+{"reply": "1–3 sentences on this batch", "results": [{"accountId": "<id>", "industry": "short industry label, e.g. Managed IT services", "tags": ["1-3 short lower-case segment tags, e.g. msp, cybersecurity"], "summary": "one line: what they do, size or region if found", "confidence": "high|medium|low", "sources": ["https://…"]}]}
+Give a result for EVERY company below, using its id exactly. Reuse these existing tags where they fit: ${Array.from(new Set((state.accounts || []).flatMap((a) => liveContacts(a).flatMap(tagsOf)))).slice(0, 60).join(", ") || "(none yet)"}.
+
+COMPANIES:
+${batch.map((id) => companyBrief(state, id)).join("\n")}`,
+          });
+          return parseResearchReply(raw, state, batch);
+        },
+        { onAttempt: attemptNote(`Researching ${range} on the web…`) }
+      );
+      push(null, { role: "assistant", kind: "research", text: out.reply || `Researched ${range}.`, results: out.results, missing: out.missing, actions: out.actions, research: { ...r, size: batch.length }, at: Date.now() });
+      /* straight on to the next 8 */
+      if (offset + RESEARCH_BATCH < poolIds.length) {
+        if (stopRef.current) push(null, { role: "assistant", text: `Stopped after ${range}. “Research next” picks up from here.` });
+        else await runResearch({ ...r, offset: offset + RESEARCH_BATCH });
+      } else if (offset > 0) push(null, { role: "assistant", text: `✓ Research finished — all ${poolIds.length} companies done.` });
+    } catch (e) {
+      push(null, { role: "assistant", error: true, text: `⚠ Research of ${range} failed: ${e.message || "no reply"}`, retry: { kind: "research", research: r } });
+    }
+  };
+
   const runChat = async (history) => {
+    const state = stateRef.current;
     try {
       const out = await withRetry(
         async () => {
@@ -16645,9 +16940,9 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
             .slice(-10)
             .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.error ? "(failed request)" : m.text}${m.actions?.length ? ` [proposed ${m.actions.length} actions${m.applied ? `, ${m.applied} applied` : ", not applied"}]` : ""}`)
             .join("\n");
-          const raw = await callAI({ ...ai, system: AGENT_SYSTEM, user: `CRM DATA:\n${crmDigest(state)}\n\nCONVERSATION:\n${convo}\n\nReply to the last user message as JSON.` });
+          const raw = await callAI({ ...ai, system: AGENT_SYSTEM, user: `WEB SEARCH: ${canSearch ? "available (use start_research)" : "not available with the current AI provider"}\n\nCRM DATA:\n${crmDigest(state)}\n\nCONVERSATION:\n${convo}\n\nReply to the last user message as JSON.` });
           const parsed = parseAgentReply(raw);
-          if (!parsed.reply && !parsed.actions.length && !parsed.review) throw new Error("Empty reply.");
+          if (!parsed.reply && !parsed.actions.length && !parsed.review && !parsed.research) throw new Error("Empty reply.");
           return parsed;
         },
         { onAttempt: attemptNote("Thinking…") }
@@ -16655,6 +16950,7 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
       const next = push(history, { role: "assistant", text: out.reply || "(no reply)", actions: out.actions, at: Date.now() });
       /* the model asked to read the detail — run the first batch straight away */
       if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {} }, next);
+      if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, scope: out.research.scope || {} });
     } catch (e) {
       push(history, { role: "assistant", error: true, text: `⚠ ${e.message || "Couldn't reach the AI provider."}`, retry: { kind: "chat" } });
     }
@@ -16662,6 +16958,7 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
 
   const guard = async (fn) => {
     if (busy) return;
+    stopRef.current = false;
     setBusy("Thinking…");
     try {
       await fn();
@@ -16679,10 +16976,15 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
   const retry = (i) => {
     const m = msgsRef.current[i];
     const base = commit(msgsRef.current.slice(0, i));
-    guard(() => (m.retry?.kind === "review" ? runReview(m.retry.review, base) : runChat(base)));
+    guard(() => (m.retry?.kind === "review" ? runReview(m.retry.review, base) : m.retry?.kind === "research" ? runResearch(m.retry.research) : runChat(base)));
   };
   const reviewNext = (m) => guard(() => runReview({ ...m.review, offset: m.review.offset + REVIEW_BATCH }, msgsRef.current));
   const reviewAgain = (m) => guard(() => runReview(m.review, msgsRef.current));
+  const researchNext = (m) => guard(() => runResearch({ ...m.research, offset: m.research.offset + RESEARCH_BATCH }));
+  const startResearch = () => guard(async () => {
+    push(null, { role: "user", text: "🌐 Research my accounts' industries and tag them" });
+    await runResearch({ focus: "What industry is each company in? Tag them by it.", scope: {} });
+  });
   const startReview = () => guard(() => runReview({ focus: "Which of these are worth following up, and what should I do next with each?", scope: {} }, push(msgsRef.current, { role: "user", text: "🔍 Review my prospects — who's worth following up?" })));
 
   const shell = isDesktop ? { position: "fixed", top: 0, right: 0, bottom: 0, width: 440, borderLeft: `1px solid ${C.panelEdge}` } : { position: "fixed", inset: 0 };
@@ -16699,6 +17001,11 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
           <button onClick={startReview} disabled={!!busy} title={`Read notes and history ${REVIEW_BATCH} prospects at a time`} style={{ ...smallBtn, color: C.green, borderColor: C.green, opacity: busy ? 0.5 : 1 }}>
             🔍 Review
           </button>
+          {canSearch && (
+            <button onClick={startResearch} disabled={!!busy} title={`Look up accounts with no industry on the web, ${RESEARCH_BATCH} at a time, and tag them`} style={{ ...smallBtn, color: C.blue, borderColor: C.blue, opacity: busy ? 0.5 : 1 }}>
+              🌐 Research
+            </button>
+          )}
           {msgs.length > 0 && (
             <button onClick={() => commit([])} disabled={!!busy} title="Clear the conversation" style={smallBtn}>
               Clear
@@ -16713,7 +17020,8 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
         {msgs.length === 0 && (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 4 }}>
-              Ask about your accounts and leads, or tell it what to organise. 🔍 Review reads your notes {REVIEW_BATCH} prospects at a time and says who&apos;s worth chasing. Nothing changes until you press Apply.
+              Ask about your accounts and leads, or tell it what to organise. 🔍 Review reads your notes {REVIEW_BATCH} prospects at a time and says who&apos;s worth chasing.
+              {canSearch ? ` 🌐 Research looks companies up on the web and tags them by industry.` : ""} Nothing changes until you press Apply.
             </div>
             {AGENT_STARTERS.map((t) => (
               <button key={t} onClick={() => send(t)} style={{ textAlign: "left", background: C.panel, border: `1px solid ${C.panelEdge}`, color: C.ink, borderRadius: 10, padding: "9px 11px", fontSize: 12, cursor: "pointer" }}>
@@ -16724,8 +17032,10 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
         )}
         {msgs.map((m, i) => {
           const mine = m.role === "user";
-          const review = !mine && m.actions?.length ? reviewAgentActions(state, m.actions) : [];
-          const sel = picks[i] || review.map((r) => r.ok);
+          /* once applied, show the list as it was approved — re-checking it
+             against the changed CRM would mark every line as already done */
+          const review = m.appliedReview ? m.appliedReview.map((r) => ({ ...r, action: {} })) : !mine && m.actions?.length ? reviewAgentActions(state, m.actions) : [];
+          const sel = m.appliedReview ? m.appliedReview.map((r) => r.on) : picks[i] || review.map((r) => r.ok && !r.action._unchecked);
           const chosen = review.filter((r, k) => r.ok && sel[k]).map((r) => r.action);
           const rv = m.review;
           const remaining = rv ? rv.poolIds.length - (rv.offset + (rv.size || REVIEW_BATCH)) : 0;
@@ -16782,7 +17092,47 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
                     {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} in this batch got no verdict — “Review again” to retry it.</div>}
                   </div>
                 )}
-                {rv && i === lastReviewIdx && (
+                {m.results?.length > 0 && (
+                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
+                    {m.results.map((r) => {
+                      const acc = (state.accounts || []).find((x) => x.id === r.accountId);
+                      const col = r.confidence === "high" ? C.green : r.confidence === "medium" ? C.amber : C.red;
+                      return (
+                        <div key={r.accountId} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 7 }}>
+                          <span style={{ fontWeight: 700 }}>{acc?.company || "?"}</span> <span style={{ color: C.blue }}>· {r.industry || "not found"}</span>
+                          <span style={{ fontFamily: mono, fontSize: 9, color: col, marginLeft: 6 }}>{r.confidence.toUpperCase()}</span>
+                          {r.tags.length > 0 && <span style={{ color: C.muted }}> {r.tags.map((t) => `#${t}`).join(" ")}</span>}
+                          {r.summary && <div style={{ color: C.muted, fontSize: 11 }}>{r.summary}</div>}
+                          {r.sources.length > 0 && (
+                            <div style={{ fontSize: 10 }}>
+                              {r.sources.map((u, k) => (
+                                <a key={k} href={u} target="_blank" rel="noreferrer" style={{ color: C.blue, marginRight: 8 }}>
+                                  {(() => {
+                                    try {
+                                      return new URL(u).hostname.replace(/^www\./, "");
+                                    } catch (e) {
+                                      return "source";
+                                    }
+                                  })()}
+                                </a>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} {m.missing.length === 1 ? "company" : "companies"} came back without a result.</div>}
+                    {m.actions?.some((x) => x._unchecked) && <div style={{ fontSize: 11, color: C.muted }}>Low-confidence findings are listed unticked below.</div>}
+                  </div>
+                )}
+                {!busy && m.research && i === msgs.map((x) => x.kind === "research").lastIndexOf(true) && m.research.poolIds.length - (m.research.offset + (m.research.size || RESEARCH_BATCH)) > 0 && (
+                  <div style={{ marginTop: 6 }}>
+                    <Btn onClick={() => researchNext(m)} disabled={!!busy} style={{ padding: "6px 11px", fontSize: 11 }}>
+                      Research next {Math.min(RESEARCH_BATCH, m.research.poolIds.length - (m.research.offset + m.research.size))} ({m.research.poolIds.length - (m.research.offset + m.research.size)} left)
+                    </Btn>
+                  </div>
+                )}
+                {!busy && rv && i === lastReviewIdx && (
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
                     {remaining > 0 && (
                       <Btn onClick={() => reviewNext(m)} disabled={!!busy} style={{ padding: "6px 11px", fontSize: 11 }}>
@@ -16801,7 +17151,7 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
                         <input
                           type="checkbox"
                           disabled={!r.ok || !!m.applied}
-                          checked={!!(r.ok && sel[k])}
+                          checked={!!((r.ok || m.appliedReview) && sel[k])}
                           onChange={() => setPicks({ ...picks, [i]: sel.map((v, x) => (x === k ? !v : v)) })}
                           style={{ marginTop: 2 }}
                         />
@@ -16822,7 +17172,8 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
                         disabled={!chosen.length}
                         onClick={() => {
                           const n = onApply(chosen);
-                          commit(msgsRef.current.map((x, xi) => (xi === i ? { ...x, applied: n } : x)));
+                          const frozen = review.map((r, k) => ({ text: r.text, ok: r.ok, on: !!(r.ok && sel[k]) }));
+                          commit(msgsRef.current.map((x, xi) => (xi === i ? { ...x, applied: n, appliedReview: frozen } : x)));
                         }}
                         style={{ padding: "7px 12px", fontSize: 12, marginTop: 4 }}
                       >
@@ -16835,7 +17186,22 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
             </div>
           );
         })}
-        {busy && <div style={{ fontSize: 12, color: C.muted, padding: "4px 2px" }}>{busy}</div>}
+        {busy && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: C.muted, padding: "4px 2px" }}>
+            <span>{busy}</span>
+            {/^(Reviewing|Researching)/.test(busy) && (
+              <button
+                onClick={() => {
+                  stopRef.current = true;
+                  setBusy((b) => (b.includes("stopping") ? b : `${b} — stopping after this batch`));
+                }}
+                style={smallBtn}
+              >
+                ■ Stop
+              </button>
+            )}
+          </div>
+        )}
         <div ref={endRef} />
       </div>
       <div style={{ display: "flex", gap: 8, padding: "10px 12px calc(env(safe-area-inset-bottom, 0px) + 10px)", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0 }}>
