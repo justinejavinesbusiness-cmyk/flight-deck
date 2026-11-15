@@ -203,6 +203,96 @@ const OUTREACH_KINDS = ["warm", "cold"];
    emailed July 3", each tagged to whichever application or contact it
    belongs to by simply living nested inside that entry. */
 const TOUCHPOINT_CHANNELS = ["Facebook", "Instagram", "LinkedIn", "Cold email", "Phone call", "Text/SMS", "In person", "Other"];
+/* ---- what a touch point carried ----
+   A plain email and an email with a 90-second Loom are different moves, and
+   which one landed is worth knowing later. Stored on the touch point as a list,
+   since one message can carry a video and a piece of content together. */
+const SENT_KINDS = [
+  { key: "video", icon: "🎥", label: "Video" },
+  { key: "voicenote", icon: "🎙", label: "Voice note" },
+  { key: "content", icon: "📄", label: "Content" },
+];
+const sentKind = (k) => SENT_KINDS.find((x) => x.key === k) || null;
+const sentOf = (t) => (Array.isArray(t?.sent) ? t.sent.filter(sentKind) : []);
+/* everything ever sent to this person, de-duplicated */
+const sentKindsOf = (c) => Array.from(new Set((c?.touchpoints || []).flatMap(sentOf)));
+const hasSent = (c, k) => (c?.touchpoints || []).some((t) => sentOf(t).includes(k));
+const toggleSent = (t, k) => {
+  const cur = sentOf(t);
+  return { ...t, sent: cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k] };
+};
+
+/* ---- lead temperature ----
+   How interested they are, set from a conversation. Separate from the
+   cold/warm OUTREACH kind (was it a cold approach or a warm intro?), which is
+   about how you got in, not how keen they are now. */
+const LEAD_TEMPS = [
+  { key: "cold", icon: "🧊", label: "Cold", tone: "blue" },
+  { key: "warm", icon: "🌤", label: "Warm", tone: "amber" },
+  { key: "hot", icon: "🔥", label: "Hot", tone: "red" },
+];
+const leadTemp = (k) => LEAD_TEMPS.find((x) => x.key === k) || null;
+
+/* ---- "send me an email" ----
+   Open from the call where they asked until you actually write: any written
+   touch point or written follow-up ticked on or after that day closes it. */
+const emailRequestOpen = (c) => {
+  const since = c?.emailRequested;
+  if (!since) return false;
+  const wrote = (c.touchpoints || []).some((t) => t.date >= since && t.channel && t.channel !== "Phone call" && !t.engage && laneOf(t.channel) === "email");
+  const ticked = (c.followUps || []).some((f) => f.done && !f.attempt && f.channel !== "Phone call" && (f.doneAt || "") >= since);
+  return !wrote && !ticked;
+};
+
+/* ---- account list operations ----
+   Pure, so the Accounts tab, the account form and the CRM assistant all
+   change lists the same way. Adding an account with no industry fills it in
+   from the list — a list is usually a slice of one industry, and that's the
+   field you'd otherwise type thirty times. */
+const listName = (l) => (l?.name || "Untitled list").trim();
+function addAccountsToList(st, listId, accountIds) {
+  const list = (st.accountLists || []).find((l) => l.id === listId);
+  if (!list) return st;
+  const ids = new Set(accountIds);
+  return {
+    ...st,
+    accounts: (st.accounts || []).map((a) =>
+      !ids.has(a.id)
+        ? a
+        : {
+            ...a,
+            listIds: Array.from(new Set([...(a.listIds || []), listId])),
+            industry: (a.industry || "").trim() ? a.industry : list.industry || a.industry || "",
+          }
+    ),
+  };
+}
+function removeAccountsFromList(st, listId, accountIds) {
+  const ids = new Set(accountIds);
+  return { ...st, accounts: (st.accounts || []).map((a) => (ids.has(a.id) ? { ...a, listIds: (a.listIds || []).filter((x) => x !== listId) } : a)) };
+}
+function createAccountList(st, name, industry = "") {
+  const list = { id: uid(), name: String(name || "").trim() || "Untitled list", industry: String(industry || "").trim(), createdAt: today() };
+  return { st: { ...st, accountLists: [...(st.accountLists || []), list] }, list };
+}
+/* a list matched by id, or by name ignoring case — the assistant refers to
+   lists the way you do, by what they're called */
+const findList = (st, ref) => {
+  const r = String(ref || "").trim().toLowerCase();
+  return (st.accountLists || []).find((l) => l.id === ref || listName(l).toLowerCase() === r) || null;
+};
+const accountsInList = (st, listId) => (st.accounts || []).filter((a) => (a.listIds || []).includes(listId));
+
+/* ---- free tags ----
+   Short labels you or the CRM assistant put on a contact or lead. Kept
+   lower-case and trimmed so "Agency" and "agency " are one tag. */
+const normTag = (t) => String(t || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 40);
+const tagsOf = (x) => (Array.isArray(x?.tags) ? x.tags.filter(Boolean) : []);
+const withTags = (x, add = [], remove = []) => {
+  const drop = new Set(remove.map(normTag));
+  const next = Array.from(new Set([...tagsOf(x), ...add.map(normTag)].filter((t) => t && !drop.has(t))));
+  return { ...x, tags: next };
+};
 /* One glyph per channel, for the narrow mobile row where the full name eats
    the space the follow-up controls need. Monochrome to match the nav — a
    coloured emoji here would out-shout the amber "done" tick beside it. */
@@ -527,7 +617,7 @@ function contactTimeline(c) {
       kind: "touch",
       lane: laneOf(t.channel),
       channel: t.channel || "",
-      text: `${t.channel || "Touch point"}${t.note ? ` — ${t.note}` : ""}`,
+      text: `${t.channel || "Touch point"}${sentOf(t).length ? ` · sent ${sentOf(t).map((k) => `${sentKind(k).icon} ${sentKind(k).label.toLowerCase()}`).join(", ")}` : ""}${t.note ? ` — ${t.note}` : ""}`,
     })),
   ];
   if (c?.contacted) events.push({ id: "first", at: c.contacted, kind: "first", lane: "first", text: "First contacted" });
@@ -829,6 +919,10 @@ function syncContactsToApplications(accountCompany, accountWebsite, oldContacts,
          version rides along too, or it would be regenerated (and re-billed) for
          a hook that hadn't changed. */
       hook: c.hook || "",
+      /* what you know about the person travels with their pipeline row */
+      temperature: c.temperature || "",
+      emailRequested: c.emailRequested || "",
+      tags: tagsOf(c),
       researchedAt: c.researchedAt || "",
       hookPolished: c.hookPolished || "",
       hookPolishedFrom: c.hookPolishedFrom || "",
@@ -1332,6 +1426,9 @@ const CALL_OUTCOMES = [
   { key: "gatekeeper", label: "Blocked by gatekeeper", tone: "amber", connects: false },
   { key: "wrongnumber", label: "Wrong number", tone: "red", connects: false, fixed: true },
   { key: "notinterested", label: "Not interested", tone: "red", connects: true },
+  /* a "no" from someone who fits — not now, but worth another try in two
+     months, so it books that call itself instead of closing them */
+  { key: "qualified", label: "Not interested — but qualified", tone: "amber", connects: true, fixed: true, autoCallback: 60 },
   { key: "cannotcontact", label: "Can't be reached", tone: "red", connects: false, fixed: true },
 ];
 const callOutcome = (k) => CALL_OUTCOMES.find((o) => o.key === k) || null;
@@ -1415,7 +1512,7 @@ const CALL_FILTER_GROUPS = [
   },
   {
     label: "Last call",
-    items: ["callback", "spoke", "voicemail", "noanswer", "gatekeeper", "notinterested"].map((k) => ({
+    items: ["callback", "spoke", "voicemail", "noanswer", "gatekeeper", "qualified", "notinterested"].map((k) => ({
       key: `out:${k}`,
       label: k === "callback" ? "Connected — asked to call back" : callOutcome(k).label,
       test: (r) => r.lastOutcome === k,
@@ -1430,6 +1527,20 @@ const CALL_FILTER_GROUPS = [
     })),
   },
 ];
+CALL_FILTER_GROUPS.push(
+  {
+    label: "How keen",
+    items: [
+      ...LEAD_TEMPS.map((t) => ({ key: `temp:${t.key}`, label: `${t.icon} ${t.label}`, test: (r) => r.contact.temperature === t.key })),
+      { key: "qualified", label: "Qualified — not now", test: (r) => !!r.contact.qualifiedAt },
+      { key: "wantsEmail", label: "📧 Asked for an email", test: (r) => emailRequestOpen(r.contact) },
+    ],
+  },
+  {
+    label: "Sent them",
+    items: SENT_KINDS.map((k) => ({ key: `sent:${k.key}`, label: `${k.icon} Sent a ${k.label.toLowerCase()}`, test: (r) => hasSent(r.contact, k.key) })),
+  }
+);
 const CALL_FILTERS = CALL_FILTER_GROUPS.flatMap((g) => g.items);
 const callFilterOf = (k) => CALL_FILTERS.find((x) => x.key === k) || null;
 /* Typed attempts filter. Every logged call is an attempt, connected or not.
@@ -2711,20 +2822,23 @@ const trackPos = (fus, i) => (fus || []).slice(0, i + 1).filter((x) => trackOf(x
    logged (account form, call queue / contact card, application form) so they
    can't drift apart. `phoneKey` and `closes`/`closedStatus` differ between a
    contact and an application; everything else is the same. */
-function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays, connected }, { phoneKey = "phone", closes = CALL_CLOSES, closedStatus = "closed" } = {}) {
+function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays: cbDays, connected, temperature, wantsEmail }, { phoneKey = "phone", closes = CALL_CLOSES, closedStatus = "closed" } = {}) {
   const o = callOutcome(outcome);
+  /* an outcome can carry its own call-back — "qualified" books 60 days unless
+     you picked another date in the log */
+  const callbackDays = cbDays > 0 ? cbDays : o?.autoCallback || 0;
   /* what you indicated in the log, unless the outcome settles it by itself */
   const reached = o?.fixed || typeof connected !== "boolean" ? !!o?.connects : connected;
   const st = reached ? callStage(stage) : null;
   /* said out loud only when it differs from what the outcome implies */
-  const flag = reached === !!o?.connects ? "" : reached ? " · connected" : " · didn't connect";
+  const flag = (reached === !!o?.connects ? "" : reached ? " · connected" : " · didn't connect") + (reached && wantsEmail ? " · asked for an email" : "");
   /* the stage rides in the note so it shows in the timeline without its own row */
   const note = `${o?.label || "Call"}${flag}${st ? ` · ${st.label}` : ""}${(notes || "").trim() ? ` — ${notes.trim()}` : ""}`;
   const next = {
     ...c,
     /* every call is recorded, connected or not — the history and the call
        counts want the attempts too */
-    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: PHONE_TRACK, note, outcome, connected: reached, stage: st ? stage : "" }],
+    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: PHONE_TRACK, note, outcome, connected: reached, stage: st ? stage : "", ...(leadTemp(temperature) ? { temperature } : {}), ...(reached && wantsEmail ? { wantsEmail: true } : {}) }],
   };
   if (reached) {
     /* only a call that connected is contact — an untouched record starts here */
@@ -2740,6 +2854,14 @@ function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, c
        unconnected call out of the outreach numbers. */
     next.followUps = (c.followUps || []).map((x, k) => (k === followUpIndex && isPhoneFu(x) ? { ...x, done: true, doneAt: today(), attempt: !reached } : x));
   }
+  /* the latest read on how keen they are replaces the last one */
+  if (leadTemp(temperature)) {
+    next.temperature = temperature;
+    next.temperatureAt = today();
+  }
+  /* only someone you actually spoke to can ask for an email */
+  if (reached && wantsEmail) next.emailRequested = today();
+  if (outcome === "qualified") next.qualifiedAt = today();
   /* furthest stage ever reached, so a weaker later call doesn't erase it */
   if (st && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
   /* a call-back becomes a real dated phone follow-up */
@@ -3024,6 +3146,11 @@ const DEFAULT_STATE = {
      the sequence you work through — and kept in state so it survives a reload
      mid-session. */
   callSession: [],
+  /* ---- account lists ----
+     Named groups of accounts, each with an industry — "AU MSPs", "SaaS
+     founders". Membership lives on the account (listIds), the list itself
+     only holds its name and industry, so an account can sit in several. */
+  accountLists: [],
   settings: { checkinDay: 1, timezoneOffset: 8 },
   lastCheckinMonth: null,
   lastDigestShownDate: null,
@@ -3071,6 +3198,7 @@ function migrate(saved) {
   if (!Array.isArray(s.housekeepingSnoozes)) s.housekeepingSnoozes = [];
   s.copyDrafts = Array.isArray(s.copyDrafts) ? s.copyDrafts.map(normCopyDraft) : [];
   if (!Array.isArray(s.callSession)) s.callSession = [];
+  if (!Array.isArray(s.accountLists)) s.accountLists = [];
   /* drop expired snoozes so the list can't grow forever */
   s.housekeepingSnoozes = s.housekeepingSnoozes.filter((x) => x && x.key && x.until && x.until > today());
   if (!Array.isArray(s.deletedIds)) s.deletedIds = [];
@@ -3209,6 +3337,9 @@ function mergeStates(localS, remoteS) {
     cycleCount: Math.max(localS.cycleCount || 0, remoteS.cycleCount || 0),
     runway: remoteS.runway || localS.runway,
     copyDrafts: alive(unionById(localS.copyDrafts, remoteS.copyDrafts)),
+    /* by id like everything else, so a list made on the phone isn't wiped by
+       the laptop's older copy */
+    accountLists: alive(unionById(localS.accountLists, remoteS.accountLists)),
     settings: { ...localS.settings, ...remoteS.settings },
     lastCheckinMonth:
       (remoteS.lastCheckinMonth || "") > (localS.lastCheckinMonth || "")
@@ -4135,6 +4266,15 @@ export default function FlightDeck() {
   const [pipeSearch, setPipeSearch] = useState("");
   const [accSearch, setAccSearch] = useState("");
   const [accFilter, setAccFilter] = useState("active");
+  /* which list the Accounts tab is narrowed to: "" all, "none" unlisted, or a list id */
+  const [accList, setAccList] = useState("");
+  const [agentOpen, setAgentOpen] = useState(false);
+  const [agentMsgs, setAgentMsgsRaw] = useState(readAgentChat);
+  const setAgentMsgs = (m) => {
+    setAgentMsgsRaw(m);
+    writeAgentChat(m);
+  };
+  const [listsOpen, setListsOpen] = useState(false);
   const [contentSearch, setContentSearch] = useState("");
   const [contentFilter, setContentFilter] = useState("all");
   const [contentView, setContentView] = useState("list");
@@ -4158,6 +4298,7 @@ export default function FlightDeck() {
   const [callSearch, setCallSearch] = useState("");
   const [callFilter, setCallFilter] = useState("");
   const [callAttempts, setCallAttempts] = useState("");
+  const [callList, setCallList] = useState("");
   /* choosing who goes in a CSV — local to this device, it's a one-off action */
   const [csvMode, setCsvMode] = useState(false);
   const [csvPick, setCsvPick] = useState(() => new Set());
@@ -6650,6 +6791,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                          ending it there takes the contact back to its mapped
                          status. Either way the schedule anchor travels too. */
                       ...(data.callAnchor ? { callAnchor: data.callAnchor } : {}),
+                      ...(data.temperature !== undefined ? { temperature: data.temperature, temperatureAt: data.temperatureAt || "" } : {}),
+                      ...(data.emailRequested !== undefined ? { emailRequested: data.emailRequested } : {}),
+                      ...(Array.isArray(data.tags) ? { tags: data.tags } : {}),
                       ...(data.nurturedAt !== undefined
                         ? { nurturedAt: data.nurturedAt, nurtureCycle: data.nurtureCycle || 0, pastFollowUps: (data.pastFollowUps || []).map((f) => ({ ...f })) }
                         : {}),
@@ -9063,10 +9207,46 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
         ],
       },
     ];
+    /* Contact-level filters added since the long chains below were written.
+       Each is one predicate on a person; an account matches when any of its
+       live contacts does, and the people view lists the contacts themselves. */
+    const allTags = Array.from(new Set(allContacts.flatMap(tagsOf))).sort();
+    const personFilters = {
+      ...Object.fromEntries(LEAD_TEMPS.map((t) => [`temp:${t.key}`, (c) => c.temperature === t.key])),
+      qualified: (c) => !!c.qualifiedAt && c.status !== "closed",
+      wantsEmail: emailRequestOpen,
+      ...Object.fromEntries(SENT_KINDS.map((k) => [`sent:${k.key}`, (c) => hasSent(c, k.key)])),
+      sentAny: (c) => sentKindsOf(c).length > 0,
+      ...Object.fromEntries(allTags.map((tg) => [`tag:${tg}`, (c) => tagsOf(c).includes(tg)])),
+    };
+    accFilterGroups.push(
+      {
+        group: "Tagged",
+        items: [
+          ...LEAD_TEMPS.map((t) => ({ key: `temp:${t.key}`, label: `${t.icon} ${t.label} (${allContacts.filter(personFilters[`temp:${t.key}`]).length})` })),
+          { key: "qualified", label: `🎯 Qualified — not now (${allContacts.filter(personFilters.qualified).length})` },
+          { key: "wantsEmail", label: `📧 Asked for an email (${allContacts.filter(emailRequestOpen).length})` },
+          ...allTags.map((tg) => ({ key: `tag:${tg}`, label: `#${tg} (${allContacts.filter(personFilters[`tag:${tg}`]).length})` })),
+        ],
+      },
+      {
+        group: "Sent them",
+        items: [
+          { key: "sentAny", label: `Anything (${allContacts.filter(personFilters.sentAny).length})` },
+          ...SENT_KINDS.map((k) => ({ key: `sent:${k.key}`, label: `${k.icon} ${k.label} (${allContacts.filter(personFilters[`sent:${k.key}`]).length})` })),
+        ],
+      }
+    );
     const accFilters = accFilterGroups.flatMap((g) => g.items);
+    /* the list picker narrows whatever filter is on — "hot leads in my SaaS list" */
+    const activeList = (state.accountLists || []).find((l) => l.id === accList) || null;
+    const inChosenList = (acc) => (!accList ? true : accList === "none" ? !(acc.listIds || []).some((id) => (state.accountLists || []).some((l) => l.id === id)) : (acc.listIds || []).includes(accList));
     const shownAccounts = accounts
+      .filter(inChosenList)
       .filter((acc) =>
-        accFilter === "active"
+        personFilters[accFilter]
+          ? liveContacts(acc).some(personFilters[accFilter])
+          : accFilter === "active"
           ? isAccountOpen(acc)
           : accFilter === "highConfidence"
           ? !!acc.highConfidence
@@ -9115,7 +9295,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       .filter((acc) => {
         if (!accSearch.trim()) return true;
         const q = accSearch.trim().toLowerCase();
-        const contactMatch = (acc.contacts || []).some((c) => [c.name, c.email, c.position, c.linkedin].filter(Boolean).some((f) => f.toLowerCase().includes(q)));
+        const contactMatch = (acc.contacts || []).some((c) => [c.name, c.email, c.position, c.linkedin, ...tagsOf(c)].filter(Boolean).some((f) => f.toLowerCase().includes(q)));
         return [acc.company, acc.website, acc.industry, acc.notes].filter(Boolean).some((f) => f.toLowerCase().includes(q)) || contactMatch;
       })
       .slice()
@@ -9135,14 +9315,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
-    const isContactFilterView = ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable", "noPhone", "phoneNotFound", "liNone", "liRetry", "liWaiting", "liBlocked", "forNurture"].includes(accFilter);
+    const isContactFilterView = !!personFilters[accFilter] || ["outreachedContacts", "dueContacts", "notContacted", "nurture", "coldGone", "engageDue", "connected", "liPending", "callable", "noPhone", "phoneNotFound", "liNone", "liRetry", "liWaiting", "liBlocked", "forNurture"].includes(accFilter);
 
     /* flat contact list for the Outreached/Due filters — shows people, not company rows */
     const flatContacts = isContactFilterView
       ? accounts
+          .filter(inChosenList)
           .flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt).map((c) => ({ ...c, _company: acc.company || "Unnamed", _accountId: acc.id })))
           .filter((c) =>
-            accFilter === "outreachedContacts"
+            personFilters[accFilter]
+              ? personFilters[accFilter](c)
+              : accFilter === "outreachedContacts"
               ? isContactOutreached(c)
               : accFilter === "notContacted"
               ? isContactBlankStatus(c)
@@ -9177,7 +9360,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           .filter((c) => {
             if (!accSearch.trim()) return true;
             const q = accSearch.trim().toLowerCase();
-            return [c.name, c.email, c.position, c._company, c.linkedin].filter(Boolean).some((f) => f.toLowerCase().includes(q));
+            return [c.name, c.email, c.position, c._company, c.linkedin, ...tagsOf(c)].filter(Boolean).some((f) => f.toLowerCase().includes(q));
           })
           /* Due contacts is a work queue too — most overdue first. The
              Outreached list stays alphabetical by company for browsing. */
@@ -9320,6 +9503,84 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           </div>
         )}
 
+        {/* ---- lists ----
+            One row: which list you're looking at, a bulk "add what's shown
+            to a list", and — once a list is chosen — sending its callable
+            people straight to the call run. */}
+        {(() => {
+          const lists = state.accountLists || [];
+          const shownIds = isContactFilterView ? Array.from(new Set(flatContacts.map((c) => c._accountId))) : shownAccounts.map((a) => a.id);
+          const listCallable = activeList
+            ? accountsInList(state, activeList.id).flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt && hasPhone(c) && c.status !== "closed").map((c) => c.id))
+            : [];
+          const chipBtn = { fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 11px", borderRadius: 16, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, cursor: "pointer" };
+          return (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <select
+                  value={accList}
+                  onChange={(e) => {
+                    setAccList(e.target.value);
+                    setAccPage(0);
+                  }}
+                  aria-label="Show one list"
+                  style={{ ...selectStyle, width: "auto", minWidth: 170, fontSize: 12, fontWeight: 700, padding: "7px 9px", border: `1px solid ${accList ? C.blue : C.panelEdge}`, color: accList ? C.blue : C.muted, background: accList ? "rgba(125,176,247,0.08)" : "transparent" }}
+                >
+                  <option value="">📋 All lists</option>
+                  {lists.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {listName(l)}
+                      {l.industry ? ` · ${l.industry}` : ""} ({accountsInList(state, l.id).length})
+                    </option>
+                  ))}
+                  <option value="none">Not in any list</option>
+                </select>
+                {shownIds.length > 0 && lists.length > 0 && (
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (v) addToList(v, shownIds);
+                    }}
+                    aria-label="Add the accounts shown to a list"
+                    style={{ ...selectStyle, width: "auto", minWidth: 150, fontSize: 12, fontWeight: 700, padding: "7px 9px", color: C.muted, background: "transparent" }}
+                  >
+                    <option value="">+ Add {shownIds.length} shown to…</option>
+                    {lists
+                      .filter((l) => l.id !== accList)
+                      .map((l) => (
+                        <option key={l.id} value={l.id}>
+                          {listName(l)}
+                        </option>
+                      ))}
+                  </select>
+                )}
+                {activeList && listCallable.length > 0 && (
+                  <button onClick={() => addContactsToRun(listCallable, `☎ ${listCallable.length} from ${listName(activeList)} added to the call run`)} style={{ ...chipBtn, borderColor: C.green, color: C.green }}>
+                    ☎ Add {listCallable.length} callable to run
+                  </button>
+                )}
+                {activeList && (
+                  <button
+                    onClick={() => {
+                      const ids = shownIds.filter((id) => accountsInList(state, activeList.id).some((a) => a.id === id));
+                      if (ids.length) mutate((st) => removeAccountsFromList(st, activeList.id, ids), `${ids.length} removed from ${listName(activeList)}`);
+                    }}
+                    style={chipBtn}
+                    title="Take the accounts shown out of this list"
+                  >
+                    − Remove shown from list
+                  </button>
+                )}
+                <button onClick={() => setListsOpen(!listsOpen)} style={{ ...chipBtn, color: listsOpen ? C.blue : C.muted, borderColor: listsOpen ? C.blue : C.panelEdge }}>
+                  ⚙ {lists.length ? "Manage lists" : "+ New list"}
+                </button>
+              </div>
+              {listsOpen && <ListManager lists={lists} counts={Object.fromEntries(lists.map((l) => [l.id, accountsInList(state, l.id).length]))} onCreate={newAccountList} onUpdate={updateAccountList} onDelete={deleteAccountList} />}
+            </div>
+          );
+        })()}
+
         {isContactFilterView ? (
           <>
             {flatContacts.length === 0 && (
@@ -9359,6 +9620,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                     <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
                       {[c.position, c.email, c.phone].filter(Boolean).join(" · ") || "—"}
                     </div>
+                    <ContactBadges contact={c} style={{ marginTop: 5 }} />
                     <div style={{ display: "flex", gap: 10, marginTop: 6, flexWrap: "wrap", alignItems: "center" }}>
                       {c.outreachKind && (
                         <span style={{ fontFamily: mono, fontSize: 10, color: outreachKindColor(c.outreachKind), textTransform: "uppercase" }}>{c.outreachKind}</span>
@@ -10699,6 +10961,36 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       return { ...st, callSession: cur.includes(contactId) ? cur.filter((x) => x !== contactId) : [...cur, contactId] };
     });
   const clearCallSession = () => mutate((st) => ({ ...st, callSession: [] }), "Run cleared");
+  /* Appends contacts to the run in the order given, skipping anyone already
+     in it and anyone with no number you could dial. */
+  const addContactsToRun = (contactIds, label) =>
+    mutate((st) => {
+      const cur = st.callSession || [];
+      const dialable = new Set((st.accounts || []).flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt && hasPhone(c) && c.status !== "closed").map((c) => c.id)));
+      const add = contactIds.filter((id) => dialable.has(id) && !cur.includes(id));
+      return { ...st, callSession: [...cur, ...add] };
+    }, label);
+  const newAccountList = (name, industry) => {
+    let made = null;
+    mutate((st) => {
+      const r = createAccountList(st, name, industry);
+      made = r.list;
+      return r.st;
+    }, `List “${String(name || "").trim() || "Untitled list"}” created`);
+    return made;
+  };
+  const updateAccountList = (id, patch) => mutate((st) => ({ ...st, accountLists: (st.accountLists || []).map((l) => (l.id === id ? { ...l, ...patch } : l)) }));
+  const deleteAccountList = (id) =>
+    mutate(
+      (st) => ({
+        ...removeAccountsFromList(st, id, (st.accounts || []).map((a) => a.id)),
+        accountLists: (st.accountLists || []).filter((l) => l.id !== id),
+        deletedIds: tombstones(st, [id]),
+      }),
+      "List deleted — its accounts are untouched"
+    );
+  const addToList = (listId, accountIds) =>
+    mutate((st) => addAccountsToList(st, listId, accountIds), `${accountIds.length} ${accountIds.length === 1 ? "account" : "accounts"} added to ${listName((state.accountLists || []).find((l) => l.id === listId))}`);
   /* silent: it fires as part of logging a call, and a second toast on top of
      the call confirmation would just be noise */
   const dropFromCallSession = (contactId) => mutate((st) => ({ ...st, callSession: (st.callSession || []).filter((x) => x !== contactId) }));
@@ -10711,7 +11003,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
            number, and a queue that hides them hides the work. They sort to the
            bottom instead, below everything actually dialable. */
         .filter((c) => !c.archivedAt && !c.tombstoned && (c.phone || "").trim() && c.status !== "closed")
-        .map((c) => ({ contact: c, accountId: acc.id, company: acc.company }))
+        .map((c) => ({ contact: c, accountId: acc.id, company: acc.company, listIds: acc.listIds || [], industry: acc.industry || "" }))
     );
     const calls = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").length;
     const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
@@ -10749,16 +11041,17 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const q = callSearch.trim().toLowerCase();
     const matches = (r) =>
       !q ||
-      `${r.contact.name || ""} ${r.contact.position || ""} ${r.company || ""} ${r.contact.phone || ""}`.toLowerCase().includes(q);
+      `${r.contact.name || ""} ${r.contact.position || ""} ${r.company || ""} ${r.contact.phone || ""} ${r.industry || ""} ${tagsOf(r.contact).join(" ")}`.toLowerCase().includes(q);
     const run = callQueue.filter((r) => r.pick !== -1);
     /* like the search, the filter only narrows the unpicked remainder */
     const activeFilter = callFilterOf(callFilter);
     const unpicked = callQueue.filter((r) => r.pick === -1);
     const attemptsTest = parseAttempts(callAttempts);
     const attemptsTyped = callAttempts.trim() !== "";
-    const rest = unpicked.filter((r) => matches(r) && (!activeFilter || activeFilter.test(r)) && (!attemptsTest || attemptsTest(r.calls)));
+    const callListObj = (state.accountLists || []).find((l) => l.id === callList) || null;
+    const rest = unpicked.filter((r) => matches(r) && (!activeFilter || activeFilter.test(r)) && (!attemptsTest || attemptsTest(r.calls)) && (!callListObj || r.listIds.includes(callListObj.id)));
     const hiddenBySearch = unpicked.length - rest.length;
-    const narrowed = !!q || !!activeFilter || !!attemptsTest;
+    const narrowed = !!q || !!activeFilter || !!attemptsTest || !!callListObj;
     const addShownToRun = () => {
       const ids = rest.filter((r) => r.dialable).map((r) => r.contact.id);
       if (!ids.length) return;
@@ -10838,6 +11131,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           <div style={{ fontSize: 11, color: C.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {[r.contact.position, r.company].filter(Boolean).join(" · ")}
           </div>
+          <ContactBadges contact={r.contact} />
           <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 3 }}>
             {r.dialable ? (
               r.contact.phone
@@ -11055,6 +11349,22 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                   </button>
                 )}
               </div>
+              {(state.accountLists || []).length > 0 && (
+                <select
+                  value={callListObj ? callList : ""}
+                  onChange={(e) => setCallList(e.target.value)}
+                  aria-label="Only one list"
+                  style={{ ...selectStyle, flex: "1 1 150px", minWidth: 0, width: "auto", fontSize: 13, padding: "9px 30px 9px 11px", border: `1px solid ${callListObj ? C.blue : C.panelEdge}`, color: callListObj ? C.blue : C.ink }}
+                >
+                  <option value="">📋 All lists</option>
+                  {(state.accountLists || []).map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {listName(l)}
+                      {l.industry ? ` · ${l.industry}` : ""} ({unpicked.filter((r) => r.listIds.includes(l.id)).length})
+                    </option>
+                  ))}
+                </select>
+              )}
               <input
                 value={callAttempts}
                 onChange={(e) => setCallAttempts(e.target.value)}
@@ -11098,12 +11408,13 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                         + Add {rest.filter((r) => r.dialable).length} to run
                       </Btn>
                     )}
-                    {(activeFilter || attemptsTyped) && (
+                    {(activeFilter || attemptsTyped || callListObj) && (
                       <Btn
                         ghost
                         onClick={() => {
                           setCallFilter("");
                           setCallAttempts("");
+                          setCallList("");
                         }}
                         style={{ padding: "5px 11px", fontSize: 11 }}
                       >
@@ -11117,9 +11428,9 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
 
             {/* numbering continues past the run so positions stay unique */}
             {rest.map((r, i) => callRow(r, picked + i))}
-            {!q && (activeFilter || attemptsTest) && rest.length === 0 && (
+            {!q && (activeFilter || attemptsTest || callListObj) && rest.length === 0 && (
               <div style={{ color: C.muted, fontSize: 13, padding: "14px 4px", textAlign: "center", lineHeight: 1.6 }}>
-                Nobody left in the queue matches {[activeFilter ? `“${activeFilter.label}”` : "", attemptsTest ? `${callAttempts.trim()} attempts` : ""].filter(Boolean).join(" with ")}.
+                Nobody left in the queue matches {[callListObj ? `the ${listName(callListObj)} list` : "", activeFilter ? `“${activeFilter.label}”` : "", attemptsTest ? `${callAttempts.trim()} attempts` : ""].filter(Boolean).join(" with ")}.
               </div>
             )}
             {q && rest.length === 0 && (
@@ -11396,6 +11707,59 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
         </div>
       )}
 
+      {/* ---- CRM assistant ---- */}
+      {!agentOpen && (
+        <button
+          onClick={() => setAgentOpen(true)}
+          aria-label="Open the CRM assistant"
+          title="CRM assistant"
+          style={{
+            position: "fixed",
+            right: 16,
+            bottom: `calc(env(safe-area-inset-bottom, 0px) + ${isDesktop ? 24 : MODES[mode] === "PIPELINE" ? 140 : 92}px)`,
+            width: 50,
+            height: 50,
+            borderRadius: 25,
+            border: `1px solid ${C.blue}`,
+            background: C.panel,
+            color: C.blue,
+            fontSize: 22,
+            cursor: "pointer",
+            zIndex: 45,
+            boxShadow: "0 6px 18px rgba(0,0,0,0.35)",
+          }}
+        >
+          💬
+        </button>
+      )}
+      {agentOpen && (
+        <AgentPanel
+          state={state}
+          msgs={agentMsgs}
+          setMsgs={setAgentMsgs}
+          isDesktop={isDesktop}
+          ai={{ provider: state.settings?.aiProvider, model: state.settings?.aiModel, baseUrl: state.settings?.aiBaseUrl, key: readAiKey(), maxTokens: state.settings?.aiMaxTokens }}
+          canUndo={undoCount > 0}
+          onUndo={undo}
+          onClose={() => setAgentOpen(false)}
+          onApply={(actions) => {
+            /* counted against the state as it is now, so the number shown is
+               what actually went through */
+            const n = applyAgentActions(state, actions).applied;
+            mutate((st) => {
+              const r = applyAgentActions(st, actions);
+              let next = r.st;
+              /* contact tags and temperature also live on their pipeline rows */
+              r.touchedAccounts.forEach((id) => {
+                next = reconcileAccountApplications(next, id, (st.accounts || []).find((a) => a.id === id)?.contacts || []);
+              });
+              return next;
+            }, `Assistant: ${n} ${n === 1 ? "change" : "changes"} applied`);
+            return n;
+          }}
+        />
+      )}
+
       {/* toast */}
       {toast && (
         <div style={{ position: "fixed", bottom: `calc(env(safe-area-inset-bottom, 0px) + ${isDesktop ? 24 : MODES[mode] === "PIPELINE" ? 132 : 84}px)`, left: "50%", transform: "translateX(-50%)", background: C.panelEdge, color: C.ink, fontSize: 13, fontWeight: 600, padding: "8px 18px", borderRadius: 20, zIndex: 60 }}>
@@ -11406,7 +11770,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
           key={modal.kind + "-" + (modal.entry?.id || "new")}
-          modal={{ ...modal, followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiSenderName: state.settings?.aiSenderName, aiWebSearch: state.settings?.aiWebSearch, aiMaxTokens: state.settings?.aiMaxTokens, defaultTouchChannel: state.settings?.defaultTouchChannel, draftSections: state.settings?.draftSections, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
+          modal={{ ...modal, accountLists: state.accountLists || [], followUpDefaults: state.settings?.followUpDefaults, followUpDailyCap: state.settings?.followUpDailyCap, autoArchiveStale: state.settings?.autoArchiveStale, autoArchiveDays: state.settings?.autoArchiveDays, aiProvider: state.settings?.aiProvider, aiModel: state.settings?.aiModel, aiBaseUrl: state.settings?.aiBaseUrl, aiPitch: state.settings?.aiPitch, aiSenderName: state.settings?.aiSenderName, aiWebSearch: state.settings?.aiWebSearch, aiMaxTokens: state.settings?.aiMaxTokens, defaultTouchChannel: state.settings?.defaultTouchChannel, draftSections: state.settings?.draftSections, contentBufferTarget: state.contentGoal?.bufferTarget, contentIdeaFloor: state.contentGoal?.ideaFloor, goalMode: state.settings?.goalMode, poolCycleName: `Cycle ${cyclePhase(state.settings).cycleIndex + 1}`, poolWeeklyWrite: state.settings?.poolWeeklyWrite, cycleWeeks: state.settings?.cycleWeeks, discoveryWeeks: state.settings?.discoveryWeeks, cycleStart: state.settings?.cycleStart, syncKey: syncKeyRef.current, archivedCsvCount: state.archivedCsvRows.length }}
           onClose={() => setModal(null)}
           onSave={saveModal}
           totals={totals}
@@ -11689,6 +12053,10 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         /* read-only here, but the form shows due dates, so it needs the anchor */
         nurturedAt: entry?.nurturedAt ?? "",
         callAnchor: entry?.callAnchor ?? "",
+        temperature: entry?.temperature ?? "",
+        temperatureAt: entry?.temperatureAt ?? "",
+        emailRequested: entry?.emailRequested ?? "",
+        tags: tagsOf(entry),
         nurtureTrack: entry?.nurtureTrack ?? "",
         nurtureCycle: entry?.nurtureCycle ?? 0,
         pastFollowUps: Array.isArray(entry?.pastFollowUps) ? entry.pastFollowUps.map((f) => ({ ...f })) : [],
@@ -11746,6 +12114,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         company: entry?.company || pre.company || "",
         website: entry?.website || "",
         industry: entry?.industry || "",
+        listIds: Array.isArray(entry?.listIds) ? [...entry.listIds] : Array.isArray(pre.listIds) ? [...pre.listIds] : [],
         headcount: entry?.headcount || "",
         status: entry?.status || "",
         highConfidence: entry?.highConfidence || false,
@@ -12383,6 +12752,19 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                   }
                   style={{ ...inputStyle, flex: "1 1 140px", minWidth: 0, padding: "8px 10px", fontSize: 13 }}
                 />
+                {SENT_KINDS.map((k) => {
+                  const on = sentOf(tp).includes(k.key);
+                  return (
+                    <button
+                      key={k.key}
+                      onClick={() => setF((p) => ({ ...p, touchpoints: p.touchpoints.map((x, j) => (j === i ? toggleSent(x, k.key) : x)) }))}
+                      title={on ? `Sent a ${k.label.toLowerCase()} — tap to undo` : `Tag: sent a ${k.label.toLowerCase()}`}
+                      style={{ background: on ? "rgba(74,222,128,0.14)" : "transparent", border: `1px solid ${on ? C.green : C.panelEdge}`, borderRadius: 8, width: 34, height: 36, fontSize: 15, cursor: "pointer", flexShrink: 0, opacity: on ? 1 : 0.45, filter: on ? "none" : "grayscale(1)" }}
+                    >
+                      {k.icon}
+                    </button>
+                  );
+                })}
                 <button
                   onClick={() => setF((p) => ({ ...p, touchpoints: p.touchpoints.filter((_, j) => j !== i) }))}
                   style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 8, width: 32, height: 36, cursor: "pointer", flexShrink: 0 }}
@@ -13776,6 +14158,34 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             </div>
             <Field label="Website" value={f.website} onChange={set("website")} placeholder="https://acme.com" />
             <Field label="Industry" value={f.industry} onChange={set("industry")} placeholder="e.g. Fintech, SaaS" />
+            {(modal.accountLists || []).length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <Label>Lists</Label>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {modal.accountLists.map((l) => {
+                    const on = (f.listIds || []).includes(l.id);
+                    return (
+                      <button
+                        key={l.id}
+                        onClick={() =>
+                          setF((p) => ({
+                            ...p,
+                            listIds: on ? (p.listIds || []).filter((x) => x !== l.id) : [...(p.listIds || []), l.id],
+                            /* same rule as bulk add: an empty industry takes the list's */
+                            industry: !on && !(p.industry || "").trim() && l.industry ? l.industry : p.industry,
+                          }))
+                        }
+                        style={{ fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "6px 11px", borderRadius: 16, cursor: "pointer", border: `1px solid ${on ? C.blue : C.panelEdge}`, background: on ? "rgba(125,176,247,0.12)" : "transparent", color: on ? C.blue : C.muted }}
+                      >
+                        {on ? "✓ " : "+ "}
+                        {listName(l)}
+                        {l.industry ? <span style={{ fontWeight: 400, opacity: 0.8 }}> · {l.industry}</span> : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             <Field label="Headcount" value={f.headcount} onChange={set("headcount")} placeholder="e.g. 50-200, 500+" />
             {modal.goalMode === "pool" && (
               <div style={{ marginBottom: 12 }}>
@@ -14385,6 +14795,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                     </div>
                   )}
 
+                  <ContactTagRow contact={c} onChange={setContact} />
+
                   <div style={{ marginTop: 6, marginBottom: 2 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                       <span style={{ fontSize: 10, color: C.muted }}>Touch points:</span>
@@ -14403,6 +14815,20 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                               ))}
                             </select>
                             <span style={{ fontFamily: mono, fontSize: 9, color: C.muted }}>{tp.date}</span>
+                            {/* what went with it — lit when sent */}
+                            {SENT_KINDS.map((k) => {
+                              const on = sentOf(tp).includes(k.key);
+                              return (
+                                <button
+                                  key={k.key}
+                                  onClick={() => setContact({ touchpoints: tps.map((x, xi) => (xi === ti ? toggleSent(x, k.key) : x)) })}
+                                  title={on ? `Sent a ${k.label.toLowerCase()} — tap to undo` : `Tag: sent a ${k.label.toLowerCase()}`}
+                                  style={{ background: on ? "rgba(74,222,128,0.14)" : "transparent", border: "none", borderRadius: 6, fontSize: 11, cursor: "pointer", padding: "0 2px", lineHeight: 1.3, opacity: on ? 1 : 0.5, filter: on ? "none" : "grayscale(1)" }}
+                                >
+                                  {k.icon}
+                                </button>
+                              );
+                            })}
                             <button
                               onClick={() => setContact({ touchpoints: tps.filter((_, xi) => xi !== ti) })}
                               style={{ background: "transparent", border: "none", color: C.muted, fontSize: 11, cursor: "pointer", padding: 0, lineHeight: 1 }}
@@ -15147,6 +15573,9 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    follow-up, and a status change when the outcome ends the pursuit. */
 function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES }) {
   const [outcome, setOutcome] = useState("");
+  /* starts at what you last said about them; tap the lit one to leave it */
+  const [temperature, setTemperature] = useState(contact.temperature || "");
+  const [wantsEmail, setWantsEmail] = useState(false);
   const [notes, setNotes] = useState("");
   const [tickFollowUp, setTickFollowUp] = useState(true);
   const [stage, setStage] = useState("");
@@ -15215,6 +15644,9 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
                   setOutcome(o.key);
                   /* a new outcome starts from its own default */
                   setConnectedPick(null);
+                  /* "qualified" pre-picks its 60 days — still changeable below */
+                  if (o.autoCallback) setCallbackDays(o.autoCallback);
+                  else if (callOutcome(outcome)?.autoCallback && callbackDays === callOutcome(outcome).autoCallback) setCallbackDays(0);
                 }}
                 style={{
                   textAlign: "left",
@@ -15346,6 +15778,62 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
           </>
         )}
 
+        {/* how keen they sounded — the latest read replaces the last */}
+        {picked && (
+          <>
+            <Label>Lead temperature</Label>
+            <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+              {LEAD_TEMPS.map((t) => {
+                const on = temperature === t.key;
+                const col = toneCol(t.tone);
+                return (
+                  <button
+                    key={t.key}
+                    onClick={() => setTemperature(on ? "" : t.key)}
+                    style={{
+                      flex: 1,
+                      fontFamily: sans,
+                      fontSize: 13,
+                      fontWeight: 700,
+                      padding: "8px 6px",
+                      borderRadius: 10,
+                      cursor: "pointer",
+                      border: `1px solid ${on ? col : C.panelEdge}`,
+                      background: on ? `${col}1f` : "transparent",
+                      color: on ? col : C.muted,
+                    }}
+                  >
+                    {t.icon} {t.label}
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {/* a request you'll want to see again when you sit down to write */}
+        {picked && connected && (
+          <button
+            onClick={() => setWantsEmail(!wantsEmail)}
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              textAlign: "left",
+              background: wantsEmail ? "rgba(125,176,247,0.1)" : "transparent",
+              border: `1px solid ${wantsEmail ? C.blue : C.panelEdge}`,
+              color: wantsEmail ? C.blue : C.muted,
+              borderRadius: 10,
+              padding: "9px 12px",
+              fontSize: 13,
+              fontWeight: 700,
+              cursor: "pointer",
+              marginBottom: 12,
+            }}
+          >
+            {wantsEmail ? "☑" : "☐"} 📧 They asked me to email them
+          </button>
+        )}
+
         <Label>Notes</Label>
         <textarea
           value={notes}
@@ -15401,7 +15889,7 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
           </Btn>
           <Btn
             disabled={!outcome}
-            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked, stage: connected ? stage : "", callbackDays, connected })}
+            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked, stage: connected ? stage : "", callbackDays, connected, temperature, wantsEmail: connected && wantsEmail })}
             style={{ flex: 2 }}
           >
             Log call
@@ -15429,6 +15917,1088 @@ const SETTINGS_SECTIONS = [
 /* A LinkedIn connection is the one relationship state worth seeing at a
    glance from anywhere — it changes whether you can message someone directly.
    Small enough to sit beside a name without competing with it. */
+/* ============================================================
+   FOLLOW-UP EDITS BY DATE
+
+   The schedule is cumulative per track, so neither adding nor removing an
+   entry can be a plain splice: either one would re-date everything after it.
+   Both work by computing every entry's date first, changing the list, then
+   back-solving each remaining entry's gap so its date stays where it was.
+   ============================================================ */
+const FU_TRACK_NAME = (fu) => (isPhoneFu(fu) ? "call" : fu?.channel && fu.channel !== "Cold email" ? fu.channel : "email");
+/* every entry with its due date (null when its track has no anchor yet) */
+function datedFollowUps(rec) {
+  const fus = normFollowUps(rec);
+  return fus.map((f, i) => {
+    const anchor = anchorFor(rec, trackOf(f));
+    return { f, i, date: anchor ? followUpDueDate(anchor, fus, i) : null };
+  });
+}
+/* rebuild gaps so each kept entry lands on its original date */
+function regapFollowUps(rec, kept) {
+  const last = {};
+  return kept.map(({ f, date }) => {
+    const track = trackOf(f);
+    const anchor = anchorFor(rec, track);
+    if (!anchor || !date) return { ...f };
+    const prev = last[track] || anchor;
+    last[track] = date;
+    return { ...f, days: Math.max(0, Math.round((new Date(date) - new Date(prev)) / 86400000)) };
+  });
+}
+/* Drops PENDING entries that match; ticked ones are history and stay. */
+function removePendingFollowUps(rec, { scope = "due", track = "any" } = {}) {
+  const t = today();
+  const onTrack = (f) => track === "any" || (track === "call" ? isPhoneFu(f) : !isPhoneFu(f));
+  const dated = datedFollowUps(rec);
+  const gone = dated.filter(({ f, date }) => !f.done && onTrack(f) && (scope === "all_pending" || (date && date <= t)));
+  if (!gone.length) return { rec, removed: [] };
+  const goneIdx = new Set(gone.map((x) => x.i));
+  const kept = dated.filter((x) => !goneIdx.has(x.i));
+  return { rec: { ...rec, followUps: regapFollowUps(rec, kept) }, removed: gone };
+}
+/* Adds one pending entry on a date, on the track its channel belongs to.
+   A call on someone never contacted counts from a call anchor set today; a
+   written follow-up needs a real contact date, so it's refused without one
+   rather than inventing contact that didn't happen. */
+function addFollowUpOn(rec, date, channel = "Cold email") {
+  const fu = { days: 0, done: false, doneAt: "", channel: channel || "Cold email", fromAssistant: true };
+  const track = trackOf(fu);
+  let base = rec;
+  if (!anchorFor(base, track)) {
+    if (track !== PHONE_TRACK) return { rec, error: "not contacted yet, so a written follow-up has no date to count from" };
+    base = { ...base, callAnchor: today() };
+  }
+  const dated = datedFollowUps(base);
+  /* slot it after the last entry on or before that date, keeping order */
+  let at = dated.length;
+  for (let k = 0; k < dated.length; k++) {
+    if (dated[k].date && dated[k].date > date) {
+      at = k;
+      break;
+    }
+  }
+  const list = [...dated.slice(0, at), { f: fu, i: -1, date }, ...dated.slice(at)];
+  return { rec: { ...base, followUps: regapFollowUps(base, list) } };
+}
+/* "2026-12-01" or a day count from today, as the assistant gives it */
+const resolveFuDate = (a) => (/^\d{4}-\d{2}-\d{2}$/.test(String(a?.date || "")) ? a.date : Number.isFinite(+a?.inDays) && a?.inDays !== "" && a?.inDays != null ? addDays(today(), Math.max(0, Math.round(+a.inDays))) : "");
+/* pending follow-ups as one short digest field */
+const fuDigest = (rec) => {
+  const t = today();
+  const pend = datedFollowUps(rec).filter((x) => !x.f.done);
+  if (!pend.length) return "none";
+  return pend
+    .slice(0, 5)
+    .map((x) => `${x.date || "no-date"} ${FU_TRACK_NAME(x.f)}${x.date && x.date <= t ? " DUE" : ""}`)
+    .join("; ") + (pend.length > 5 ? `; +${pend.length - 5} more` : "");
+};
+
+/* ============================================================
+   CALL RUN BY CRITERIA
+
+   "Warm leads I've tried twice but never reached", "anyone who hung up after
+   the pitch". Picking those out of a few hundred rows is exactly what a
+   language model gets subtly wrong, so the assistant doesn't pick: it writes
+   the criteria, and this code finds the people. What you approve is the
+   resulting list of names, counted and shown before anything changes.
+   ============================================================ */
+const CALL_CRITERIA_DOC = `{"type":"add_to_run_where","criteria":{ ...any of these, all must match... }}
+  temperature: ["hot","warm","cold","none"]
+  attemptsMin / attemptsMax: numbers (logged calls, connected or not; 0 = never called)
+  connected: true (ever reached on the phone) | false (called but never reached)
+  lastOutcome: ["spoke","voicemail","callback","noanswer","gatekeeper","qualified","notinterested"]   (how the most recent call ended)
+  lastStage: ["nostart","opener","pitch","objection","interest","booked"]   (where the most recent CONNECTED call stopped; "pitch" = got to the pitch then it ended)
+  callDue: true (a call follow-up is due today or overdue)
+  notCalledForDays: N (last call at least N days ago, or never called)
+  touchesMin / touchesMax: numbers (all logged touch points, any channel, excluding LinkedIn post engagement)
+  writtenTouchesMin / writtenTouchesMax: numbers (touch points that aren't calls)
+  sent: ["video","voicenote","content"]   (sent at least one of these)
+  wantsEmail: true | false
+  qualified: true ("not interested but qualified")
+  status: ["not contacted","outreach","nurture","replied","discovery call","ongoing"]
+  tags: ["tag"]  (has any of these)
+  lists: ["list name or id"]  (account is in any of these)
+  industry: "text"  (account industry contains this)
+  search: "text"  (name, position or company contains this)
+  order: "queue" (default: due, never-called, hottest, longest since last call) | "hottest" | "fewest_attempts" | "most_attempts" | "longest_since_call"
+  limit: N  (cap how many are added)`;
+const TEMP_RANK = { hot: 0, warm: 1, cold: 2 };
+const arr = (v) => (Array.isArray(v) ? v : v == null || v === "" ? [] : [v]).map((x) => String(x).trim().toLowerCase()).filter(Boolean);
+const num = (v) => (v === "" || v == null || !Number.isFinite(+v) ? null : +v);
+/* the facts a criterion can test, for one contact */
+function callFacts(acc, c) {
+  const cs = callStanding(c);
+  const tps = (c.touchpoints || []).filter((t) => !t.engage);
+  const lastCall = (c.touchpoints || []).filter(isCallTouch).map((t) => t.date).sort().pop() || "";
+  return {
+    acc,
+    c,
+    temp: c.temperature || "none",
+    attempts: cs.count,
+    everConnected: cs.everConnected,
+    lastOutcome: cs.lastOutcome,
+    lastStage: cs.talkStage,
+    callDue: isCallDue(c),
+    daysSinceCall: lastCall ? Math.round((new Date(today()) - new Date(lastCall)) / 86400000) : Infinity,
+    lastCall,
+    touches: tps.length,
+    written: tps.filter((t) => !isCallTouch(t)).length,
+  };
+}
+function matchCallCriteria(st, crit = {}) {
+  const k = crit || {};
+  const temps = arr(k.temperature);
+  const outcomes = arr(k.lastOutcome);
+  const stages = arr(k.lastStage);
+  const sent = arr(k.sent);
+  const tags = arr(k.tags).map(normTag);
+  const statuses = arr(k.status);
+  const lists = arr(k.lists)
+    .map((ref) => findList(st, ref))
+    .filter(Boolean)
+    .map((l) => l.id);
+  const wantLists = arr(k.lists).length > 0;
+  const industry = String(k.industry || "").trim().toLowerCase();
+  const search = String(k.search || "").trim().toLowerCase();
+  const inRun = new Set(st.callSession || []);
+  const between = (v, lo, hi) => (num(lo) == null || v >= num(lo)) && (num(hi) == null || v <= num(hi));
+  let rows = (st.accounts || [])
+    .flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt && !c.tombstoned && hasPhone(c) && c.status !== "closed" && !inRun.has(c.id)).map((c) => callFacts(acc, c)))
+    .filter((r) => !temps.length || temps.includes(r.temp))
+    .filter((r) => between(r.attempts, k.attemptsMin, k.attemptsMax))
+    .filter((r) => k.connected == null || k.connected === "" || (k.connected === true || k.connected === "true" ? r.everConnected : r.attempts > 0 && !r.everConnected))
+    .filter((r) => !outcomes.length || outcomes.includes(r.lastOutcome))
+    .filter((r) => !stages.length || stages.includes(r.lastStage))
+    .filter((r) => !k.callDue || r.callDue)
+    .filter((r) => num(k.notCalledForDays) == null || r.daysSinceCall >= num(k.notCalledForDays))
+    .filter((r) => between(r.touches, k.touchesMin, k.touchesMax))
+    .filter((r) => between(r.written, k.writtenTouchesMin, k.writtenTouchesMax))
+    .filter((r) => !sent.length || sent.some((x) => hasSent(r.c, x)))
+    .filter((r) => k.wantsEmail == null || k.wantsEmail === "" || !!emailRequestOpen(r.c) === (k.wantsEmail === true || k.wantsEmail === "true"))
+    .filter((r) => !k.qualified || !!r.c.qualifiedAt)
+    .filter((r) => !statuses.length || statuses.includes(r.c.status || "not contacted"))
+    .filter((r) => !tags.length || tagsOf(r.c).some((t) => tags.includes(t)))
+    .filter((r) => !wantLists || (r.acc.listIds || []).some((id) => lists.includes(id)))
+    .filter((r) => !industry || (r.acc.industry || "").toLowerCase().includes(industry))
+    .filter((r) => !search || `${r.c.name || ""} ${r.c.position || ""} ${r.acc.company || ""}`.toLowerCase().includes(search));
+  const tempRank = (r) => TEMP_RANK[r.temp] ?? 3;
+  const order = String(k.order || "queue");
+  rows.sort((a, b) =>
+    order === "hottest"
+      ? tempRank(a) - tempRank(b) || (b.callDue ? 1 : 0) - (a.callDue ? 1 : 0)
+      : order === "fewest_attempts"
+      ? a.attempts - b.attempts
+      : order === "most_attempts"
+      ? b.attempts - a.attempts
+      : order === "longest_since_call"
+      ? b.daysSinceCall - a.daysSinceCall
+      : (b.callDue ? 1 : 0) - (a.callDue ? 1 : 0) || (a.attempts === 0 ? 0 : 1) - (b.attempts === 0 ? 0 : 1) || tempRank(a) - tempRank(b) || (a.lastCall || "").localeCompare(b.lastCall || "")
+  );
+  const lim = num(k.limit);
+  if (lim != null && lim >= 0) rows = rows.slice(0, Math.round(lim));
+  return rows;
+}
+/* the criteria read back in words, so you can check the model understood you */
+function criteriaSummary(st, crit = {}) {
+  const k = crit || {};
+  const parts = [];
+  const range = (lo, hi, unit) => {
+    const a = num(lo);
+    const b = num(hi);
+    return a != null && b != null ? (a === b ? `${a} ${unit}` : `${a}–${b} ${unit}`) : a != null ? `${a}+ ${unit}` : `up to ${b} ${unit}`;
+  };
+  if (arr(k.temperature).length) parts.push(arr(k.temperature).join(" or "));
+  if (num(k.attemptsMin) != null || num(k.attemptsMax) != null)
+    parts.push(num(k.attemptsMax) === 0 ? "never called" : range(k.attemptsMin, k.attemptsMax, "attempts"));
+  if (k.connected === true || k.connected === "true") parts.push("reached before");
+  if (k.connected === false || k.connected === "false") parts.push("never reached");
+  if (arr(k.lastOutcome).length) parts.push(`last call: ${arr(k.lastOutcome).map((o) => callOutcome(o)?.label.toLowerCase() || o).join(" / ")}`);
+  if (arr(k.lastStage).length) parts.push(`last talk ended at ${arr(k.lastStage).map((x) => callStage(x)?.label.toLowerCase() || x).join(" / ")}`);
+  if (k.callDue) parts.push("call due");
+  if (num(k.notCalledForDays) != null) parts.push(`not called in ${num(k.notCalledForDays)}+ days`);
+  if (num(k.touchesMin) != null || num(k.touchesMax) != null) parts.push(range(k.touchesMin, k.touchesMax, "touch points"));
+  if (num(k.writtenTouchesMin) != null || num(k.writtenTouchesMax) != null) parts.push(range(k.writtenTouchesMin, k.writtenTouchesMax, "written touches"));
+  if (arr(k.sent).length) parts.push(`sent ${arr(k.sent).map((x) => sentKind(x)?.label.toLowerCase() || x).join(" or ")}`);
+  if (k.wantsEmail === true || k.wantsEmail === "true") parts.push("asked for an email");
+  if (k.qualified) parts.push("qualified");
+  if (arr(k.status).length) parts.push(arr(k.status).join(" / "));
+  if (arr(k.tags).length) parts.push(arr(k.tags).map((t) => `#${normTag(t)}`).join(" or "));
+  if (arr(k.lists).length) parts.push(`in ${arr(k.lists).map((ref) => (findList(st, ref) ? listName(findList(st, ref)) : `unknown list “${ref}”`)).join(" / ")}`);
+  if (k.industry) parts.push(`industry “${k.industry}”`);
+  if (k.search) parts.push(`matching “${k.search}”`);
+  if (num(k.limit) != null) parts.push(`top ${num(k.limit)}`);
+  return parts.join(", ") || "anyone callable";
+}
+
+/* ============================================================
+   CRM ASSISTANT
+
+   A chat that can read the CRM and propose changes to it. It never writes on
+   its own: every change comes back as a list you tick through and apply, and
+   anything it names that doesn't exist is shown as skipped rather than
+   guessed at. What it can do is deliberately narrow — tags, temperature,
+   lists, industry, notes and the call run — the things that are tedious by
+   hand and harmless to get slightly wrong. Statuses, follow-ups and deletes
+   stay with you, because those move your numbers.
+   ============================================================ */
+const AGENT_ACTION_DOC = `Actions (use ids exactly as they appear in the data):
+- {"type":"tag","id":"<contact or lead id>","add":["tag"],"remove":["tag"]}
+- {"type":"temperature","id":"<contact or lead id>","value":"cold"|"warm"|"hot"|""}
+- {"type":"create_list","name":"AU MSPs","industry":"IT services"}
+- {"type":"add_to_list","list":"<list id or exact list name>","accountIds":["<account id>"]}
+- {"type":"remove_from_list","list":"<list id or name>","accountIds":["<account id>"]}
+- {"type":"set_industry","accountId":"<account id>","industry":"Fintech"}
+- {"type":"add_to_run","contactIds":["<contact id>"]}   (call run, specific people; only contacts with a phone number)
+- ${CALL_CRITERIA_DOC}
+  Use add_to_run_where whenever the user describes WHO they want to call by a quality (warmth, attempts, outcome, stage, touches, list…) rather than naming people. The app finds the matches itself — don't list ids for it.
+- {"type":"note","id":"<account, contact or lead id>","text":"short note"}
+- {"type":"remove_followups","id":"<contact or lead id>","scope":"due"|"all_pending","track":"email"|"call"|"any"}   ("due" = pending and due today or earlier; ticked follow-ups are history and are never removed)
+- {"type":"start_review","focus":"what to judge, in the user's words","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true}}   (all scope keys optional)
+  Use start_review when the user wants you to read their notes, judge who is worth following up, or asks about anything the CRM DATA doesn't show (what was said, notes, touch-point details). The app then sends you full notes and history 50 prospects at a time. It changes nothing and runs straight away.
+- {"type":"add_followup","id":"<contact or lead id>","date":"YYYY-MM-DD"}  or  {"type":"add_followup","id":"...","inDays":7}   optional "channel": "Cold email" (default) | "LinkedIn" | "Phone call" | "Text/SMS" | "Facebook" | "Instagram"`;
+
+/* every record the assistant may point at, by id */
+function locateRecord(st, id) {
+  if (!id) return null;
+  for (const acc of st.accounts || []) {
+    if (acc.id === id) return { kind: "account", acc };
+    const c = (acc.contacts || []).find((x) => x.id === id);
+    if (c) return { kind: "contact", acc, c };
+  }
+  const app = (st.applications || []).find((a) => a.id === id);
+  if (app) return { kind: "lead", app };
+  return null;
+}
+const recordLabel = (r) => (!r ? "?" : r.kind === "account" ? r.acc.company || "Unnamed account" : r.kind === "contact" ? `${r.c.name || "Unnamed"} (${r.acc.company || "?"})` : `${r.app.company || "?"}${r.app.role ? ` — ${r.app.role}` : ""}`);
+
+/* The CRM as compact lines. Archived people, and pipeline rows that only
+   mirror an account contact, are left out — the contact is the record to
+   change, and listing both would invite the model to edit the copy. */
+function crmDigest(st) {
+  const lines = [`TODAY: ${today()}`];
+  const lists = st.accountLists || [];
+  lines.push(`\nLISTS (id | name | industry | accounts):`);
+  if (!lists.length) lines.push("(none)");
+  lists.forEach((l) => lines.push(`${l.id} | ${listName(l)} | ${l.industry || "-"} | ${accountsInList(st, l.id).length}`));
+  lines.push(`\nACCOUNTS (id | company | industry | lists | status) with their contacts indented (id | name | position | status | contacted | temp | tags | phone | email | calls(connected) last-outcome last-stage | touches | sent | wants-email | last touch | fu):`);
+  (st.accounts || []).forEach((acc) => {
+    const ln = (acc.listIds || []).map((id) => lists.find((l) => l.id === id)).filter(Boolean).map(listName);
+    lines.push(`${acc.id} | ${acc.company || "?"} | ${acc.industry || "-"} | ${ln.join(", ") || "-"} | ${acc.status || "open"}`);
+    (acc.contacts || [])
+      .filter((c) => !c.archivedAt && !c.tombstoned)
+      .forEach((c) => {
+        const cs = callStanding(c);
+        const last = [...(c.touchpoints || [])].map((t) => t.date).sort().pop() || "-";
+        lines.push(
+          `  ${c.id} | ${c.name || "?"} | ${c.position || "-"} | ${c.status || "not contacted"} | ${c.contacted || "-"} | ${c.temperature || "-"} | ${tagsOf(c).join(",") || "-"} | ${hasPhone(c) ? "yes" : "no"} | ${c.email ? "yes" : "no"} | ${cs.count}(${cs.connectedCount}) ${cs.lastOutcome || "-"} ${cs.talkStage || "-"} | ${(c.touchpoints || []).filter((t) => !t.engage).length} | ${sentKindsOf(c).join(",") || "-"} | ${emailRequestOpen(c) ? "yes" : "-"} | ${last} | ${fuDigest(c)}`
+        );
+      });
+  });
+  const leads = (st.applications || []).filter((a) => !a.fromAccountContact && !a.archivedAt);
+  lines.push(`\nLEADS / APPLICATIONS (id | company | role | status | temp | tags | contacted | fu):`);
+  leads.forEach((a) => lines.push(`${a.id} | ${a.company || "?"} | ${a.role || "-"} | ${a.status || "-"} | ${a.temperature || "-"} | ${tagsOf(a).join(",") || "-"} | ${a.contacted || "-"} | ${fuDigest(a)}`));
+  return lines.join("\n");
+}
+
+/* What an action would do, in words — or why it can't. `plannedLists` holds
+   names of lists created earlier in the same batch, so "make a list, then fill
+   it" checks out before the list exists. */
+function describeAgentAction(st, a, plannedLists = new Set()) {
+  const bad = (why) => ({ ok: false, text: why });
+  const listRef = (ref) => findList(st, ref) || (plannedLists.has(String(ref || "").trim().toLowerCase()) ? { name: ref } : null);
+  switch (a?.type) {
+    case "tag": {
+      const r = locateRecord(st, a.id);
+      if (!r || r.kind === "account") return bad(`Tag: no contact or lead with id ${a.id}`);
+      const add = (a.add || []).map(normTag).filter(Boolean);
+      const rm = (a.remove || []).map(normTag).filter(Boolean);
+      if (!add.length && !rm.length) return bad("Tag: nothing to add or remove");
+      return { ok: true, text: `${recordLabel(r)}: ${[add.length ? `tag ${add.map((t) => `#${t}`).join(" ")}` : "", rm.length ? `untag ${rm.map((t) => `#${t}`).join(" ")}` : ""].filter(Boolean).join(", ")}` };
+    }
+    case "temperature": {
+      const r = locateRecord(st, a.id);
+      if (!r || r.kind === "account") return bad(`Temperature: no contact or lead with id ${a.id}`);
+      if (a.value && !leadTemp(a.value)) return bad(`Temperature: "${a.value}" isn't cold, warm or hot`);
+      return { ok: true, text: `${recordLabel(r)} → ${a.value ? `${leadTemp(a.value).icon} ${leadTemp(a.value).label}` : "no temperature"}` };
+    }
+    case "create_list":
+      if (!String(a.name || "").trim()) return bad("New list: no name");
+      if (findList(st, a.name)) return bad(`New list: “${a.name}” already exists`);
+      return { ok: true, text: `New list “${String(a.name).trim()}”${a.industry ? ` · ${a.industry}` : ""}` };
+    case "add_to_list":
+    case "remove_from_list": {
+      const l = listRef(a.list);
+      if (!l) return bad(`No list called “${a.list}”`);
+      const accs = (a.accountIds || []).map((id) => locateRecord(st, id)).filter((r) => r?.kind === "account");
+      if (!accs.length) return bad(`${a.type === "add_to_list" ? "Add to" : "Remove from"} ${listName(l)}: none of those accounts exist`);
+      const names = accs.map(recordLabel);
+      return { ok: true, text: `${a.type === "add_to_list" ? "Add" : "Remove"} ${accs.length} ${accs.length === 1 ? "account" : "accounts"} ${a.type === "add_to_list" ? "to" : "from"} ${listName(l)}: ${names.slice(0, 6).join(", ")}${names.length > 6 ? ` +${names.length - 6} more` : ""}` };
+    }
+    case "set_industry": {
+      const r = locateRecord(st, a.accountId);
+      if (r?.kind !== "account") return bad(`Industry: no account with id ${a.accountId}`);
+      return { ok: true, text: `${recordLabel(r)} industry → ${a.industry || "blank"}` };
+    }
+    case "add_to_run_where": {
+      const rows = matchCallCriteria(st, a.criteria);
+      const what = criteriaSummary(st, a.criteria);
+      if (!rows.length) return bad(`Call run (${what}): nobody callable matches — or they're already in the run`);
+      const names = rows.map((r) => `${r.c.name || "Unnamed"} (${r.acc.company || "?"})`);
+      return { ok: true, text: `☎ Add ${rows.length} to the call run — ${what}: ${names.slice(0, 8).join(", ")}${names.length > 8 ? ` +${names.length - 8} more` : ""}` };
+    }
+    case "add_to_run": {
+      const rs = (a.contactIds || []).map((id) => locateRecord(st, id)).filter((r) => r?.kind === "contact");
+      const callable = rs.filter((r) => hasPhone(r.c) && r.c.status !== "closed");
+      if (!callable.length) return bad("Call run: none of those contacts has a number you can dial");
+      return { ok: true, text: `☎ Add ${callable.length} to the call run: ${callable.slice(0, 6).map(recordLabel).join(", ")}${callable.length > 6 ? ` +${callable.length - 6} more` : ""}${rs.length > callable.length ? ` (${rs.length - callable.length} skipped, no number)` : ""}` };
+    }
+    case "remove_followups": {
+      const r = locateRecord(st, a.id);
+      if (!r || r.kind === "account") return bad(`Follow-ups: no contact or lead with id ${a.id}`);
+      const rec = r.kind === "contact" ? r.c : r.app;
+      const { removed } = removePendingFollowUps(rec, { scope: a.scope === "all_pending" ? "all_pending" : "due", track: ["email", "call"].includes(a.track) ? a.track : "any" });
+      if (!removed.length) return bad(`${recordLabel(r)}: no ${a.scope === "all_pending" ? "pending" : "due"} follow-ups to remove`);
+      return { ok: true, text: `${recordLabel(r)}: remove ${removed.length} ${a.scope === "all_pending" ? "pending" : "due"} follow-up${removed.length === 1 ? "" : "s"} (${removed.map((x) => `${x.date ? x.date.slice(5) : "undated"} ${FU_TRACK_NAME(x.f)}`).join(", ")})` };
+    }
+    case "add_followup": {
+      const r = locateRecord(st, a.id);
+      if (!r || r.kind === "account") return bad(`Follow-up: no contact or lead with id ${a.id}`);
+      const date = resolveFuDate(a);
+      if (!date) return bad(`${recordLabel(r)}: follow-up needs a date or a number of days`);
+      if (date < today()) return bad(`${recordLabel(r)}: ${date} is in the past`);
+      if (a.channel && !TOUCHPOINT_CHANNELS.includes(a.channel)) return bad(`${recordLabel(r)}: “${a.channel}” isn't a channel`);
+      const out = addFollowUpOn(r.kind === "contact" ? r.c : r.app, date, a.channel);
+      if (out.error) return bad(`${recordLabel(r)}: ${out.error}`);
+      return { ok: true, text: `${recordLabel(r)}: ${isPhoneFu({ channel: a.channel }) ? "☎ call" : `${a.channel || "Cold email"} follow-up`} due ${date}` };
+    }
+    case "note": {
+      const r = locateRecord(st, a.id);
+      if (!r) return bad(`Note: nothing with id ${a.id}`);
+      if (!String(a.text || "").trim()) return bad("Note: empty");
+      return { ok: true, text: `Note on ${recordLabel(r)}: “${String(a.text).trim()}”` };
+    }
+    default:
+      return bad(`Unknown action “${a?.type}”`);
+  }
+}
+/* the checked actions for a whole reply, in order */
+function reviewAgentActions(st, actions) {
+  const planned = new Set();
+  /* run additions are checked against the run as earlier actions in the
+     same reply will leave it, so "hot ones, then everyone due" doesn't
+     count the same person twice in the preview */
+  let sim = st;
+  return (actions || []).map((a) => {
+    const d = describeAgentAction(sim, a, planned);
+    if (d.ok && a.type === "create_list") planned.add(String(a.name).trim().toLowerCase());
+    if (d.ok && (a.type === "add_to_run_where" || a.type === "add_to_run")) {
+      const cur = sim.callSession || [];
+      const add = a.type === "add_to_run_where" ? matchCallCriteria(sim, a.criteria).map((r) => r.c.id) : (a.contactIds || []).filter((id) => { const r = locateRecord(sim, id); return r?.kind === "contact" && hasPhone(r.c) && r.c.status !== "closed"; });
+      sim = { ...sim, callSession: [...cur, ...add.filter((id) => !cur.includes(id))] };
+    }
+    return { action: a, ...d };
+  });
+}
+
+const stampNote = (old, text) => `${(old || "").trim() ? `${old.trim()}\n` : ""}${today()}: ${String(text).trim()}`;
+
+/* Applies actions in order and reports what it touched, so the caller can
+   re-sync pipeline rows for any account whose contacts changed. */
+function applyAgentActions(st0, actions) {
+  let st = st0;
+  const touchedAccounts = new Set();
+  let applied = 0;
+  const patchContact = (accId, cId, fn) => {
+    st = { ...st, accounts: (st.accounts || []).map((a) => (a.id !== accId ? a : { ...a, contacts: (a.contacts || []).map((c) => (c.id === cId ? fn(c) : c)) })) };
+    touchedAccounts.add(accId);
+  };
+  const patchApp = (id, fn) => {
+    st = { ...st, applications: (st.applications || []).map((a) => (a.id === id ? fn(a) : a)) };
+  };
+  const patchRecord = (r, fn) => (r.kind === "contact" ? patchContact(r.acc.id, r.c.id, fn) : r.kind === "lead" ? patchApp(r.app.id, fn) : null);
+  reviewAgentActions(st0, actions).forEach(({ action: a, ok }) => {
+    if (!ok) return;
+    const r = a.id ? locateRecord(st, a.id) : null;
+    switch (a.type) {
+      case "tag":
+        patchRecord(r, (x) => withTags(x, a.add || [], a.remove || []));
+        break;
+      case "temperature":
+        patchRecord(r, (x) => ({ ...x, temperature: a.value || "", temperatureAt: a.value ? today() : "" }));
+        break;
+      case "create_list":
+        st = createAccountList(st, a.name, a.industry).st;
+        break;
+      case "add_to_list":
+      case "remove_from_list": {
+        const l = findList(st, a.list);
+        if (!l) return;
+        st = a.type === "add_to_list" ? addAccountsToList(st, l.id, a.accountIds || []) : removeAccountsFromList(st, l.id, a.accountIds || []);
+        break;
+      }
+      case "set_industry":
+        st = { ...st, accounts: (st.accounts || []).map((x) => (x.id === a.accountId ? { ...x, industry: String(a.industry || "").trim() } : x)) };
+        break;
+      case "add_to_run_where": {
+        const cur = st.callSession || [];
+        st = { ...st, callSession: [...cur, ...matchCallCriteria(st, a.criteria).map((r) => r.c.id).filter((id) => !cur.includes(id))] };
+        break;
+      }
+      case "add_to_run": {
+        const cur = st.callSession || [];
+        const ids = (a.contactIds || []).filter((id) => {
+          const rr = locateRecord(st, id);
+          return rr?.kind === "contact" && hasPhone(rr.c) && rr.c.status !== "closed" && !cur.includes(id);
+        });
+        st = { ...st, callSession: [...cur, ...ids] };
+        break;
+      }
+      case "remove_followups":
+        patchRecord(r, (x) => removePendingFollowUps(x, { scope: a.scope === "all_pending" ? "all_pending" : "due", track: ["email", "call"].includes(a.track) ? a.track : "any" }).rec);
+        break;
+      case "add_followup": {
+        const out = addFollowUpOn(r.kind === "contact" ? r.c : r.app, resolveFuDate(a), a.channel);
+        if (out.error) return;
+        patchRecord(r, () => out.rec);
+        break;
+      }
+      case "note":
+        if (r.kind === "account") st = { ...st, accounts: (st.accounts || []).map((x) => (x.id === r.acc.id ? { ...x, notes: stampNote(x.notes, a.text) } : x)) };
+        else patchRecord(r, (x) => ({ ...x, notes: stampNote(x.notes, a.text) }));
+        break;
+      default:
+        return;
+    }
+    applied += 1;
+  });
+  return { st, touchedAccounts: Array.from(touchedAccounts), applied };
+}
+
+/* Pulls the JSON object out of a reply. Models wrap it in prose or fences
+   now and then; anything unparseable comes back as plain text with no
+   actions, so a malformed answer degrades to a chat reply, not an error. */
+function parseAgentReply(raw) {
+  const text = String(raw || "").trim();
+  const a = text.indexOf("{");
+  const b = text.lastIndexOf("}");
+  if (a !== -1 && b > a) {
+    try {
+      const j = JSON.parse(text.slice(a, b + 1));
+      if (j && typeof j === "object") {
+        const all = Array.isArray(j.actions) ? j.actions : [];
+        const review = all.find((x) => x?.type === "start_review") || null;
+        const actions = all.filter((x) => x?.type !== "start_review");
+        return { reply: String(j.reply || "").trim() || (actions.length ? "Here's what I'd change:" : review ? "Reviewing…" : ""), actions, review };
+      }
+    } catch (e) {
+      /* fall through to plain text */
+    }
+  }
+  return { reply: text, actions: [], review: null };
+}
+
+const AGENT_SYSTEM = `You are the CRM assistant inside Flight Deck, a job-search and outreach CRM. You help organise accounts, contacts and leads: tagging, lead temperature, account lists by industry or segment, industries, notes, and building call runs. You answer questions about the data too.
+
+Reply with ONE JSON object and nothing else:
+{"reply": "what you say to the user, plain text, short", "actions": [ ... ]}
+
+${AGENT_ACTION_DOC}
+
+Rules:
+- Only use ids that appear in the CRM data. Never invent an id. If you can't find something, say so in reply and propose no action for it.
+- Propose actions only when the user asks for changes. For questions, answer in reply with "actions": [].
+- The user reviews and approves every action before it applies, so propose the full set in one go (create a list and add to it in the same reply).
+- Tags are short lower-case labels. Reuse existing tags where they fit.
+- "temp" is lead temperature (how keen); it is separate from outreach status.
+- Conditions inside one add_to_run_where must ALL match. For "X, plus Y" or "hot first, then warm", use one add_to_run_where per group, in the order the user wants them called. Someone already added isn't added twice.
+- You can add or remove PENDING follow-ups. "fu" in the data lists each one as date + channel, with DUE when it's due today or earlier. You cannot tick a follow-up as done, or remove ticked ones.
+- A written follow-up needs the person to have been contacted already ("contacted" date or a status other than "not contacted"); a call follow-up doesn't.
+- You cannot change statuses, phone numbers or delete records. If asked, say the user needs to do that themselves.
+- Keep reply under 120 words. Mention counts ("tagged 12 contacts") rather than listing everyone.`;
+
+/* ============================================================
+   PROSPECT REVIEW
+
+   Judging who's worth chasing needs the notes, and the notes don't fit in
+   one request for a few hundred people. So review goes 50 at a time: each
+   batch carries everything written about those 50 — your notes on the
+   contact and account, every touch point with its note, call outcomes,
+   follow-ups — and comes back as a verdict per person plus any changes the
+   model proposes, which you approve like any other.
+   ============================================================ */
+const REVIEW_BATCH = 50;
+const clip = (t, n) => {
+  const x = String(t || "").replace(/\s+/g, " ").trim();
+  return x.length > n ? `${x.slice(0, n - 1)}…` : x;
+};
+/* everyone worth judging: open contacts and open leads that aren't just the
+   pipeline mirror of a contact. Due first, then anyone with notes, then most
+   recently active — so the first batch is the one that matters most. */
+function reviewPool(st, scope = {}) {
+  const k = scope || {};
+  const who = k.who || "all";
+  const temps = arr(k.temperature);
+  const tags = arr(k.tags).map(normTag);
+  const statuses = arr(k.status);
+  const listIds = arr(k.lists).map((ref) => findList(st, ref)).filter(Boolean).map((l) => l.id);
+  const search = String(k.search || "").trim().toLowerCase();
+  const rows = [];
+  if (who !== "leads")
+    (st.accounts || []).forEach((acc) =>
+      (acc.contacts || [])
+        .filter((c) => !c.archivedAt && !c.tombstoned && c.status !== "closed")
+        .forEach((c) => rows.push({ kind: "contact", id: c.id, rec: c, acc, name: c.name, company: acc.company, notes: `${c.notes || ""}${acc.notes || ""}`, due: isContactDue(c) || isCallDue(c) }))
+    );
+  if (who !== "contacts")
+    (st.applications || [])
+      .filter((a) => !a.fromAccountContact && !a.archivedAt && isOpenApp(a))
+      .forEach((a) => rows.push({ kind: "lead", id: a.id, rec: a, acc: null, name: a.contact || a.role, company: a.company, notes: a.notes || "", due: isDue(a) }));
+  return rows
+    .filter((r) => !k.due || r.due)
+    .filter((r) => !temps.length || temps.includes(r.rec.temperature || "none"))
+    .filter((r) => !tags.length || tagsOf(r.rec).some((t) => tags.includes(t)))
+    .filter((r) => !statuses.length || statuses.includes(r.rec.status || "not contacted"))
+    .filter((r) => !arr(k.lists).length || (r.acc && (r.acc.listIds || []).some((id) => listIds.includes(id))))
+    .filter((r) => !search || `${r.name || ""} ${r.rec.position || r.rec.role || ""} ${r.company || ""}`.toLowerCase().includes(search))
+    .filter((r) => !k.hasNotes || r.notes.trim() || (r.rec.touchpoints || []).some((t) => (t.note || "").trim()))
+    .sort((a, b) => (b.due ? 1 : 0) - (a.due ? 1 : 0) || (b.notes.trim() ? 1 : 0) - (a.notes.trim() ? 1 : 0) || (lastActivityDate(b.rec) || "").localeCompare(lastActivityDate(a.rec) || ""))
+    .map((r) => r.id);
+}
+/* everything written about one prospect, as a block the model can read */
+function prospectDetail(st, id) {
+  const r = locateRecord(st, id);
+  if (!r || r.kind === "account") return "";
+  const x = r.kind === "contact" ? r.c : r.app;
+  const head =
+    r.kind === "contact"
+      ? `### ${x.id} | contact | ${x.name || "?"} | ${x.position || "-"} | ${r.acc.company || "?"}${r.acc.industry ? ` (${r.acc.industry})` : ""}`
+      : `### ${x.id} | lead | ${x.contact || "-"} | ${x.role || "-"} | ${x.company || "?"}`;
+  const lists = r.kind === "contact" ? (r.acc.listIds || []).map((lid) => (st.accountLists || []).find((l) => l.id === lid)).filter(Boolean).map(listName) : [];
+  const cs = callStanding(x);
+  const lines = [
+    head,
+    `status: ${x.status || "not contacted"} | contacted: ${x.contacted || "-"} | temp: ${x.temperature || "-"} | tags: ${tagsOf(x).join(", ") || "-"}${lists.length ? ` | lists: ${lists.join(", ")}` : ""} | replied: ${x.gotReply ? "yes" : "no"}${x.qualifiedAt ? ` | qualified ${x.qualifiedAt}` : ""}${emailRequestOpen(x) ? ` | asked for email ${x.emailRequested}` : ""}`,
+    `calls: ${cs.count} (${cs.connectedCount} connected)${cs.lastOutcome ? `, last: ${cs.lastOutcome}` : ""}${cs.talkStage ? `, last talk got to: ${cs.talkStage}` : ""} | follow-ups: ${fuDigest(x)}`,
+  ];
+  if ((x.notes || "").trim()) lines.push(`my notes: ${clip(x.notes, 500)}`);
+  if (r.kind === "contact" && (r.acc.notes || "").trim()) lines.push(`account notes: ${clip(r.acc.notes, 300)}`);
+  if (r.kind === "contact" && (x.hook || "").trim()) lines.push(`hook: ${clip(x.hook, 160)}`);
+  const tps = [...(x.touchpoints || [])].sort((a, b) => (a.date || "").localeCompare(b.date || "")).slice(-8);
+  if (tps.length) lines.push(`touches (oldest→newest): ${tps.map((t) => `${t.date} ${t.channel || "?"}${sentOf(t).length ? ` [sent ${sentOf(t).join("+")}]` : ""}${t.engage ? " [engaged a post]" : ""}${(t.note || "").trim() ? `: ${clip(t.note, 140)}` : ""}`).join(" || ")}`);
+  return lines.join("\n");
+}
+const REVIEW_VERDICTS = [
+  { key: "follow_up", icon: "✅", label: "Worth following up", tone: "green" },
+  { key: "nurture", icon: "🌱", label: "Nurture — not now", tone: "amber" },
+  { key: "unclear", icon: "❔", label: "Not enough to go on", tone: "blue" },
+  { key: "drop", icon: "✖", label: "Let go", tone: "red" },
+];
+/* Review replies must carry verdicts; one without them is treated as a
+   failure so it's retried, rather than shown as if the batch had been read. */
+function parseReviewReply(raw, batchIds) {
+  const text = String(raw || "").trim();
+  const a = text.indexOf("{");
+  const b = text.lastIndexOf("}");
+  let j = null;
+  if (a !== -1 && b > a) {
+    try {
+      j = JSON.parse(text.slice(a, b + 1));
+    } catch (e) {
+      j = null;
+    }
+  }
+  if (!j || !Array.isArray(j.verdicts)) throw new Error("The reply didn't contain a verdict list.");
+  const ids = new Set(batchIds);
+  const seen = new Set();
+  const verdicts = j.verdicts
+    .filter((v) => v && ids.has(v.id) && !seen.has(v.id) && seen.add(v.id))
+    .map((v) => ({ id: v.id, verdict: REVIEW_VERDICTS.some((x) => x.key === v.verdict) ? v.verdict : "unclear", why: clip(v.why, 200), next: clip(v.next, 160) }));
+  if (!verdicts.length) throw new Error("None of the verdicts matched the prospects sent.");
+  return {
+    reply: String(j.reply || "").trim(),
+    verdicts,
+    actions: Array.isArray(j.actions) ? j.actions.filter((x) => x?.type !== "start_review") : [],
+    missing: batchIds.filter((id) => !seen.has(id)),
+  };
+}
+/* Retries what's worth retrying — network trouble, rate limits, a garbled
+   reply — with a growing pause. A missing key or a refused request fails at
+   once, since asking again would only repeat it. */
+const isRetryable = (e) => !/No API key|invalid x-api-key|authentication|permission|credit balance|not_found_error|model:/i.test(e?.message || "");
+async function withRetry(fn, { tries = 3, onAttempt } = {}) {
+  let last;
+  for (let n = 1; n <= tries; n++) {
+    try {
+      onAttempt && onAttempt(n, tries);
+      return await fn(n);
+    } catch (e) {
+      last = e;
+      if (n === tries || !isRetryable(e)) break;
+      await new Promise((res) => setTimeout(res, n === 1 ? 1500 : 4000));
+    }
+  }
+  throw last;
+}
+
+const AGENT_STORE = "fd-agent-chat";
+const readAgentChat = () => {
+  try {
+    const v = JSON.parse(localStorage.getItem(AGENT_STORE) || "[]");
+    return Array.isArray(v) ? v.slice(-40) : [];
+  } catch (e) {
+    return [];
+  }
+};
+const writeAgentChat = (msgs) => {
+  try {
+    localStorage.setItem(AGENT_STORE, JSON.stringify(msgs.slice(-40)));
+  } catch (e) {
+    /* chat history is a convenience — losing it is fine */
+  }
+};
+const AGENT_STARTERS = [
+  "Tag everyone I've sent a video to as #video",
+  "Make a list of my SaaS accounts",
+  "Who are my hot leads?",
+  "Add hot and warm contacts with a number to my call run",
+  "Call run: everyone who hung up after the pitch, plus anyone I've tried 3+ times without reaching",
+  "Clear every overdue follow-up older than two weeks",
+  "Read my notes and tell me who's actually worth following up",
+];
+
+/* The chat panel. Messages live with the app so closing the panel doesn't
+   lose them; each assistant reply carries its proposed actions and, once
+   applied, how many went through. Review replies also carry their batch
+   position, so "next 50" picks up where the last one stopped, and failed
+   requests carry what they were, so Retry sends exactly that again. */
+function AgentPanel({ state, msgs, setMsgs, ai, onApply, onUndo, canUndo, onClose, isDesktop }) {
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState("");
+  const [picks, setPicks] = useState({});
+  const endRef = useRef(null);
+  /* latest messages, for async steps that finish after a re-render */
+  const msgsRef = useRef(msgs);
+  msgsRef.current = msgs;
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: "end" });
+  }, [msgs.length, busy]);
+  /* Every write goes through the ref first, so a reply that lands after an
+     Apply (or a second batch after the first) appends to the real latest
+     list instead of an older copy captured when the request started. */
+  const commit = (next) => {
+    msgsRef.current = next;
+    setMsgs(next);
+    return next;
+  };
+  const push = (_base, m) => commit([...msgsRef.current, m]);
+  const attemptNote = (label) => (n, tries) => setBusy(n === 1 ? label : `${label} (retry ${n - 1} of ${tries - 1})`);
+
+  const runReview = async (review, base) => {
+    const poolIds = review.poolIds || reviewPool(state, review.scope);
+    const offset = review.offset || 0;
+    const batch = poolIds.slice(offset, offset + REVIEW_BATCH).filter((id) => locateRecord(state, id));
+    const r = { focus: review.focus || "Which of these are worth following up, and what should I do next with each?", scope: review.scope || {}, poolIds, offset };
+    if (!batch.length) {
+      push(base, { role: "assistant", text: poolIds.length ? "That's everyone — no more prospects left to review." : "No open prospects match that." });
+      return;
+    }
+    const range = `${offset + 1}–${offset + batch.length} of ${poolIds.length}`;
+    try {
+      const out = await withRetry(
+        async () => {
+          const raw = await callAI({
+            ...ai,
+            maxTokens: Math.max(+ai.maxTokens || 0, 8000),
+            system: AGENT_SYSTEM,
+            user: `TODAY: ${today()}
+TASK: Review these prospects (${range}). The user's focus: "${r.focus}"
+
+Read each one's notes, touch points, call outcomes, temperature and follow-ups, and judge it:
+- follow_up: worth chasing now
+- nurture: real potential but not now
+- unclear: not enough written down to judge
+- drop: no realistic prospect (said no, wrong fit, dead for months)
+
+Reply with ONE JSON object:
+{"reply": "2–4 sentence summary of this batch: patterns, who stands out", "verdicts": [{"id": "<id>", "verdict": "follow_up|nurture|unclear|drop", "why": "under 20 words, from their notes/history", "next": "concrete next step, under 15 words"}], "actions": [optional changes, same action types as usual — only if the user's focus asks for changes]}
+Give a verdict for EVERY prospect below, using its id exactly.
+
+PROSPECTS:
+${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
+          });
+          return parseReviewReply(raw, batch);
+        },
+        { onAttempt: attemptNote(`Reviewing ${range}…`) }
+      );
+      push(base, { role: "assistant", kind: "review", text: out.reply || `Reviewed ${range}.`, verdicts: out.verdicts, missing: out.missing, actions: out.actions, review: { ...r, size: batch.length }, at: Date.now() });
+    } catch (e) {
+      push(base, { role: "assistant", error: true, text: `⚠ Review of ${range} failed: ${e.message || "no reply"}`, retry: { kind: "review", review: r } });
+    }
+  };
+
+  const runChat = async (history) => {
+    try {
+      const out = await withRetry(
+        async () => {
+          const convo = history
+            .slice(-10)
+            .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.error ? "(failed request)" : m.text}${m.actions?.length ? ` [proposed ${m.actions.length} actions${m.applied ? `, ${m.applied} applied` : ", not applied"}]` : ""}`)
+            .join("\n");
+          const raw = await callAI({ ...ai, system: AGENT_SYSTEM, user: `CRM DATA:\n${crmDigest(state)}\n\nCONVERSATION:\n${convo}\n\nReply to the last user message as JSON.` });
+          const parsed = parseAgentReply(raw);
+          if (!parsed.reply && !parsed.actions.length && !parsed.review) throw new Error("Empty reply.");
+          return parsed;
+        },
+        { onAttempt: attemptNote("Thinking…") }
+      );
+      const next = push(history, { role: "assistant", text: out.reply || "(no reply)", actions: out.actions, at: Date.now() });
+      /* the model asked to read the detail — run the first batch straight away */
+      if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {} }, next);
+    } catch (e) {
+      push(history, { role: "assistant", error: true, text: `⚠ ${e.message || "Couldn't reach the AI provider."}`, retry: { kind: "chat" } });
+    }
+  };
+
+  const guard = async (fn) => {
+    if (busy) return;
+    setBusy("Thinking…");
+    try {
+      await fn();
+    } finally {
+      setBusy("");
+    }
+  };
+  const send = (textIn) => {
+    const text = String(textIn ?? draft).trim();
+    if (!text || busy) return;
+    setDraft("");
+    guard(() => runChat(push(msgsRef.current, { role: "user", text })));
+  };
+  /* drop the failed message and send the same request again */
+  const retry = (i) => {
+    const m = msgsRef.current[i];
+    const base = commit(msgsRef.current.slice(0, i));
+    guard(() => (m.retry?.kind === "review" ? runReview(m.retry.review, base) : runChat(base)));
+  };
+  const reviewNext = (m) => guard(() => runReview({ ...m.review, offset: m.review.offset + REVIEW_BATCH }, msgsRef.current));
+  const reviewAgain = (m) => guard(() => runReview(m.review, msgsRef.current));
+  const startReview = () => guard(() => runReview({ focus: "Which of these are worth following up, and what should I do next with each?", scope: {} }, push(msgsRef.current, { role: "user", text: "🔍 Review my prospects — who's worth following up?" })));
+
+  const shell = isDesktop ? { position: "fixed", top: 0, right: 0, bottom: 0, width: 440, borderLeft: `1px solid ${C.panelEdge}` } : { position: "fixed", inset: 0 };
+  const smallBtn = { background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 8, fontSize: 11, padding: "4px 9px", cursor: "pointer" };
+  const lastReviewIdx = msgs.map((m) => m.kind === "review").lastIndexOf(true);
+  return (
+    <div onTouchStart={(e) => e.stopPropagation()} onTouchEnd={(e) => e.stopPropagation()} style={{ ...shell, background: C.bg, zIndex: 58, display: "flex", flexDirection: "column", boxShadow: "-12px 0 32px rgba(0,0,0,0.35)" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", borderBottom: `1px solid ${C.panelEdge}`, flexShrink: 0, gap: 8 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 15, fontWeight: 800, color: C.ink }}>💬 CRM assistant</div>
+          <div style={{ fontSize: 11, color: C.muted }}>Reads your notes, organises, builds call runs — you approve every change.</div>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          <button onClick={startReview} disabled={!!busy} title={`Read notes and history ${REVIEW_BATCH} prospects at a time`} style={{ ...smallBtn, color: C.green, borderColor: C.green, opacity: busy ? 0.5 : 1 }}>
+            🔍 Review
+          </button>
+          {msgs.length > 0 && (
+            <button onClick={() => commit([])} disabled={!!busy} title="Clear the conversation" style={smallBtn}>
+              Clear
+            </button>
+          )}
+          <button onClick={onClose} aria-label="Close assistant" style={{ background: "transparent", border: "none", color: C.muted, fontSize: 22, cursor: "pointer", lineHeight: 1 }}>
+            ×
+          </button>
+        </div>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px" }}>
+        {msgs.length === 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 4 }}>
+              Ask about your accounts and leads, or tell it what to organise. 🔍 Review reads your notes {REVIEW_BATCH} prospects at a time and says who&apos;s worth chasing. Nothing changes until you press Apply.
+            </div>
+            {AGENT_STARTERS.map((t) => (
+              <button key={t} onClick={() => send(t)} style={{ textAlign: "left", background: C.panel, border: `1px solid ${C.panelEdge}`, color: C.ink, borderRadius: 10, padding: "9px 11px", fontSize: 12, cursor: "pointer" }}>
+                {t}
+              </button>
+            ))}
+          </div>
+        )}
+        {msgs.map((m, i) => {
+          const mine = m.role === "user";
+          const review = !mine && m.actions?.length ? reviewAgentActions(state, m.actions) : [];
+          const sel = picks[i] || review.map((r) => r.ok);
+          const chosen = review.filter((r, k) => r.ok && sel[k]).map((r) => r.action);
+          const rv = m.review;
+          const remaining = rv ? rv.poolIds.length - (rv.offset + (rv.size || REVIEW_BATCH)) : 0;
+          return (
+            <div key={i} style={{ display: "flex", justifyContent: mine ? "flex-end" : "flex-start", marginBottom: 10 }}>
+              <div
+                style={{
+                  maxWidth: m.kind === "review" ? "100%" : "88%",
+                  background: mine ? "rgba(125,176,247,0.12)" : C.panel,
+                  border: `1px solid ${mine ? C.blue : m.error ? C.red : C.panelEdge}`,
+                  borderRadius: 12,
+                  padding: "9px 11px",
+                  fontSize: 13,
+                  color: m.error ? C.red : C.ink,
+                  lineHeight: 1.5,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                }}
+              >
+                {rv && (
+                  <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted, marginBottom: 4 }}>
+                    REVIEWED {rv.offset + 1}–{rv.offset + (rv.size || 0)} OF {rv.poolIds.length}
+                  </div>
+                )}
+                {m.text}
+                {m.error && m.retry && (
+                  <div style={{ marginTop: 6 }}>
+                    <button onClick={() => retry(i)} disabled={!!busy} style={{ ...smallBtn, color: C.amber, borderColor: C.amber }}>
+                      ↻ Retry
+                    </button>
+                  </div>
+                )}
+                {/* verdicts, grouped so the ones worth chasing come first */}
+                {m.verdicts?.length > 0 && (
+                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
+                    {REVIEW_VERDICTS.map((g) => {
+                      const vs = m.verdicts.filter((v) => v.verdict === g.key);
+                      if (!vs.length) return null;
+                      return (
+                        <div key={g.key} style={{ marginBottom: 8 }}>
+                          <div style={{ fontSize: 11, fontWeight: 800, color: TONE_COL[g.tone], marginBottom: 3 }}>
+                            {g.icon} {g.label} ({vs.length})
+                          </div>
+                          {vs.map((v) => (
+                            <div key={v.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>
+                              <span style={{ fontWeight: 700 }}>{recordLabel(locateRecord(state, v.id))}</span>
+                              {v.why ? <span style={{ color: C.muted }}> — {v.why}</span> : null}
+                              {v.next ? <div style={{ color: C.ink, fontSize: 11 }}>→ {v.next}</div> : null}
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })}
+                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} in this batch got no verdict — “Review again” to retry it.</div>}
+                  </div>
+                )}
+                {rv && i === lastReviewIdx && (
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+                    {remaining > 0 && (
+                      <Btn onClick={() => reviewNext(m)} disabled={!!busy} style={{ padding: "6px 11px", fontSize: 11 }}>
+                        Review next {Math.min(REVIEW_BATCH, remaining)} ({remaining} left)
+                      </Btn>
+                    )}
+                    <button onClick={() => reviewAgain(m)} disabled={!!busy} style={smallBtn}>
+                      ↻ Review again
+                    </button>
+                  </div>
+                )}
+                {review.length > 0 && (
+                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8 }}>
+                    {review.map((r, k) => (
+                      <label key={k} style={{ display: "flex", gap: 7, alignItems: "flex-start", fontSize: 12, color: r.ok ? C.ink : C.muted, marginBottom: 5, cursor: r.ok && !m.applied ? "pointer" : "default", whiteSpace: "normal" }}>
+                        <input
+                          type="checkbox"
+                          disabled={!r.ok || !!m.applied}
+                          checked={!!(r.ok && sel[k])}
+                          onChange={() => setPicks({ ...picks, [i]: sel.map((v, x) => (x === k ? !v : v)) })}
+                          style={{ marginTop: 2 }}
+                        />
+                        <span style={{ textDecoration: r.ok ? "none" : "line-through" }}>{r.text}</span>
+                      </label>
+                    ))}
+                    {m.applied ? (
+                      <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
+                        <span style={{ fontSize: 11, color: C.green, fontWeight: 700 }}>✓ Applied {m.applied}</span>
+                        {canUndo && i === msgs.length - 1 && (
+                          <button onClick={onUndo} style={smallBtn}>
+                            ↩ Undo
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <Btn
+                        disabled={!chosen.length}
+                        onClick={() => {
+                          const n = onApply(chosen);
+                          commit(msgsRef.current.map((x, xi) => (xi === i ? { ...x, applied: n } : x)));
+                        }}
+                        style={{ padding: "7px 12px", fontSize: 12, marginTop: 4 }}
+                      >
+                        Apply {chosen.length} {chosen.length === 1 ? "change" : "changes"}
+                      </Btn>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        {busy && <div style={{ fontSize: 12, color: C.muted, padding: "4px 2px" }}>{busy}</div>}
+        <div ref={endRef} />
+      </div>
+      <div style={{ display: "flex", gap: 8, padding: "10px 12px calc(env(safe-area-inset-bottom, 0px) + 10px)", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0 }}>
+        <textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              send();
+            }
+          }}
+          rows={2}
+          placeholder="e.g. Review my hot leads' notes — who should I call this week?"
+          style={{ ...inputStyle, flex: 1, resize: "none", fontSize: 14 }}
+        />
+        <Btn disabled={!!busy || !draft.trim()} onClick={() => send()} style={{ padding: "0 16px" }}>
+          Send
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+/* Temperature, the email request and free tags, editable by hand on the
+   contact itself — the call log and the assistant set them too, and anything
+   they set has to be correctable here. */
+function ContactTagRow({ contact, onChange }) {
+  const [draft, setDraft] = useState("");
+  const tags = tagsOf(contact);
+  const add = () => {
+    const parts = draft.split(",").map(normTag).filter(Boolean);
+    if (parts.length) onChange({ tags: withTags(contact, parts).tags });
+    setDraft("");
+  };
+  const pill = (on, col) => ({ fontFamily: mono, fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 10, cursor: "pointer", border: `1px solid ${on ? col : C.panelEdge}`, background: on ? `${col}1f` : "transparent", color: on ? col : C.muted });
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, alignItems: "center", marginTop: 6 }}>
+      {/* labelled, because the Warm/Cold pair above is the outreach kind
+          (how you got in) and these are how keen they are now */}
+      <span style={{ fontSize: 10, color: C.muted }}>Lead temp:</span>
+      {LEAD_TEMPS.map((t) => {
+        const on = contact.temperature === t.key;
+        return (
+          <button key={t.key} onClick={() => onChange({ temperature: on ? "" : t.key, temperatureAt: on ? "" : today() })} style={pill(on, TONE_COL[t.tone])} title={on ? "Tap to clear" : `Mark ${t.label.toLowerCase()}`}>
+            {t.icon} {t.label}
+          </button>
+        );
+      })}
+      {contact.emailRequested && (
+        <button
+          onClick={() => onChange({ emailRequested: "" })}
+          style={pill(emailRequestOpen(contact), C.blue)}
+          title={emailRequestOpen(contact) ? `Asked for an email on ${contact.emailRequested} — tap to clear` : `Asked ${contact.emailRequested}, already written to — tap to clear`}
+        >
+          📧 {emailRequestOpen(contact) ? "wants email" : "emailed"} ×
+        </button>
+      )}
+      {tags.map((tg) => (
+        <button key={tg} onClick={() => onChange({ tags: withTags(contact, [], [tg]).tags })} style={pill(true, C.muted)} title="Remove tag">
+          #{tg} ×
+        </button>
+      ))}
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && add()}
+        onBlur={add}
+        placeholder="+ tag"
+        aria-label="Add a tag"
+        style={{ fontFamily: mono, fontSize: 10, width: 70, padding: "3px 7px", borderRadius: 10, border: `1px dashed ${C.panelEdge}`, background: "transparent", color: C.ink, outline: "none" }}
+      />
+    </div>
+  );
+}
+
+/* Create, rename, re-industry and delete lists. Edits commit on blur so a
+   half-typed name doesn't sync on every keystroke. Delete asks once. */
+function ListManager({ lists, counts, onCreate, onUpdate, onDelete }) {
+  const [name, setName] = useState("");
+  const [industry, setIndustry] = useState("");
+  const [confirmId, setConfirmId] = useState("");
+  const small = { ...inputStyle, fontSize: 13, padding: "7px 9px" };
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "12px 13px", marginTop: 8 }}>
+      {lists.length === 0 && <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>No lists yet. Make one per industry or segment, then add accounts to it from the filters above or from an account.</div>}
+      {lists.map((l) => (
+        <div key={l.id} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6, flexWrap: "wrap" }}>
+          <input defaultValue={l.name} onBlur={(e) => e.target.value.trim() !== l.name && onUpdate(l.id, { name: e.target.value.trim() || l.name })} style={{ ...small, flex: "2 1 140px", width: "auto" }} aria-label="List name" />
+          <input defaultValue={l.industry || ""} placeholder="Industry" onBlur={(e) => e.target.value.trim() !== (l.industry || "") && onUpdate(l.id, { industry: e.target.value.trim() })} style={{ ...small, flex: "1 1 110px", width: "auto" }} aria-label="List industry" />
+          <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, minWidth: 64 }}>{counts[l.id] || 0} accounts</span>
+          {confirmId === l.id ? (
+            <>
+              <Btn ghost onClick={() => setConfirmId("")} style={{ padding: "6px 10px", fontSize: 11 }}>
+                Keep
+              </Btn>
+              <Btn color={C.red} onClick={() => onDelete(l.id)} style={{ padding: "6px 10px", fontSize: 11 }}>
+                Delete list
+              </Btn>
+            </>
+          ) : (
+            <button onClick={() => setConfirmId(l.id)} title="Delete this list (accounts stay)" style={{ background: "transparent", border: "none", color: C.muted, fontSize: 15, cursor: "pointer" }}>
+              ×
+            </button>
+          )}
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="New list name, e.g. AU MSPs" style={{ ...small, flex: "2 1 160px", width: "auto" }} />
+        <input value={industry} onChange={(e) => setIndustry(e.target.value)} placeholder="Industry" style={{ ...small, flex: "1 1 110px", width: "auto" }} />
+        <Btn
+          disabled={!name.trim()}
+          onClick={() => {
+            onCreate(name, industry);
+            setName("");
+            setIndustry("");
+          }}
+          style={{ padding: "7px 13px", fontSize: 12 }}
+        >
+          + Create
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+/* One line of what you know about a person at a glance: how keen, whether
+   they're waiting on an email, what you've sent them, and their tags. Renders
+   nothing when there's nothing to say, so it costs no space on bare rows. */
+const TONE_COL = { blue: C.blue, amber: C.amber, red: C.red, green: C.green };
+function ContactBadges({ contact, style }) {
+  const t = leadTemp(contact?.temperature);
+  const sent = sentKindsOf(contact);
+  const tags = tagsOf(contact);
+  const email = emailRequestOpen(contact);
+  if (!t && !sent.length && !tags.length && !email) return null;
+  const chip = (col) => ({ fontFamily: mono, fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 8, border: `1px solid ${col}`, color: col, whiteSpace: "nowrap" });
+  return (
+    <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 3, ...style }}>
+      {t && (
+        <span style={chip(TONE_COL[t.tone])} title={`Lead temperature${contact.temperatureAt ? ` · set ${contact.temperatureAt}` : ""}`}>
+          {t.icon} {t.label.toUpperCase()}
+        </span>
+      )}
+      {email && (
+        <span style={chip(C.blue)} title={`Asked for an email on ${contact.emailRequested} — clears once you write to them`}>
+          📧 WANTS EMAIL
+        </span>
+      )}
+      {sent.length > 0 && (
+        <span style={chip(C.green)} title={`Sent: ${sent.map((k) => sentKind(k).label).join(", ")}`}>
+          SENT {sent.map((k) => sentKind(k).icon).join("")}
+        </span>
+      )}
+      {tags.map((tg) => (
+        <span key={tg} style={chip(C.muted)}>
+          #{tg}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function ConnDot({ contact, style }) {
   if (contact?.liStatus !== "connected") return null;
   return (
@@ -15551,6 +17121,7 @@ function ContactCardModal({ contact, company, accountId, onClose, onOpenAccount,
           </div>
         </div>
         <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>{[c.position, company].filter(Boolean).join(" · ") || "—"}</div>
+        <ContactBadges contact={c} style={{ marginTop: -6, marginBottom: 12 }} />
 
         {c.hook && (
           <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 10, padding: "9px 11px", marginBottom: 12 }}>
