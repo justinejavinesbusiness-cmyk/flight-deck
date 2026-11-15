@@ -2995,7 +2995,7 @@ function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, c
     ...c,
     /* every call is recorded, connected or not — the history and the call
        counts want the attempts too */
-    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), channel: PHONE_TRACK, note, outcome, connected: reached, stage: st ? stage : "", ...(leadTemp(temperature) ? { temperature } : {}), ...(reached && wantsEmail ? { wantsEmail: true } : {}) }],
+    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), at: new Date().toISOString(), channel: PHONE_TRACK, note, outcome, connected: reached, stage: st ? stage : "", ...(leadTemp(temperature) ? { temperature } : {}), ...(reached && wantsEmail ? { wantsEmail: true } : {}) }],
   };
   if (reached) {
     /* only a call that connected is contact — an untouched record starts here */
@@ -3303,6 +3303,12 @@ const DEFAULT_STATE = {
      the sequence you work through — and kept in state so it survives a reload
      mid-session. */
   callSession: [],
+  /* ---- call-run sessions ----
+     The run is WHO to call; a session is WHEN you called them: started,
+     paused, stopped. Only one is live at a time; ended ones keep their
+     summary so you can look back. */
+  callRunSession: null,
+  callRuns: [],
   /* ---- account lists ----
      Named groups of accounts, each with an industry — "AU MSPs", "SaaS
      founders". Membership lives on the account (listIds), the list itself
@@ -3356,6 +3362,7 @@ function migrate(saved) {
   s.copyDrafts = Array.isArray(s.copyDrafts) ? s.copyDrafts.map(normCopyDraft) : [];
   if (!Array.isArray(s.callSession)) s.callSession = [];
   if (!Array.isArray(s.accountLists)) s.accountLists = [];
+  if (!Array.isArray(s.callRuns)) s.callRuns = [];
   /* drop expired snoozes so the list can't grow forever */
   s.housekeepingSnoozes = s.housekeepingSnoozes.filter((x) => x && x.key && x.until && x.until > today());
   if (!Array.isArray(s.deletedIds)) s.deletedIds = [];
@@ -3497,6 +3504,13 @@ function mergeStates(localS, remoteS) {
     /* by id like everything else, so a list made on the phone isn't wiped by
        the laptop's older copy */
     accountLists: alive(unionById(localS.accountLists, remoteS.accountLists)),
+    callRuns: alive(unionById(localS.callRuns, remoteS.callRuns)),
+    /* the live session: whichever side ended it wins, so a run stopped on
+       the phone isn't revived by the laptop */
+    callRunSession: (() => {
+      const ended = new Set([...(localS.callRuns || []), ...(remoteS.callRuns || [])].map((r) => r && r.id));
+      return [remoteS.callRunSession, localS.callRunSession].find((x) => x && !ended.has(x.id)) || null;
+    })(),
     settings: { ...localS.settings, ...remoteS.settings },
     lastCheckinMonth:
       (remoteS.lastCheckinMonth || "") > (localS.lastCheckinMonth || "")
@@ -11247,6 +11261,33 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       return { ...st, callSession: cur.includes(contactId) ? cur.filter((x) => x !== contactId) : [...cur, contactId] };
     });
   const clearCallSession = () => mutate((st) => ({ ...st, callSession: [] }), "Run cleared");
+  /* ---- start / pause / stop ---- */
+  const [confirmStopRun, setConfirmStopRun] = useState(false);
+  const [runSummary, setRunSummary] = useState(null);
+  const runSession = state.callRunSession || null;
+  const startCallRun = () =>
+    mutate((st) => ({ ...st, callRunSession: { id: uid(), startedAt: new Date().toISOString(), status: "running", pausedAt: null, pausedMs: 0, pausedCount: 0, plannedCount: (st.callSession || []).length } }), "▶ Run started — calls you log now count toward it");
+  const pauseCallRun = () =>
+    mutate((st) => (st.callRunSession?.status === "running" ? { ...st, callRunSession: { ...st.callRunSession, status: "paused", pausedAt: new Date().toISOString(), pausedCount: (st.callRunSession.pausedCount || 0) + 1 } } : st), "⏸ Paused");
+  const resumeCallRun = () =>
+    mutate(
+      (st) =>
+        st.callRunSession?.status === "paused"
+          ? { ...st, callRunSession: { ...st.callRunSession, status: "running", pausedMs: (st.callRunSession.pausedMs || 0) + (Date.now() - new Date(st.callRunSession.pausedAt).getTime()), pausedAt: null } }
+          : st,
+      "▶ Resumed"
+    );
+  /* ends the session and files its summary — then shows it */
+  const stopCallRun = () => {
+    const sess = state.callRunSession;
+    if (!sess) return;
+    const endedAt = new Date().toISOString();
+    const closed = { ...sess, endedAt, ...(sess.status === "paused" && sess.pausedAt ? { pausedMs: (sess.pausedMs || 0) + (Date.now() - new Date(sess.pausedAt).getTime()), pausedAt: null } : {}), status: "ended" };
+    const run = { ...closed, summary: summarizeCallRun(state, closed, endedAt) };
+    mutate((st) => ({ ...st, callRunSession: null, callRuns: [run, ...(st.callRuns || [])].slice(0, 30) }), "■ Run ended");
+    setConfirmStopRun(false);
+    setRunSummary(run);
+  };
   /* Appends contacts to the run in the order given, skipping anyone already
      in it and anyone with no number you could dial. */
   const addContactsToRun = (contactIds, label) =>
@@ -11537,16 +11578,50 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           </div>
         ) : (
           <>
-            {/* the run you've built, when you've built one */}
-            {picked > 0 && (
+            {/* the run you've built, when you've built one — and while a run is
+                live, even after its last call has been made */}
+            {(picked > 0 || runSession) && (
               <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 12, padding: "10px 13px", marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
                 <div style={{ minWidth: 0 }}>
                   <div style={{ fontSize: 13, fontWeight: 700, color: C.amber }}>
                     ▶ This run — {picked} {picked === 1 ? "call" : "calls"}
+                    {picked === 0 ? " left" : ""}
                   </div>
-                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.45, marginTop: 1 }}>Work down from the top. Numbers are the order you picked.</div>
+                  {runSession ? (
+                    (() => {
+                      const so = summarizeCallRun(state, runSession);
+                      return (
+                        <div style={{ fontSize: 11, color: runSession.status === "paused" ? C.amber : C.green, lineHeight: 1.45, marginTop: 1, fontWeight: 700 }}>
+                          {runSession.status === "paused" ? "⏸ Paused" : "● Live"} · {fmtDuration(sessionActiveMs(runSession, clockNow.getTime()))} · {so.counts.calls} logged · {so.counts.connected} connected
+                          {so.counts.booked ? ` · ${so.counts.booked} booked` : ""}
+                        </div>
+                      );
+                    })()
+                  ) : (
+                    <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.45, marginTop: 1 }}>Work down from the top. Numbers are the order you picked. Start the run to get a summary at the end.</div>
+                  )}
                 </div>
-                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  {!runSession && picked > 0 && (
+                    <Btn onClick={startCallRun} style={{ padding: "6px 12px", fontSize: 11 }}>
+                      ▶ Start
+                    </Btn>
+                  )}
+                  {runSession?.status === "running" && (
+                    <Btn ghost onClick={pauseCallRun} style={{ padding: "6px 11px", fontSize: 11 }}>
+                      ⏸ Pause
+                    </Btn>
+                  )}
+                  {runSession?.status === "paused" && (
+                    <Btn onClick={resumeCallRun} style={{ padding: "6px 12px", fontSize: 11 }}>
+                      ▶ Resume
+                    </Btn>
+                  )}
+                  {runSession && (
+                    <Btn ghost onClick={() => setConfirmStopRun(true)} style={{ padding: "6px 11px", fontSize: 11, color: C.red, borderColor: C.red }}>
+                      ■ Stop
+                    </Btn>
+                  )}
                   {canWebSearch(state.settings) &&
                     (() => {
                       /* companies in the run whose zone is only a guess or unknown */
@@ -11569,6 +11644,36 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                     Clear
                   </Btn>
                 </div>
+              </div>
+            )}
+
+            {confirmStopRun && runSession && (
+              <div style={{ background: "rgba(248,113,113,0.08)", border: `1px solid ${C.red}`, borderRadius: 12, padding: "10px 13px", marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <div style={{ fontSize: 12, color: C.ink }}>
+                  End this run? {summarizeCallRun(state, runSession).counts.calls} calls logged in {fmtDuration(sessionActiveMs(runSession, clockNow.getTime()))}. You&apos;ll get the summary next.
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <Btn ghost onClick={() => setConfirmStopRun(false)} style={{ padding: "6px 11px", fontSize: 11 }}>
+                    Keep going
+                  </Btn>
+                  <Btn color={C.red} onClick={stopCallRun} style={{ padding: "6px 12px", fontSize: 11 }}>
+                    End run &amp; summarise
+                  </Btn>
+                </div>
+              </div>
+            )}
+            {(state.callRuns || []).length > 0 && !runSession && (
+              <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>
+                Past runs:{" "}
+                {(state.callRuns || []).slice(0, 5).map((r) => (
+                  <button
+                    key={r.id}
+                    onClick={() => setRunSummary(r)}
+                    style={{ background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 10, fontSize: 10, padding: "2px 8px", marginRight: 4, cursor: "pointer" }}
+                  >
+                    {new Date(r.startedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })} · {r.summary?.counts?.calls || 0} calls
+                  </button>
+                ))}
               </div>
             )}
 
@@ -12017,6 +12122,33 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             );
           })}
         </div>
+      )}
+
+      {runSummary && (
+        <RunSummaryModal
+          run={runSummary}
+          onClose={() => setRunSummary(null)}
+          canAsk={!!agentControl.current}
+          onEmailFollowUps={(ids) => {
+            const n = applyAgentActions(state, ids.map((id) => ({ type: "add_followup", id, date: today(), channel: "Cold email" }))).applied;
+            mutate((st) => {
+              const r = applyAgentActions(st, ids.map((id) => ({ type: "add_followup", id, date: today(), channel: "Cold email" })));
+              let next = r.st;
+              r.touchedAccounts.forEach((id) => {
+                next = reconcileAccountApplications(next, id, (st.accounts || []).find((a) => a.id === id)?.contacts || []);
+              });
+              return next;
+            }, `📧 ${n} email follow-up${n === 1 ? "" : "s"} due today`);
+          }}
+          onAskAssistant={() => {
+            const sm = runSummary.summary;
+            agentControl.current?.ask(
+              `Here's my call run summary (${sm.counts.calls} calls, ${sm.counts.connected} connected, ${sm.counts.booked} booked). For each person, suggest the next step and propose the changes (follow-ups, temperature, tags, statuses). Calls: ${JSON.stringify(sm.calls.map((c) => ({ id: c.id, name: c.name, company: c.company, outcome: c.outcome, connected: c.connected, stage: c.stage, wantsEmail: c.wantsEmail, note: c.note, callback: c.callback })))}`
+            );
+            setRunSummary(null);
+            setAgentOpen(true);
+          }}
+        />
       )}
 
       {/* ---- CRM assistant ---- */}
@@ -16659,6 +16791,203 @@ const findAccount = (st, ref) => {
 };
 
 /* ============================================================
+   CALL-RUN SESSIONS
+
+   Start, pause, stop. A session doesn't log anything itself — the calls do
+   that, each stamped with its exact time — so the summary is simply every
+   call logged between start and stop, wherever it was logged from (the
+   queue, a contact card, an application). Pauses only stop the clock.
+   ============================================================ */
+const sessionActiveMs = (s, now = Date.now()) => {
+  if (!s?.startedAt) return 0;
+  const end = s.endedAt ? new Date(s.endedAt).getTime() : now;
+  const pausedNow = s.status === "paused" && s.pausedAt ? end - new Date(s.pausedAt).getTime() : 0;
+  return Math.max(0, end - new Date(s.startedAt).getTime() - (s.pausedMs || 0) - pausedNow);
+};
+const fmtDuration = (ms) => {
+  const m = Math.round(ms / 60000);
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+};
+/* Every call logged inside the session window, with what it told us. */
+function summarizeCallRun(st, session, endedAt = new Date().toISOString()) {
+  const from = session.startedAt;
+  const calls = [];
+  const take = (rec, kind, acc) =>
+    (rec.touchpoints || []).forEach((t) => {
+      if (!isCallTouch(t) || !t.at || t.at < from || t.at > endedAt) return;
+      const info = callInfo(t);
+      const next = nextFollowUpOn(rec, "Phone call");
+      calls.push({
+        id: rec.id,
+        kind,
+        name: kind === "contact" ? rec.name || "Unnamed" : rec.contact || rec.role || "Lead",
+        company: kind === "contact" ? acc?.company || "" : rec.company || "",
+        at: t.at,
+        outcome: info.outcome,
+        connected: info.connected,
+        stage: info.stage,
+        wantsEmail: !!t.wantsEmail,
+        temperature: t.temperature || "",
+        note: (t.note || "").split(" — ").slice(1).join(" — "),
+        callback: next && !next.done ? next.date : "",
+        email: rec.email || "",
+      });
+    });
+  (st.accounts || []).forEach((acc) => (acc.contacts || []).forEach((c) => take(c, "contact", acc)));
+  (st.applications || []).filter((a) => !a.fromAccountContact).forEach((a) => take(a, "lead", null));
+  calls.sort((a, b) => a.at.localeCompare(b.at));
+  const by = (fn) => calls.filter(fn);
+  const groups = [
+    { key: "booked", icon: "📅", label: "Booked a meeting", tone: "green", items: by((c) => c.stage === "booked") },
+    { key: "email", icon: "📧", label: "Asked for an email — send one", tone: "blue", items: by((c) => c.wantsEmail) },
+    { key: "interest", icon: "✨", label: "Showed real interest", tone: "green", items: by((c) => c.stage === "interest") },
+    { key: "pitched", icon: "🎯", label: "Heard the pitch, then it ended", tone: "amber", items: by((c) => c.stage === "pitch" || c.stage === "objection") },
+    { key: "callback", icon: "🔁", label: "Asked to call back", tone: "blue", items: by((c) => c.outcome === "callback") },
+    { key: "qualified", icon: "🎯", label: "Not now, but qualified (call in 60 days)", tone: "amber", items: by((c) => c.outcome === "qualified") },
+    { key: "early", icon: "✋", label: "Hung up early (opener or before)", tone: "muted", items: by((c) => c.connected && (c.stage === "nostart" || c.stage === "opener")) },
+    { key: "no", icon: "✖", label: "Not interested", tone: "red", items: by((c) => c.outcome === "notinterested") },
+    { key: "unreached", icon: "📵", label: "Didn't reach (no answer, voicemail, gatekeeper)", tone: "muted", items: by((c) => !c.connected && ["noanswer", "voicemail", "gatekeeper"].includes(c.outcome)) },
+    { key: "dead", icon: "☠", label: "Wrong number / can't be reached", tone: "red", items: by((c) => ["wrongnumber", "cannotcontact"].includes(c.outcome)) },
+  ].filter((g) => g.items.length);
+  const connected = calls.filter((c) => c.connected).length;
+  return {
+    calls,
+    groups,
+    counts: { calls: calls.length, people: new Set(calls.map((c) => c.id)).size, connected, booked: calls.filter((c) => c.stage === "booked").length, emails: calls.filter((c) => c.wantsEmail).length },
+    activeMs: sessionActiveMs({ ...session, endedAt }),
+  };
+}
+
+/* ============================================================
+   SEGMENT SEARCH ("find me coaching leads")
+
+   A search that cleans up as it goes:
+     1. look at what's already known — segment tags on people, the
+        company's industry — and take those as matches
+     2. companies nobody has classified yet (no industry) get researched on
+        the web, with the question "is this a <segment> business?"
+     3. research proposes, for every company it looked at, its industry and
+        segment tags (so the next search finds them from tags alone), and the
+        segment tag on the ones that match
+     4. the leads — already-known plus newly found — come back as one list
+   ============================================================ */
+const segmentWords = (seg) =>
+  Array.from(new Set([seg?.segment, ...(Array.isArray(seg?.match) ? seg.match : [])].map(normTag).filter(Boolean)));
+/* does this company already say it's in the segment? */
+const accountInSegment = (acc, words) => {
+  const ind = (acc.industry || "").toLowerCase();
+  /* a short word only matches a tag exactly — "it" mustn't hit "cybersecurity" */
+  const tagHit = liveContacts(acc).some((c) => tagsOf(c).some((t) => words.some((w) => t === w || (w.length >= 4 && t.includes(w)))));
+  return tagHit || words.some((w) => ind.includes(w));
+};
+function segmentPools(st, seg) {
+  const words = segmentWords(seg);
+  const sc = seg?.scope || {};
+  const scoped = Object.keys(sc).some((k) => sc[k] !== undefined && sc[k] !== null && sc[k] !== "");
+  const ids = scoped ? researchPool(st, { ...sc, noIndustry: false }) : (st.accounts || []).filter(isAccountOpen).map((a) => a.id);
+  const accs = ids.map((id) => (st.accounts || []).find((a) => a.id === id)).filter(Boolean);
+  const known = accs.filter((a) => accountInSegment(a, words));
+  /* classified as something else (has an industry, no match) is left alone;
+     only the blank ones are worth a web lookup */
+  const unclassified = accs.filter((a) => !accountInSegment(a, words) && !(a.industry || "").trim());
+  const leads = scoped ? [] : (st.applications || []).filter((a) => !a.fromAccountContact && !a.archivedAt && isOpenApp(a) && (tagsOf(a).some((t) => words.some((w) => t.includes(w))) || words.some((w) => (a.industry || "").toLowerCase().includes(w))));
+  return { words, known, unclassified, leads };
+}
+const peopleAt = (accs) => accs.flatMap((a) => liveContacts(a).filter((c) => c.status !== "closed").map((c) => c.id));
+
+/* ============================================================
+   READ TOOLS
+
+   The assistant's way to LOOK before it answers. A digest of the CRM fits
+   in every request, but not everyone's notes and history — so instead of
+   answering from the digest (and falling back on something generic when it
+   doesn't hold the answer), the model asks for exactly the records it needs
+   and gets them back in full, then answers. Up to five rounds per question.
+   These only read; nothing here changes the CRM.
+   ============================================================ */
+const READ_TOOLS = ["query", "get", "stats"];
+const READ_TOOL_DOC = `READ TOOLS — use these to look at records before answering. Reply with {"tool_calls":[ … ]} (no "reply" needed) and you'll get the results back, then answer or call more tools (max 5 rounds):
+- {"tool":"query","criteria":{ same as find },"limit":40}   → full detail (notes, every recent touch point with its note, calls and what was said, follow-ups, email requests) for everyone matching, plus the total count
+- {"tool":"get","ids":["<contact, lead or account id>"]}   → the same full detail for specific records (an account returns its notes and each contact)
+- {"tool":"stats","criteria":{ same as find },"by":"status"|"temperature"|"lastOutcome"|"lastStage"|"company"|"industry"|"list"|"timezone"|"callWindow"|"tag"}   → counts per group`;
+function accountDetail(st, acc) {
+  const lists = (acc.listIds || []).map((id) => (st.accountLists || []).find((l) => l.id === id)).filter(Boolean).map(listName);
+  return [
+    `### ${acc.id} | account | ${acc.company || "?"} | industry: ${acc.industry || "-"} | status: ${acc.status || "open"} | tz: ${acc.timezone || "-"}${lists.length ? ` | lists: ${lists.join(", ")}` : ""}`,
+    (acc.notes || "").trim() ? `account notes: ${clip(acc.notes, 500)}` : "",
+    ...liveContacts(acc)
+      .slice(0, 8)
+      .map((c) => prospectDetail(st, c.id)),
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+function groupValue(st, p, by) {
+  const c = p.rec;
+  switch (by) {
+    case "status":
+      return c.status || "not contacted";
+    case "temperature":
+      return c.temperature || "none";
+    case "lastOutcome":
+      return callStanding(c).lastOutcome || "never called";
+    case "lastStage":
+      return callStanding(c).talkStage || "no conversation";
+    case "company":
+      return p.company || "?";
+    case "industry":
+      return p.industry || "no industry";
+    case "list":
+      return p.acc && (p.acc.listIds || []).length ? (p.acc.listIds || []).map((id) => listName((st.accountLists || []).find((l) => l.id === id))).join(" + ") : "no list";
+    case "timezone":
+      return (p.kind === "contact" ? callWindowOf(c, p.acc).tz : "") || "unknown";
+    case "callWindow":
+      return p.kind === "contact" ? callWindowOf(c, p.acc).window : "unknown";
+    case "tag":
+      return tagsOf(c).join(", ") || "untagged";
+    default:
+      return "all";
+  }
+}
+/* one tool call → { label for the chat, text for the model } */
+function runReadTool(st, tc) {
+  const tool = tc?.tool || tc?.type;
+  if (tool === "query") {
+    const ppl = findPeople(st, { includeClosed: true, ...(tc.criteria || {}) });
+    const lim = Math.max(1, Math.min(60, Math.round(num(tc.limit) || 40)));
+    const shown = ppl.slice(0, lim);
+    return {
+      label: `🔎 Looked up ${findSummary(tc.criteria || {}, st)} → ${ppl.length} ${ppl.length === 1 ? "person" : "people"}${ppl.length > shown.length ? ` (read the first ${shown.length})` : ""}`,
+      text: `query ${JSON.stringify(tc.criteria || {})} → ${ppl.length} matching${ppl.length > shown.length ? `, showing ${shown.length} — narrow the criteria to see the rest` : ""}:\n${shown.map((x) => prospectDetail(st, x.id)).join("\n\n") || "(none)"}`,
+    };
+  }
+  if (tool === "get") {
+    const ids = Array.isArray(tc.ids) ? tc.ids.slice(0, 30) : tc.id ? [tc.id] : [];
+    const blocks = ids.map((id) => {
+      const r = locateRecord(st, id);
+      if (!r) return `### ${id} | not found`;
+      return r.kind === "account" ? accountDetail(st, r.acc) : prospectDetail(st, id);
+    });
+    return { label: `📄 Read ${ids.length} record${ids.length === 1 ? "" : "s"} in full`, text: `get ${JSON.stringify(ids)}:\n${blocks.join("\n\n") || "(nothing asked for)"}` };
+  }
+  if (tool === "stats") {
+    const ppl = findPeople(st, { includeClosed: true, ...(tc.criteria || {}) });
+    const by = String(tc.by || "status");
+    const counts = {};
+    ppl.forEach((p) => {
+      const v = groupValue(st, p, by);
+      counts[v] = (counts[v] || 0) + 1;
+    });
+    const rows = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    return {
+      label: `📊 Counted ${ppl.length} by ${by}`,
+      text: `stats by ${by} over ${ppl.length} people (${findSummary(tc.criteria || {}, st)}):\n${rows.map(([kk, v]) => `${kk}: ${v}`).join("\n") || "(none)"}`,
+    };
+  }
+  return { label: `⚠ Unknown tool ${tool}`, text: `Unknown tool "${tool}". Use query, get or stats.` };
+}
+
+/* ============================================================
    CRM ASSISTANT
 
    A chat that can read the CRM and propose changes to it. It never writes on
@@ -16677,6 +17006,11 @@ const FIND_DOC = `{"type":"find","criteria":{ ...any of these, all must match...
   hasPhone / hasEmail / hasLinkedIn: true|false
   callWindow: "business"|"after"|"callable"|"closed"|"unknown"  (their local time RIGHT NOW, from this device's clock)
   timezone: "New_York" (their time zone contains this)
+  hasChannels: ["call","email","linkedin"]  (has touch points on ALL of these: call, email, linkedin, social, text, meeting)
+  askedForEmail: true  (on a call they asked to be emailed — at any time)
+  emailedAfterAsk: true|false  (after asking, an email was / wasn't sent)
+  noteText: "words"  (in your notes or any touch-point note only)
+  touchedWithinDays: N   notTouchedForDays: N  (last touch point of any kind)
   dueFollowUp: true  (has a follow-up due today or overdue — exactly the people in the app's DUE count)
   overdueMinDays / overdueMaxDays: N  (their oldest due follow-up was due at least / at most N days ago; implies dueFollowUp)
   who: "contacts" | "leads" | "all" (default all)   includeClosed: true (default false)
@@ -16699,6 +17033,7 @@ const AGENT_ACTION_DOC = `Actions (use ids exactly as they appear in the data):
 - ${CALL_CRITERIA_DOC}
   Use add_to_run_where whenever the user describes WHO they want to call by a quality (warmth, attempts, outcome, stage, touches, list…) rather than naming people. The app finds the matches itself — don't list ids for it.
 - {"type":"note","id":"<account, contact or lead id>","text":"short note"}
+${READ_TOOL_DOC}
 CALL RUN (positions as numbered on the Calls page, listed under CALL RUN in the data):
 - {"type":"remove_from_run","positions":"31-36"}  or  {"type":"remove_from_run","contactIds":["<id>"]}   (positions also as [31,32,33] or "31,33")
 - {"type":"clear_run"}
@@ -16720,6 +17055,8 @@ ACCOUNTS & CONTACTS:
 - {"type":"remove_followups","id":"<contact or lead id>","scope":"due"|"all_pending","track":"email"|"call"|"any"}   ("due" = pending and due today or earlier; ticked follow-ups are history and are never removed)
 - {"type":"start_review","focus":"what to judge, in the user's words","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true}}   (all scope keys optional)
   Use start_review when the user wants you to read their notes, judge who is worth following up, or asks about anything the CRM DATA doesn't show (what was said, notes, touch-point details). The app then sends you full notes and history 50 prospects at a time. It changes nothing and runs straight away.
+- {"type":"segment_search","segment":"coaching","match":["coach","life coach","executive coaching"],"tag":"coaching","scope":{ optional: "lists", "criteria", "accountIds", "inRun" },"research":true,"addToList":"optional list name"}
+  For ANY "find/show me <type> leads" request (coaching, cybersecurity, dentists, MSPs…): checks tags and industry first, then researches the companies nobody has classified yet, proposes their industry + segment tags (CRM hygiene), tags the matches, and lists the leads. Put synonyms in "match". Leave scope out to cover every open account.
 - {"type":"start_research","mode":"hours","scope":{"inRun":true,"onlyMissingTz":true}}   (CALLING HOURS: finds each company's HQ, decides the time zone to call on — favouring the HQ over the person's number — and opening hours. 10 per batch, no industry/tags. Use this for any "time zone / calling hours / when can I call" research.)
 - {"type":"start_research","question":"what must be true, e.g. based in New York AND an MSP or IT services company","scope":{"inRun":true,"criteria":{ same as find, e.g. {"phonePrefix":"+1"} },"tzUnknown":true,"onlyMissingTz":true,"noIndustry":true,"lists":["list"],"search":"company name","accountIds":["<account id>"]},"then":{"addToList":"US Tech List","removeNonMatchesFromList":"US Tech List","tag":["ny-msp"],"setIndustry":true}}
   Web research on companies, 8 at a time, running through every batch on its own. Only when WEB SEARCH is available.
@@ -17222,15 +17559,18 @@ function parseAgentReply(raw) {
         const all = Array.isArray(j.actions) ? j.actions : [];
         const review = all.find((x) => x?.type === "start_review") || null;
         const research = all.find((x) => x?.type === "start_research") || null;
+        const segment = all.find((x) => x?.type === "segment_search" && String(x.segment || "").trim()) || null;
         const finds = all.filter((x) => x?.type === "find");
-        const actions = all.filter((x) => !["start_review", "start_research", "find"].includes(x?.type));
-        return { reply: String(j.reply || "").trim() || (actions.length ? "Here's what I'd change:" : review ? "Reviewing…" : research ? "Researching…" : finds.length ? "Here's what I found:" : ""), actions, review, research, finds };
+        /* read tools, whether sent as tool_calls or mixed into actions */
+        const tools = [...(Array.isArray(j.tool_calls) ? j.tool_calls : []), ...all.filter((x) => READ_TOOLS.includes(x?.type))].filter((x) => READ_TOOLS.includes(x?.tool || x?.type));
+        const actions = all.filter((x) => !["start_review", "start_research", "find", "segment_search", ...READ_TOOLS].includes(x?.type));
+        return { reply: String(j.reply || "").trim() || (actions.length ? "Here's what I'd change:" : review ? "Reviewing…" : research ? "Researching…" : segment ? "Searching…" : finds.length ? "Here's what I found:" : ""), actions, review, research, finds, tools, segment };
       }
     } catch (e) {
       /* fall through to plain text */
     }
   }
-  return { reply: text, actions: [], review: null, research: null, finds: [] };
+  return { reply: text, actions: [], review: null, research: null, finds: [], tools: [], segment: null };
 }
 
 const AGENT_SYSTEM = `You are the CRM assistant inside Flight Deck, a job-search and outreach CRM. You help organise accounts, contacts and leads: tagging, lead temperature, account lists by industry or segment, industries, notes, and building call runs. You answer questions about the data too.
@@ -17241,6 +17581,9 @@ Reply with ONE JSON object and nothing else:
 ${AGENT_ACTION_DOC}
 
 Rules:
+- "Find/get/show me <segment> leads" → segment_search, not find. It runs on its own and reports back.
+- Answer the user's actual request — never a generic reply. If the answer depends on notes, what was said on calls, touch-point details, or anyone not obvious from the CRM DATA table, use the read tools (query / get / stats) FIRST, then answer from what they return. Interpret loose wording sensibly ("prospects I sent an email to when I called them" = people who asked for an email on a call, or who were both called and emailed — query both if unsure and say which you used).
+- When you need tools, reply ONLY with {"tool_calls":[…]}. When you're done, reply with {"reply": …, "actions": [ … ]}. Quote names, dates and the user's own note wording in the reply; keep it skimmable (short lines, one person per line when listing).
 - Only use ids that appear in the CRM data. Never invent an id. If you can't find something, say so in reply and propose no action for it.
 - Propose actions only when the user asks for changes. For questions, answer in reply with "actions": [].
 - The user reviews and approves every action before it applies, so propose the full set in one go (create a list and add to it in the same reply).
@@ -17254,7 +17597,7 @@ Rules:
 - "Their local time" is worked out from THIS device's clock converted into each person's time zone. The tz column in the data gives each contact's zone, their local time now and the window (business / after / closed / unknown). For "who can I call now", use criteria callWindow:"callable". For companies whose zone is unknown or a guess, use start_research — it finds HQ location, time zone and opening hours.
 - You can change statuses, nurture plans, LinkedIn status, contact details, call-run order, log what the user did, and create accounts and contacts. Only log or tick something the user says actually happened.
 - You cannot delete or archive accounts, contacts or leads, or change Settings. If asked, say the user needs to do that themselves.
-- Keep reply under 120 words. Mention counts ("tagged 12 contacts") rather than listing everyone.`;
+- Keep replies tight. For lists of people, one line each: name (company) — the specific thing from their notes. If more than 25, give the count and the most relevant 25.`;
 
 /* ---- finding people ----
    One search over every contact and lead, for "everyone with a +1 number",
@@ -17298,6 +17641,25 @@ function findPeople(st, crit = {}) {
       if (!d) return false;
       if (num(k.overdueMinDays) != null && d.overdueDays < num(k.overdueMinDays)) return false;
       if (num(k.overdueMaxDays) != null && d.overdueDays > num(k.overdueMaxDays)) return false;
+    }
+    if (arr(k.hasChannels).length) {
+      const lanes = new Set((p.rec.touchpoints || []).map((t) => laneOf(t.channel)));
+      if (!arr(k.hasChannels).every((l) => lanes.has(l === "phone" ? "call" : l))) return false;
+    }
+    if (yes(k.askedForEmail) && !(p.rec.emailRequested || (p.rec.touchpoints || []).some((t) => t.wantsEmail))) return false;
+    if (k.emailedAfterAsk !== undefined && k.emailedAfterAsk !== "" && k.emailedAfterAsk !== null) {
+      if (!p.rec.emailRequested) return false;
+      if (yes(k.emailedAfterAsk) === emailRequestOpen(p.rec)) return false;
+    }
+    if (k.noteText) {
+      const nt = String(k.noteText).toLowerCase();
+      if (![p.rec.notes, ...(p.rec.touchpoints || []).map((t) => t.note)].filter(Boolean).join(" ").toLowerCase().includes(nt)) return false;
+    }
+    if (num(k.touchedWithinDays) != null || num(k.notTouchedForDays) != null) {
+      const last = (p.rec.touchpoints || []).map((t) => t.date).filter(Boolean).sort().pop();
+      const ago = last ? Math.round((new Date(today()) - new Date(last)) / 86400000) : Infinity;
+      if (num(k.touchedWithinDays) != null && ago > num(k.touchedWithinDays)) return false;
+      if (num(k.notTouchedForDays) != null && ago < num(k.notTouchedForDays)) return false;
     }
     if (k.phonePrefix && !phoneMatches(p.phone, String(k.phonePrefix).startsWith("+") ? k.phonePrefix : `+${k.phonePrefix}`)) return false;
     if (k.phoneContains && !phoneMatches(p.phone, String(k.phoneContains).replace(/^\+/, ""))) return false;
@@ -17370,6 +17732,13 @@ function findSummary(crit = {}, st = { accountLists: [] }) {
   });
   if (k.who && k.who !== "all") parts.push(`${k.who} only`);
   if (k.dueFollowUp === true || k.dueFollowUp === "true") parts.push("follow-up due");
+  if (arr(k.hasChannels).length) parts.push(`touched by ${arr(k.hasChannels).join(" + ")}`);
+  if (k.askedForEmail === true || k.askedForEmail === "true") parts.push("asked for an email on a call");
+  if (k.emailedAfterAsk === true || k.emailedAfterAsk === "true") parts.push("emailed after asking");
+  if (k.emailedAfterAsk === false || k.emailedAfterAsk === "false") parts.push("still waiting on that email");
+  if (k.noteText) parts.push(`notes mention “${k.noteText}”`);
+  if (num(k.touchedWithinDays) != null) parts.push(`touched in the last ${num(k.touchedWithinDays)} days`);
+  if (num(k.notTouchedForDays) != null) parts.push(`not touched for ${num(k.notTouchedForDays)}+ days`);
   if (num(k.overdueMinDays) != null || num(k.overdueMaxDays) != null)
     parts.push(num(k.overdueMaxDays) == null ? `overdue ${num(k.overdueMinDays)}+ days` : `overdue ${num(k.overdueMinDays) ?? 0}–${num(k.overdueMaxDays)} days`);
   const rest = criteriaSummary(st, { ...k, text: undefined, search: undefined });
@@ -17558,10 +17927,12 @@ function parseResearchReply(raw, st, batchIds, { question = "", then = {}, hours
     if (!acc || !r.industry || /^(unknown|n\/a|unclear)$/i.test(r.industry)) return;
     const unsure = r.confidence === "low";
     if ((acc.industry || "").trim().toLowerCase() !== r.industry.toLowerCase()) actions.push({ type: "set_industry", accountId: acc.id, industry: r.industry, ...(unsure ? { _unchecked: true } : {}) });
-    if (question) return; /* with a question, industry only — the tags are the user's call */
+    if (question && !t.tagAll) return; /* with a question, industry only — unless it's a hygiene pass */
     const tags = r.tags.length ? r.tags : [normTag(r.industry)];
     liveContacts(acc).forEach((c) => {
-      const add = tags.filter((t) => !tagsOf(c).includes(t));
+      /* skip tags already proposed for this person above (the segment tag) */
+      const already = new Set(actions.filter((x) => x.type === "tag" && x.id === c.id).flatMap((x) => x.add || []));
+      const add = tags.filter((tg) => !tagsOf(c).includes(tg) && !already.has(tg));
       if (add.length) actions.push({ type: "tag", id: c.id, add, ...(unsure ? { _unchecked: true } : {}) });
     });
   });
@@ -17635,8 +18006,14 @@ function prospectDetail(st, id) {
   if ((x.notes || "").trim()) lines.push(`my notes: ${clip(x.notes, 500)}`);
   if (r.kind === "contact" && (r.acc.notes || "").trim()) lines.push(`account notes: ${clip(r.acc.notes, 300)}`);
   if (r.kind === "contact" && (x.hook || "").trim()) lines.push(`hook: ${clip(x.hook, 160)}`);
-  const tps = [...(x.touchpoints || [])].sort((a, b) => (a.date || "").localeCompare(b.date || "")).slice(-8);
-  if (tps.length) lines.push(`touches (oldest→newest): ${tps.map((t) => `${t.date} ${t.channel || "?"}${sentOf(t).length ? ` [sent ${sentOf(t).join("+")}]` : ""}${t.engage ? " [engaged a post]" : ""}${(t.note || "").trim() ? `: ${clip(t.note, 140)}` : ""}`).join(" || ")}`);
+  const tps = [...(x.touchpoints || [])].sort((a, b) => (a.at || a.date || "").localeCompare(b.at || b.date || "")).slice(-12);
+  if (tps.length)
+    lines.push(
+      `touches (oldest→newest): ${tps
+        .map((t) => `${t.date} ${t.channel || "?"}${isCallTouch(t) ? ` [${callConnected(t) ? "connected" : "not reached"}]` : ""}${t.wantsEmail ? " [ASKED FOR AN EMAIL on this call]" : ""}${sentOf(t).length ? ` [sent ${sentOf(t).join("+")}]` : ""}${t.engage ? " [engaged a post]" : ""}${(t.note || "").trim() ? `: ${clip(t.note, 160)}` : ""}`)
+        .join(" || ")}`
+    );
+  if (x.emailRequested) lines.push(`email request: asked ${x.emailRequested} — ${emailRequestOpen(x) ? "NOT sent yet" : "emailed since"}`);
   return lines.join("\n");
 }
 const REVIEW_VERDICTS = [
@@ -17732,6 +18109,7 @@ const AGENT_STARTERS = [
   "Read my notes and tell me who's actually worth following up",
   "Organise my accounts into lists by industry",
   "Find everyone with a +1 number",
+  "Find me coaching leads",
   "Take numbers 31–36 out of my call run",
   "Who can I call right now? Put them first in my run",
   "Research the time zones of companies I can't place",
@@ -17781,7 +18159,7 @@ function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo
       push(null, { role: "user", text: "🕐 Find time zones and opening hours for the companies in my call run" });
       await runResearch({ mode: "hours", scope: { inRun: true, onlyMissingTz: true } });
     });
-  if (controlRef) controlRef.current = { stop, researchRunHours, busy: !!busy };
+  if (controlRef) controlRef.current = { stop, researchRunHours, busy: !!busy, ask: (text) => send(text) };
   useEffect(() => {
     if (open) endRef.current?.scrollIntoView({ block: "end" });
   }, [msgs.length, busy, open]);
@@ -17874,7 +18252,7 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
     const hoursOnly = research.mode === "hours";
     const bs = hoursOnly ? 10 : RESEARCH_BATCH;
     const batch = poolIds.slice(offset, offset + bs).filter((id) => (state.accounts || []).some((a) => a.id === id));
-    const r = { focus: research.focus || (hoursOnly ? "Where is each company based, and when is it open?" : "What industry is each company in? Tag them by it."), mode: research.mode || "", batchSize: bs, question: String(research.question || "").trim(), then: research.then || {}, scope: research.scope || {}, poolIds, offset };
+    const r = { focus: research.focus || (hoursOnly ? "Where is each company based, and when is it open?" : "What industry is each company in? Tag them by it."), jobId: research.jobId || "", segment: research.segment || null, mode: research.mode || "", batchSize: bs, question: String(research.question || "").trim(), then: research.then || {}, scope: research.scope || {}, poolIds, offset };
     if (!batch.length) {
       push(null, {
         role: "assistant",
@@ -17944,16 +18322,19 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
       if (offset + bs < poolIds.length) {
         if (stopRef.current) {
           push(null, { role: "assistant", text: `Stopped after ${range}. “Research next” picks up from here.` });
-          notify("done", `Research stopped after ${range}`);
+          if (r.segment) finishSegment(r, true);
+          else notify("done", `Research stopped after ${range}`);
         } else await runResearch({ ...r, offset: offset + bs });
       } else {
         if (offset > 0) push(null, { role: "assistant", text: `✓ Research finished — all ${poolIds.length} companies done.` });
-        notify("done", `Research finished — ${poolIds.length} companies looked up${r.question ? "; matches are ready to approve" : hoursOnly ? "; time zones are ready to approve" : ""}`);
+        if (r.segment) finishSegment(r);
+        else notify("done", `Research finished — ${poolIds.length} companies looked up${r.question ? "; matches are ready to approve" : hoursOnly ? "; time zones are ready to approve" : ""}`);
       }
     } catch (e) {
       if (isAbort(e)) {
         push(null, { role: "assistant", stopped: true, text: `■ Stopped during ${range}.`, retry: { kind: "research", research: r } });
-        notify("done", `Research stopped during ${range}`);
+        if (r.segment) finishSegment(r, true);
+        else notify("done", `Research stopped during ${range}`);
         return;
       }
       push(null, { role: "assistant", error: true, text: `⚠ Research of ${range} failed: ${e.message || "no reply"}`, retry: { kind: "research", research: r } });
@@ -17961,31 +18342,98 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
     }
   };
 
+  /* the leads a segment search ended with: known ones plus research matches */
+  const finishSegment = (r, partial) => {
+    const st = stateRef.current;
+    const seg = r.segment;
+    const matchedIds = new Set(
+      msgsRef.current
+        .filter((m) => m.kind === "research" && m.research?.jobId === r.jobId)
+        .flatMap((m) => (m.results || []).filter((x) => x.matches === true).map((x) => x.accountId))
+    );
+    const knownIds = new Set(seg.knownIds || []);
+    const accs = (st.accounts || []).filter((a) => knownIds.has(a.id) || matchedIds.has(a.id));
+    const ids = [...peopleAt(accs), ...(seg.leadIds || [])];
+    const fromResearch = accs.filter((a) => matchedIds.has(a.id) && !knownIds.has(a.id)).length;
+    push(null, {
+      role: "assistant",
+      kind: "found",
+      criteria: { segment: seg.segment },
+      ids,
+      text: `🎯 ${seg.segment} leads${partial ? " (so far)" : ""} — ${ids.length} ${ids.length === 1 ? "person" : "people"} at ${accs.length} ${accs.length === 1 ? "company" : "companies"}: ${knownIds.size} already tagged${fromResearch ? `, ${fromResearch} found by research — approve the research changes above to tag them and set their industry` : ""}.`,
+    });
+    notify("done", `${seg.segment} leads ready — ${ids.length} people at ${accs.length} companies`);
+  };
+  const runSegment = async (seg) => {
+    const st = stateRef.current;
+    const { words, known, unclassified, leads } = segmentPools(st, seg);
+    const tagWord = normTag(seg.tag || seg.segment);
+    const segInfo = { segment: String(seg.segment).trim(), knownIds: known.map((a) => a.id), leadIds: leads.map((a) => a.id) };
+    push(null, {
+      role: "assistant",
+      kind: "tool",
+      text: `🏷 Checked tags and industry for “${words.join("”, “")}” → ${known.length} ${known.length === 1 ? "company already matches" : "companies already match"}${leads.length ? `, plus ${leads.length} lead${leads.length === 1 ? "" : "s"}` : ""}\n${unclassified.length ? `🌐 ${unclassified.length} ${unclassified.length === 1 ? "company has" : "companies have"} no industry yet — ${seg.research === false ? "not researching (asked not to)" : canSearch ? "researching them now" : "web search isn't available, so they're skipped"}` : "Every company in scope is already classified."}`,
+    });
+    if (seg.research === false || !canSearch || !unclassified.length) {
+      finishSegment({ segment: segInfo, jobId: "none" });
+      return;
+    }
+    await runResearch({
+      focus: `${segInfo.segment} leads — classify and tag`,
+      question: `Is this company a ${segInfo.segment} business (${words.join(", ")})?`,
+      then: { tag: [tagWord], setIndustry: true, tagAll: true, ...(seg.addToList ? { addToList: seg.addToList } : {}) },
+      scope: { accountIds: unclassified.map((a) => a.id) },
+      poolIds: unclassified.map((a) => a.id),
+      jobId: uid(),
+      segment: segInfo,
+    });
+  };
+
   const runChat = async (history) => {
     const state = stateRef.current;
     try {
-      const out = await withRetry(
+      /* Each round: ask the model; if it wants to look something up, run the
+         read tools against the live CRM, hand the results back and ask again.
+         Up to five rounds, then it must answer with what it has. */
+      let scratch = "";
+      let out = null;
+      for (let round = 0; round <= 5; round++) {
+        const lastRound = round === 5;
+        out = await withRetry(
         async () => {
           const convo = history
             .slice(-10)
             .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.error ? "(failed request)" : m.text}${m.kind === "found" ? ` [find criteria ${JSON.stringify(m.criteria)} — reuse them for tag_where / add_to_run_where]` : ""}${m.actions?.length ? ` [proposed ${m.actions.length} actions${m.applied ? `, ${m.applied} applied` : ", not applied"}]` : ""}`)
             .join("\n");
-          const raw = await callAI({ ...ai, signal: abortRef.current?.signal, system: AGENT_SYSTEM, user: `WEB SEARCH: ${canSearch ? "available (use start_research)" : "not available with the current AI provider"}\n\nCRM DATA:\n${crmDigest(state)}\n\nCONVERSATION:\n${convo}\n\nReply to the last user message as JSON.` });
+          const raw = await callAI({
+            ...ai,
+            signal: abortRef.current?.signal,
+            system: AGENT_SYSTEM,
+            user: `WEB SEARCH: ${canSearch ? "available (use start_research)" : "not available with the current AI provider"}\n\nCRM DATA:\n${crmDigest(stateRef.current)}\n\nCONVERSATION:\n${convo}${scratch}\n\n${lastRound ? "No more tool rounds — give your final JSON answer now from what you have." : "Reply to the last user message as JSON (tool_calls to look things up, or the final answer)."}`,
+          });
           const parsed = parseAgentReply(raw);
-          if (!parsed.reply && !parsed.actions.length && !parsed.review && !parsed.research && !parsed.finds.length) throw new Error("Empty reply.");
+          if (!parsed.reply && !parsed.actions.length && !parsed.review && !parsed.research && !parsed.finds.length && !parsed.tools.length) throw new Error("Empty reply.");
           return parsed;
         },
-        { onAttempt: attemptNote("Thinking…"), signal: abortRef.current?.signal }
+        { onAttempt: attemptNote(round ? `Reading records (round ${round + 1})…` : "Thinking…"), signal: abortRef.current?.signal }
       );
+        if (!out.tools.length || lastRound) break;
+        const results = out.tools.slice(0, 4).map((tc) => runReadTool(stateRef.current, tc));
+        /* what it looked at, shown small, so you can see how it got its answer */
+        push(null, { role: "assistant", kind: "tool", text: results.map((r) => r.label).join("\n") });
+        scratch += `\n\nTOOL ROUND ${round + 1} — you called ${JSON.stringify(out.tools.slice(0, 4))}\nRESULTS:\n${results.map((r) => r.text).join("\n\n")}`;
+      }
+      if (out.tools.length && !out.reply && !out.actions.length) out = { ...out, reply: "I looked through the records but couldn't settle on an answer — try asking more specifically." };
       const next = push(history, { role: "assistant", text: out.reply || "(no reply)", actions: out.actions, at: Date.now() });
       /* searches run here, against the live CRM, and show their matches */
       out.finds.forEach((fd) => {
         const found = findPeople(stateRef.current, fd.criteria);
         push(null, { role: "assistant", kind: "found", criteria: fd.criteria || {}, ids: found.map((p) => p.id), text: `${found.length} ${found.length === 1 ? "match" : "matches"} — ${findSummary(fd.criteria, stateRef.current)}` });
       });
-      if (!out.review && !out.research) notify("done", out.actions.length ? `CRM assistant has ${out.actions.length} ${out.actions.length === 1 ? "change" : "changes"} for you to approve` : "CRM assistant replied");
+      if (!out.review && !out.research && !out.segment) notify("done", out.actions.length ? `CRM assistant has ${out.actions.length} ${out.actions.length === 1 ? "change" : "changes"} for you to approve` : "CRM assistant replied");
       /* the model asked to read the detail — run the first batch straight away */
       if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {} }, next);
+      if (out.segment) await runSegment(out.segment);
       if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, mode: out.research.mode, question: out.research.question, then: out.research.then, scope: out.research.scope || {} });
     } catch (e) {
       if (isAbort(e)) {
@@ -18086,6 +18534,11 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
           const rv = m.review;
           const remaining = rv ? rv.poolIds.length - (rv.offset + (rv.size || REVIEW_BATCH)) : 0;
           return (
+            m.kind === "tool" ? (
+              <div key={i} style={{ fontSize: 11, color: C.muted, margin: "-4px 0 8px 4px", whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+                {m.text}
+              </div>
+            ) : (
             <div key={i} style={{ display: "flex", justifyContent: mine ? "flex-end" : "flex-start", marginBottom: 10 }}>
               <div
                 style={{
@@ -18251,6 +18704,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                 )}
               </div>
             </div>
+            )
           );
         })}
         {busy && (
@@ -18280,6 +18734,78 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
         <Btn disabled={!!busy || !draft.trim()} onClick={() => send()} style={{ padding: "0 16px" }}>
           Send
         </Btn>
+      </div>
+    </div>
+  );
+}
+
+/* The end-of-run report: numbers first, then who needs what next. */
+function RunSummaryModal({ run, onClose, onEmailFollowUps, onAskAssistant, canAsk }) {
+  const sm = run.summary || { calls: [], groups: [], counts: {} };
+  const k = sm.counts || {};
+  const started = new Date(run.startedAt);
+  const emailIds = Array.from(new Set((sm.groups.find((g) => g.key === "email")?.items || []).map((c) => c.id)));
+  const stat = (label, val, col) => (
+    <div style={{ flex: "1 1 90px", background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "8px 10px" }}>
+      <div style={{ fontSize: 9, letterSpacing: "0.14em", color: C.muted }}>{label}</div>
+      <div style={{ fontFamily: mono, fontSize: 18, fontWeight: 700, color: col || C.ink }}>{val}</div>
+    </div>
+  );
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 62, padding: 16 }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 560, maxHeight: "88vh", overflowY: "auto", background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 16, padding: 18, boxSizing: "border-box" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 800, color: C.ink }}>☎ Call run summary</div>
+            <div style={{ fontSize: 11, color: C.muted }}>
+              {started.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })} · {started.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} · {fmtDuration(sm.activeMs || 0)} on the phone
+              {run.pausedCount ? ` · paused ${run.pausedCount}×` : ""}
+            </div>
+          </div>
+          <button onClick={onClose} aria-label="Close summary" style={{ background: "transparent", border: "none", color: C.muted, fontSize: 22, cursor: "pointer" }}>
+            ×
+          </button>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", margin: "12px 0" }}>
+          {stat("CALLS", k.calls || 0)}
+          {stat("PEOPLE", k.people || 0)}
+          {stat("CONNECTED", `${k.connected || 0}${k.calls ? ` · ${Math.round(((k.connected || 0) / k.calls) * 100)}%` : ""}`, C.green)}
+          {stat("MEETINGS", k.booked || 0, k.booked ? C.green : C.ink)}
+          {stat("EMAILS TO SEND", k.emails || 0, k.emails ? C.blue : C.ink)}
+        </div>
+        {!sm.calls.length && <div style={{ fontSize: 13, color: C.muted, padding: "8px 0" }}>No calls were logged during this run.</div>}
+        {sm.groups.map((g) => (
+          <div key={g.key} style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12, fontWeight: 800, color: TONE_COL[g.tone] || C.muted, marginBottom: 3 }}>
+              {g.icon} {g.label} ({g.items.length})
+            </div>
+            {g.items.map((c, i) => (
+              <div key={c.id + i} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 2 }}>
+                <span style={{ fontWeight: 700, color: C.ink }}>{c.name}</span>
+                <span style={{ color: C.muted }}> · {c.company}</span>
+                {g.key === "email" && c.email && <span style={{ fontFamily: mono, fontSize: 10, color: C.blue }}> · {c.email}</span>}
+                {(g.key === "callback" || g.key === "qualified" || g.key === "pitched") && c.callback && <span style={{ fontFamily: mono, fontSize: 10, color: C.amber }}> · call {c.callback}</span>}
+                {c.temperature && <span style={{ fontSize: 10 }}> {leadTemp(c.temperature)?.icon}</span>}
+                {c.note && <div style={{ color: C.muted, fontSize: 11, marginLeft: 8 }}>“{clip(c.note, 140)}”</div>}
+              </div>
+            ))}
+          </div>
+        ))}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+          {emailIds.length > 0 && (
+            <Btn onClick={() => onEmailFollowUps(emailIds)} style={{ padding: "8px 12px", fontSize: 12 }}>
+              📧 Add an email follow-up due today ({emailIds.length})
+            </Btn>
+          )}
+          {canAsk && sm.calls.length > 0 && (
+            <Btn ghost onClick={onAskAssistant} style={{ padding: "8px 12px", fontSize: 12 }}>
+              💬 Ask the assistant for next steps
+            </Btn>
+          )}
+          <Btn ghost onClick={onClose} style={{ padding: "8px 12px", fontSize: 12 }}>
+            Done
+          </Btn>
+        </div>
       </div>
     </div>
   );
