@@ -203,6 +203,135 @@ const OUTREACH_KINDS = ["warm", "cold"];
    emailed July 3", each tagged to whichever application or contact it
    belongs to by simply living nested inside that entry. */
 const TOUCHPOINT_CHANNELS = ["Facebook", "Instagram", "LinkedIn", "Cold email", "Phone call", "Text/SMS", "In person", "Other"];
+/* ============================================================
+   THEIR LOCAL TIME
+
+   Every callable person gets a time zone, so the queue can say whether it's
+   a sensible moment to ring them. In order of trust:
+     1. one set on the contact (by you or the assistant)
+     2. their number — a US/Canada area code, or a single-zone country code
+     3. the company's time zone (set on the account, or found by research)
+     4. a country code that spans several zones (Australia, Brazil…) — a guess
+     5. the website's country domain (.com.au, .co.uk…) — a guess
+   Windows, in their time: Mon–Fri 9–5 is business hours, the two hours
+   after are "after hours" (still worth a try — owners often pick up), and
+   everything else is closed.
+   ============================================================ */
+const NANP_TZ = {
+  "America/New_York": "201 202 203 207 212 215 216 220 223 227 229 231 234 239 240 248 252 260 267 269 272 276 283 302 304 305 313 315 317 321 326 330 332 336 339 347 351 352 363 380 386 401 404 407 410 412 413 419 423 434 436 440 443 445 448 463 470 475 478 484 502 508 513 516 517 518 540 551 561 567 570 571 574 582 585 586 603 606 607 609 610 614 616 617 624 631 640 646 656 667 678 679 680 681 686 689 703 704 706 716 717 718 724 727 732 734 740 743 754 757 762 765 770 771 772 774 781 786 802 803 804 810 812 813 814 826 828 835 838 839 843 845 848 850 854 856 857 859 860 862 863 864 865 878 904 906 908 910 912 914 917 919 929 930 934 937 941 943 947 948 954 959 973 978 980 984 989",
+  "America/Chicago": "205 210 214 217 218 219 224 225 228 251 254 256 262 270 274 281 308 309 312 314 316 318 319 320 325 327 331 334 337 346 361 364 402 405 409 414 417 430 432 447 464 469 479 501 504 507 512 515 531 534 539 557 563 572 573 580 601 605 608 612 615 618 620 629 630 636 641 651 659 660 662 682 701 708 712 713 715 726 730 731 737 763 769 773 779 785 806 815 816 817 830 832 847 861 870 872 901 903 913 918 920 931 936 938 940 945 952 956 972 975 979 985",
+  "America/Denver": "303 307 385 406 435 505 575 719 720 801 915 970 983 208 986",
+  "America/Phoenix": "480 520 602 623 928",
+  "America/Los_Angeles": "206 209 213 253 279 310 323 341 350 360 408 415 424 425 442 458 503 509 510 530 541 559 562 564 619 626 628 650 657 661 669 702 707 714 725 747 760 775 805 818 820 831 840 858 909 916 925 949 951 971",
+  "America/Anchorage": "907",
+  "Pacific/Honolulu": "808",
+  "America/Puerto_Rico": "787 939",
+  "America/Toronto": "226 249 263 289 343 354 365 367 382 416 418 437 438 450 468 514 519 548 579 581 613 647 683 705 742 753 807 819 873 905 942",
+  "America/Halifax": "428 506 782 902",
+  "America/St_Johns": "709",
+  "America/Winnipeg": "204 431 584",
+  "America/Regina": "306 474 639",
+  "America/Edmonton": "368 403 587 780 825",
+  "America/Vancouver": "236 250 257 604 672 778",
+  "America/Whitehorse": "867",
+};
+const AREA_TZ = Object.fromEntries(Object.entries(NANP_TZ).flatMap(([tz, codes]) => codes.split(" ").map((c) => [c, tz])));
+/* longest prefix wins; `multi` marks countries spanning several zones */
+const COUNTRY_TZ = [
+  ["44", "Europe/London"], ["353", "Europe/Dublin"], ["61", "Australia/Sydney", true], ["64", "Pacific/Auckland"], ["63", "Asia/Manila"], ["65", "Asia/Singapore"],
+  ["852", "Asia/Hong_Kong"], ["81", "Asia/Tokyo"], ["82", "Asia/Seoul"], ["86", "Asia/Shanghai"], ["886", "Asia/Taipei"], ["91", "Asia/Kolkata"], ["971", "Asia/Dubai"],
+  ["966", "Asia/Riyadh"], ["974", "Asia/Qatar"], ["27", "Africa/Johannesburg"], ["33", "Europe/Paris"], ["49", "Europe/Berlin"], ["31", "Europe/Amsterdam"], ["32", "Europe/Brussels"],
+  ["34", "Europe/Madrid"], ["39", "Europe/Rome"], ["41", "Europe/Zurich"], ["43", "Europe/Vienna"], ["45", "Europe/Copenhagen"], ["46", "Europe/Stockholm"], ["47", "Europe/Oslo"],
+  ["358", "Europe/Helsinki"], ["48", "Europe/Warsaw"], ["351", "Europe/Lisbon"], ["30", "Europe/Athens"], ["420", "Europe/Prague"], ["36", "Europe/Budapest"], ["40", "Europe/Bucharest"],
+  ["90", "Europe/Istanbul"], ["972", "Asia/Jerusalem"], ["20", "Africa/Cairo"], ["234", "Africa/Lagos"], ["254", "Africa/Nairobi"], ["7", "Europe/Moscow", true],
+  ["55", "America/Sao_Paulo", true], ["52", "America/Mexico_City", true], ["54", "America/Argentina/Buenos_Aires"], ["56", "America/Santiago"], ["57", "America/Bogota"], ["51", "America/Lima"],
+  ["60", "Asia/Kuala_Lumpur"], ["62", "Asia/Jakarta", true], ["66", "Asia/Bangkok"], ["84", "Asia/Ho_Chi_Minh"], ["880", "Asia/Dhaka"], ["92", "Asia/Karachi"], ["94", "Asia/Colombo"], ["977", "Asia/Kathmandu"],
+].sort((a, b) => b[0].length - a[0].length);
+const TLD_TZ = [
+  [".com.au", "Australia/Sydney"], [".net.au", "Australia/Sydney"], [".au", "Australia/Sydney"], [".co.uk", "Europe/London"], [".uk", "Europe/London"], [".co.nz", "Pacific/Auckland"], [".nz", "Pacific/Auckland"],
+  [".ph", "Asia/Manila"], [".sg", "Asia/Singapore"], [".ie", "Europe/Dublin"], [".ca", "America/Toronto"], [".de", "Europe/Berlin"], [".nl", "Europe/Amsterdam"], [".be", "Europe/Brussels"],
+  [".fr", "Europe/Paris"], [".es", "Europe/Madrid"], [".it", "Europe/Rome"], [".in", "Asia/Kolkata"], [".ae", "Asia/Dubai"], [".za", "Africa/Johannesburg"], [".hk", "Asia/Hong_Kong"], [".jp", "Asia/Tokyo"],
+];
+const validTz = (tz) => {
+  if (!tz) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch (e) {
+    return false;
+  }
+};
+/* what a number alone says: { tz, how: "area" | "country" | "guess" } */
+function tzFromPhone(phone) {
+  const t = String(phone || "").trim();
+  if (!t.startsWith("+")) return null;
+  const d = t.replace(/\D/g, "");
+  if (d.startsWith("1") && d.length >= 4) {
+    const tz = AREA_TZ[d.slice(1, 4)];
+    return tz ? { tz, how: "area" } : null;
+  }
+  const hit = COUNTRY_TZ.find(([cc]) => d.startsWith(cc));
+  return hit ? { tz: hit[1], how: hit[2] ? "guess" : "country" } : null;
+}
+function tzFromWebsite(site) {
+  const host = String(site || "").toLowerCase().replace(/^https?:\/\//, "").split("/")[0];
+  const hit = TLD_TZ.find(([tld]) => host.endsWith(tld));
+  return hit ? hit[1] : null;
+}
+/* the zone to use for one contact, and where it came from */
+function tzOf(c, acc) {
+  if (validTz(c?.timezone)) return { tz: c.timezone, source: "set on contact" };
+  const ph = tzFromPhone(c?.phone);
+  if (ph && ph.how !== "guess") return { tz: ph.tz, source: ph.how === "area" ? "area code" : "country code" };
+  if (validTz(acc?.timezone)) return { tz: acc.timezone, source: "company" };
+  if (ph) return { tz: ph.tz, source: "country code (guess)", guess: true };
+  const w = tzFromWebsite(acc?.website);
+  if (w) return { tz: w, source: "website (guess)", guess: true };
+  return null;
+}
+const BUSINESS_START = 9;
+const BUSINESS_END = 17;
+const AFTER_HOURS = 2;
+const CALL_WINDOWS = {
+  business: { icon: "🟢", label: "Business hours", short: "OPEN", tone: "green" },
+  after: { icon: "🟠", label: "After hours", short: "AFTER HRS", tone: "amber" },
+  closed: { icon: "⚫", label: "Closed", short: "CLOSED", tone: "muted" },
+  unknown: { icon: "❔", label: "Time zone unknown", short: "TZ ?", tone: "muted" },
+};
+/* A company's own hours, when research found them: { open: 8, close: 18,
+   days: ["Mon",…] }. Without them it's Mon–Fri 9–5. */
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const hoursOf = (acc) => {
+  const h = acc?.businessHours;
+  if (!h || num(h.open) == null || num(h.close) == null || num(h.close) <= num(h.open)) return null;
+  const days = arr(h.days).map((d) => WEEKDAYS.find((w) => w.toLowerCase() === d.slice(0, 3))).filter(Boolean);
+  return { open: num(h.open), close: num(h.close), days: days.length ? days : WEEKDAYS.slice(0, 5) };
+};
+/* The device's clock converted into THEIR zone — so "now" is always your
+   real now, wherever you are, read off their wall clock. */
+function callWindowAt(tz, now = new Date(), hours = null) {
+  if (!validTz(tz)) return { window: "unknown" };
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(now).map((p) => [p.type, p.value]));
+  const hour = (+parts.hour % 24) + +parts.minute / 60;
+  const open = hours ? hours.open : BUSINESS_START;
+  const close = hours ? hours.close : BUSINESS_END;
+  const days = hours ? hours.days : WEEKDAYS.slice(0, 5);
+  const weekend = !days.includes(parts.weekday);
+  const window = weekend ? "closed" : hour >= open && hour < close ? "business" : hour >= close && hour < close + AFTER_HOURS ? "after" : "closed";
+  const h12 = Math.floor(hour) % 12 || 12;
+  const local = `${parts.weekday} ${h12}:${parts.minute}${Math.floor(hour) < 12 ? "am" : "pm"}`;
+  return { window, local, weekend, hour };
+}
+const tzCity = (tz) => String(tz || "").split("/").pop().replace(/_/g, " ");
+function callWindowOf(c, acc, now = new Date()) {
+  const z = tzOf(c, acc);
+  if (!z) return { window: "unknown", tz: "", source: "" };
+  return { ...callWindowAt(z.tz, now, hoursOf(acc)), tz: z.tz, source: z.source, guess: !!z.guess, hours: hoursOf(acc) };
+}
+/* "business", "after", "closed", "unknown", or "callable" (business or after) */
+const WIN_RANK = { business: 0, after: 1, unknown: 2, closed: 3 };
+const windowMatches = (w, want) => (want === "callable" ? w === "business" || w === "after" : w === want);
+
 /* ---- what a touch point carried ----
    A plain email and an email with a 90-second Loom are different moves, and
    which one landed is worth knowing later. Stored on the touch point as a list,
@@ -1528,6 +1657,16 @@ const CALL_FILTER_GROUPS = [
   },
 ];
 CALL_FILTER_GROUPS.push(
+  {
+    label: "Their local time, now",
+    items: [
+      { key: "win:callable", label: "☎ Callable now (business or after hours)", test: (r) => windowMatches(callWindowOf(r.contact, r.account).window, "callable") },
+      { key: "win:business", label: "🟢 Business hours", test: (r) => callWindowOf(r.contact, r.account).window === "business" },
+      { key: "win:after", label: "🟠 After hours (2h after close)", test: (r) => callWindowOf(r.contact, r.account).window === "after" },
+      { key: "win:closed", label: "⚫ Closed", test: (r) => callWindowOf(r.contact, r.account).window === "closed" },
+      { key: "win:unknown", label: "❔ Time zone unknown", test: (r) => callWindowOf(r.contact, r.account).window === "unknown" },
+    ],
+  },
   {
     label: "How keen",
     items: [
@@ -4434,6 +4573,12 @@ export default function FlightDeck() {
   const [callFilter, setCallFilter] = useState("");
   const [callAttempts, setCallAttempts] = useState("");
   const [callList, setCallList] = useState("");
+  /* the queue's local-time labels move with the clock */
+  const [clockNow, setClockNow] = useState(() => new Date());
+  useEffect(() => {
+    const t = setInterval(() => setClockNow(new Date()), 60000);
+    return () => clearInterval(t);
+  }, []);
   /* choosing who goes in a CSV — local to this device, it's a one-off action */
   const [csvMode, setCsvMode] = useState(false);
   const [csvPick, setCsvPick] = useState(() => new Set());
@@ -11142,7 +11287,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
            number, and a queue that hides them hides the work. They sort to the
            bottom instead, below everything actually dialable. */
         .filter((c) => !c.archivedAt && !c.tombstoned && (c.phone || "").trim() && c.status !== "closed")
-        .map((c) => ({ contact: c, accountId: acc.id, company: acc.company, listIds: acc.listIds || [], industry: acc.industry || "" }))
+        .map((c) => ({ contact: c, account: acc, accountId: acc.id, company: acc.company, listIds: acc.listIds || [], industry: acc.industry || "" }))
     );
     const calls = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").length;
     const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
@@ -11270,6 +11415,9 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           </div>
           <div style={{ fontSize: 11, color: C.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {[r.contact.position, r.company].filter(Boolean).join(" · ")}
+          </div>
+          <div style={{ marginTop: 3 }}>
+            <CallWindowBadge contact={r.contact} account={r.account} now={clockNow} />
           </div>
           <ContactBadges contact={r.contact} />
           <div style={{ fontFamily: mono, fontSize: 10, color: r.calls === 0 ? C.amber : C.muted, marginTop: 3 }}>
@@ -12325,6 +12473,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
         company: entry?.company || pre.company || "",
         website: entry?.website || "",
         industry: entry?.industry || "",
+        timezone: entry?.timezone || "",
         listIds: Array.isArray(entry?.listIds) ? [...entry.listIds] : Array.isArray(pre.listIds) ? [...pre.listIds] : [],
         headcount: entry?.headcount || "",
         status: entry?.status || "",
@@ -14370,6 +14519,14 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
             </div>
             <Field label="Website" value={f.website} onChange={set("website")} placeholder="https://acme.com" />
             <Field label="Industry" value={f.industry} onChange={set("industry")} placeholder="e.g. Fintech, SaaS" />
+            {/* the company's zone — used for contacts whose number doesn't
+                say where they are (no +country code, or a multi-zone country) */}
+            <Field
+              label={`Time zone${f.timezone && !validTz(f.timezone) ? " — not recognised, use a name like America/New_York" : ""}`}
+              value={f.timezone}
+              onChange={set("timezone")}
+              placeholder={tzFromWebsite(f.website) ? `${tzFromWebsite(f.website)} (from the website)` : "e.g. America/New_York, Australia/Perth"}
+            />
             {(modal.accountLists || []).length > 0 && (
               <div style={{ marginBottom: 12 }}>
                 <Label>Lists</Label>
@@ -16235,6 +16392,7 @@ const CALL_CRITERIA_DOC = `{"type":"add_to_run_where","criteria":{ ...any of the
   industry: "text"  (account industry contains this)
   search: "text"  (name, position or company contains this)
   phonePrefix: "+1"  (number starts with this code)   text: "words" (also searches email, notes, tags)
+  callWindow: "callable"|"business"|"after"|"closed"  (their local time right now)
   order: "queue" (default: due, never-called, hottest, longest since last call) | "hottest" | "fewest_attempts" | "most_attempts" | "longest_since_call"
   limit: N  (cap how many are added)`;
 const TEMP_RANK = { hot: 0, warm: 1, cold: 2 };
@@ -16280,6 +16438,7 @@ function matchCallCriteria(st, crit = {}, { anyone = false } = {}) {
   let rows = (st.accounts || [])
     .flatMap((acc) => (acc.contacts || []).filter((c) => !c.archivedAt && !c.tombstoned && (anyone || (hasPhone(c) && c.status !== "closed" && !inRun.has(c.id)))).map((c) => callFacts(acc, c)))
     .filter((r) => !k.phonePrefix || phoneMatches(r.c.phone, String(k.phonePrefix).startsWith("+") ? k.phonePrefix : `+${k.phonePrefix}`))
+    .filter((r) => !k.callWindow || windowMatches(callWindowOf(r.c, r.acc).window, String(k.callWindow)))
     .filter((r) => !k.text || [r.c.name, r.c.position, r.acc.company, r.c.email, r.c.notes, ...tagsOf(r.c)].filter(Boolean).join(" ").toLowerCase().includes(String(k.text).toLowerCase()))
     .filter((r) => !temps.length || temps.includes(r.temp))
     .filter((r) => between(r.attempts, k.attemptsMin, k.attemptsMax))
@@ -16332,6 +16491,7 @@ function criteriaSummary(st, crit = {}) {
   if (arr(k.lastOutcome).length) parts.push(`last call: ${arr(k.lastOutcome).map((o) => callOutcome(o)?.label.toLowerCase() || o).join(" / ")}`);
   if (arr(k.lastStage).length) parts.push(`last talk ended at ${arr(k.lastStage).map((x) => callStage(x)?.label.toLowerCase() || x).join(" / ")}`);
   if (k.callDue) parts.push("call due");
+  if (k.callWindow) parts.push(`${CALL_WINDOWS[k.callWindow === "callable" ? "business" : k.callWindow]?.label.toLowerCase() || k.callWindow}${k.callWindow === "callable" ? " or after hours" : ""} now`);
   if (num(k.notCalledForDays) != null) parts.push(`not called in ${num(k.notCalledForDays)}+ days`);
   if (num(k.touchesMin) != null || num(k.touchesMax) != null) parts.push(range(k.touchesMin, k.touchesMax, "touch points"));
   if (num(k.writtenTouchesMin) != null || num(k.writtenTouchesMax) != null) parts.push(range(k.writtenTouchesMin, k.writtenTouchesMax, "written touches"));
@@ -16346,6 +16506,133 @@ function criteriaSummary(st, crit = {}) {
   if (num(k.limit) != null) parts.push(`top ${num(k.limit)}`);
   return parts.join(", ") || "anyone callable";
 }
+
+/* ============================================================
+   MORE THINGS THE ASSISTANT CAN DO
+
+   Same rule as everything else it does: each change is described in words,
+   checked against the CRM, and waits for Apply. These follow the exact
+   rules the app's own buttons follow — a status change stamps the contact
+   date and seeds follow-ups the way the contact card does, a nurture plan
+   goes through the same function as the plan picker — so a change made by
+   the assistant is indistinguishable from one made by hand.
+   ============================================================ */
+
+/* the call run exactly as the Calls page numbers it: picked order, skipping
+   anyone who's since been archived, closed or lost their number */
+function runOrder(st) {
+  const live = new Map();
+  (st.accounts || []).forEach((acc) =>
+    (acc.contacts || []).forEach((c) => {
+      if (!c.archivedAt && !c.tombstoned && (c.phone || "").trim() && c.status !== "closed") live.set(c.id, { c, acc });
+    })
+  );
+  return (st.callSession || []).filter((id) => live.has(id)).map((id, i) => ({ pos: i + 1, id, ...live.get(id) }));
+}
+/* "31-36", "31,33", [31, 32], or {from, to} → positions */
+function parsePositions(a) {
+  const out = new Set();
+  const add = (v) => {
+    const t = String(v).trim();
+    const m = t.match(/^(\d+)\s*[-–to]+\s*(\d+)$/);
+    if (m) for (let n = Math.min(+m[1], +m[2]); n <= Math.max(+m[1], +m[2]); n++) out.add(n);
+    else if (/^\d+$/.test(t)) out.add(+t);
+  };
+  (Array.isArray(a.positions) ? a.positions : String(a.positions ?? "").split(",")).forEach(add);
+  if (num(a.from) != null && num(a.to) != null) add(`${a.from}-${a.to}`);
+  return Array.from(out).sort((x, y) => x - y);
+}
+
+/* contact status, the way the contact card sets it */
+function setContactStatusPure(c, status) {
+  if ((c.status || "") === status) return c;
+  const needsDate = !!status && !c.contacted;
+  const fus = Array.isArray(c.followUps) ? c.followUps : [];
+  return {
+    ...c,
+    status,
+    ...latchContactReply(c, status),
+    ...(needsDate ? { contacted: today(), followUps: fus.length ? fus : DEFAULT_FOLLOWUPS.map((d) => ({ days: d, done: false, doneAt: "" })) } : {}),
+    history: withLog(c, [logEntry("status", `Status → ${contactStatusLabel(status)} (assistant)`)]).history,
+  };
+}
+function setLeadStatusPure(a, status) {
+  if ((a.status || "") === status) return a;
+  return { ...a, status, ...(status && !a.contacted ? { contacted: today() } : {}), history: [logEntry("status", `Status → ${statusLabel(status)} (assistant)`), ...(a.history || [])].slice(0, 200) };
+}
+/* who an action is about: one id, a list of ids, or everyone a find returns */
+function actionTargets(st, a) {
+  if (a.criteria && typeof a.criteria === "object") return findPeople(st, a.criteria).map((p) => locateRecord(st, p.id)).filter(Boolean);
+  const ids = Array.isArray(a.ids) ? a.ids : a.id ? [a.id] : [];
+  return ids.map((id) => locateRecord(st, id)).filter((r) => r && r.kind !== "account");
+}
+const PERSON_ACTIONS = ["set_status", "set_nurture", "set_linkedin", "log_touchpoint", "tick_followup"];
+/* why this action can't apply to this person, or "" when it can */
+function personActionProblem(a, r) {
+  const x = r.kind === "contact" ? r.c : r.app;
+  switch (a.type) {
+    case "set_status":
+      return (r.kind === "contact" ? CONTACT_STATUSES : APP_STATUSES).includes(a.status ?? "") ? "" : `“${a.status}” isn't a ${r.kind === "contact" ? "contact" : "lead"} status`;
+    case "set_nurture":
+      return nurtureTrack(String(a.plan)) ? (r.kind === "contact" ? "" : "nurture plans are for account contacts here") : `“${a.plan}” isn't a plan (30, 60, 90 or refresh)`;
+    case "set_linkedin":
+      return LI_STATUSES.some((l) => l.key === (a.status ?? "")) ? (r.kind === "contact" ? "" : "LinkedIn status lives on account contacts") : `“${a.status}” isn't a LinkedIn status`;
+    case "log_touchpoint":
+      return TOUCHPOINT_CHANNELS.includes(a.channel) ? (a.date && !/^\d{4}-\d{2}-\d{2}$/.test(a.date) ? "date must be YYYY-MM-DD" : a.date > today() ? "date is in the future" : "") : `“${a.channel}” isn't a channel`;
+    case "tick_followup": {
+      const want = a.track === "call" ? "call" : "email";
+      return normFollowUps(x).some((f) => !f.done && (want === "call" ? isPhoneFu(f) : !isPhoneFu(f))) ? "" : `no pending ${want} follow-up`;
+    }
+    default:
+      return "unknown";
+  }
+}
+function personActionWords(a) {
+  switch (a.type) {
+    case "set_status":
+      return `status → ${a.status ? a.status : "not contacted"}`;
+    case "set_nurture":
+      return `🌱 ${nurtureTrack(String(a.plan))?.label || a.plan}`;
+    case "set_linkedin":
+      return `LinkedIn → ${LI_META(a.status).label}`;
+    case "log_touchpoint":
+      return `log ${a.channel}${a.date && a.date !== today() ? ` on ${a.date}` : ""}${sentOf(a).length ? ` (sent ${sentOf(a).join(" + ")})` : ""}${a.note ? `: “${clip(a.note, 60)}”` : ""}`;
+    case "tick_followup":
+      return `tick the next ${a.track === "call" ? "call" : "email"} follow-up as done`;
+    default:
+      return a.type;
+  }
+}
+function personActionApply(a, x, kind) {
+  switch (a.type) {
+    case "set_status":
+      return kind === "contact" ? setContactStatusPure(x, a.status || "") : setLeadStatusPure(x, a.status || "");
+    case "set_nurture":
+      return applyNurtureTrack(x, String(a.plan));
+    case "set_linkedin":
+      return { ...x, liStatus: a.status || "", liStatusAt: a.status ? today() : "", history: withLog(x, [logEntry("linkedin", `LinkedIn → ${LI_META(a.status).label} (assistant)`)]).history };
+    case "log_touchpoint":
+      return {
+        ...x,
+        touchpoints: [
+          ...(x.touchpoints || []),
+          { id: uid(), date: a.date || today(), channel: a.channel, note: String(a.note || "").trim(), ...(sentOf(a).length ? { sent: sentOf(a) } : {}), ...(a.channel === "Phone call" ? { connected: a.connected !== false } : {}) },
+        ],
+      };
+    case "tick_followup": {
+      const want = a.track === "call" ? "call" : "email";
+      const fus = normFollowUps(x);
+      const i = fus.findIndex((f) => !f.done && (want === "call" ? isPhoneFu(f) : !isPhoneFu(f)));
+      return i === -1 ? x : { ...x, followUps: fus.map((f, k) => (k === i ? { ...f, done: true, doneAt: today() } : f)) };
+    }
+    default:
+      return x;
+  }
+}
+const findAccount = (st, ref) => {
+  const r = String(ref || "").trim().toLowerCase();
+  return (st.accounts || []).find((a) => a.id === ref || (a.company || "").trim().toLowerCase() === r) || null;
+};
 
 /* ============================================================
    CRM ASSISTANT
@@ -16364,6 +16651,8 @@ const FIND_DOC = `{"type":"find","criteria":{ ...any of these, all must match...
   phoneContains: "415"  (digits anywhere in the number)
   emailDomain: "gmail.com"
   hasPhone / hasEmail / hasLinkedIn: true|false
+  callWindow: "business"|"after"|"callable"|"closed"|"unknown"  (their local time RIGHT NOW, from this device's clock)
+  timezone: "New_York" (their time zone contains this)
   dueFollowUp: true  (has a follow-up due today or overdue — exactly the people in the app's DUE count)
   overdueMinDays / overdueMaxDays: N  (their oldest due follow-up was due at least / at most N days ago; implies dueFollowUp)
   who: "contacts" | "leads" | "all" (default all)   includeClosed: true (default false)
@@ -16386,13 +16675,32 @@ const AGENT_ACTION_DOC = `Actions (use ids exactly as they appear in the data):
 - ${CALL_CRITERIA_DOC}
   Use add_to_run_where whenever the user describes WHO they want to call by a quality (warmth, attempts, outcome, stage, touches, list…) rather than naming people. The app finds the matches itself — don't list ids for it.
 - {"type":"note","id":"<account, contact or lead id>","text":"short note"}
+CALL RUN (positions as numbered on the Calls page, listed under CALL RUN in the data):
+- {"type":"remove_from_run","positions":"31-36"}  or  {"type":"remove_from_run","contactIds":["<id>"]}   (positions also as [31,32,33] or "31,33")
+- {"type":"clear_run"}
+- {"type":"move_in_run","contactId":"<id>","to":1}
+- {"type":"order_run","by":"due"|"hottest"|"fewest_attempts"|"longest_since_call"|"company"|"callable_now"}   (callable_now: in business hours first, then after hours, closed last)
+PEOPLE — each takes "id", or "ids":[…], or "criteria":{ same as find } for everyone matching:
+- {"type":"set_status","id":"…","status":"outreach"}   contacts: "" (not contacted), outreach, nurture, replied, discovery call, ongoing, closed · leads: "", outreach, applied, followed up, replied, screening, interview, final round, offer, rejected, bad fit
+- {"type":"set_nurture","id":"…","plan":"30"|"60"|"90"|"refresh"}   (account contacts; restarts their follow-ups on that plan)
+- {"type":"set_linkedin","id":"…","status":"requested"|"connected"|"declined"|"withdrawn"|"na"|"blocked"|""}
+- {"type":"log_touchpoint","id":"…","channel":"Cold email","note":"…","date":"YYYY-MM-DD (default today)","sent":["video"|"voicenote"|"content"]}   (something the user already did)
+- {"type":"tick_followup","id":"…","track":"email"|"call"}   (marks the next pending follow-up done today — only when the user says they did it)
+- {"type":"temperature","criteria":{…},"value":"hot"} also works in bulk
+ACCOUNTS & CONTACTS:
+- {"type":"create_account","company":"Acme","website":"acme.com","industry":"SaaS","lists":["list"]}
+- {"type":"add_contact","account":"<account id or exact company name, may be created above>","name":"…","position":"…","email":"…","phone":"…","linkedin":"…","notes":"…"}
+- {"type":"update_contact","id":"<contact id>","fields":{"position":"…","email":"…","phone":"…","linkedin":"…","hook":"…"}}
+- {"type":"set_account","account":"<account id or company>","status":"active"|"closed"|"bad fit","highConfidence":true|false}
+- {"type":"set_timezone","account":"<account id or company>" OR "id":"<contact id>","tz":"America/New_York","openHour":8,"closeHour":18,"openDays":["Mon","Tue","Wed","Thu","Fri"]}   (IANA zone; hours optional — the company's real opening hours in its own time, if known)
 - {"type":"remove_followups","id":"<contact or lead id>","scope":"due"|"all_pending","track":"email"|"call"|"any"}   ("due" = pending and due today or earlier; ticked follow-ups are history and are never removed)
 - {"type":"start_review","focus":"what to judge, in the user's words","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true}}   (all scope keys optional)
   Use start_review when the user wants you to read their notes, judge who is worth following up, or asks about anything the CRM DATA doesn't show (what was said, notes, touch-point details). The app then sends you full notes and history 50 prospects at a time. It changes nothing and runs straight away.
-- {"type":"start_research","question":"what must be true, e.g. based in New York AND an MSP or IT services company","scope":{"criteria":{ same as find, e.g. {"phonePrefix":"+1"} },"noIndustry":true,"lists":["list"],"search":"company name","accountIds":["<account id>"]},"then":{"addToList":"US Tech List","removeNonMatchesFromList":"US Tech List","tag":["ny-msp"],"setIndustry":true}}
+- {"type":"start_research","question":"what must be true, e.g. based in New York AND an MSP or IT services company","scope":{"criteria":{ same as find, e.g. {"phonePrefix":"+1"} },"tzUnknown":true,"noIndustry":true,"lists":["list"],"search":"company name","accountIds":["<account id>"]},"then":{"addToList":"US Tech List","removeNonMatchesFromList":"US Tech List","tag":["ny-msp"],"setIndustry":true}}
   Web research on companies, 8 at a time, running through every batch on its own. Only when WEB SEARCH is available.
   - question: each company is checked against it and comes back as matches true/false. Leave it out to just look up industry.
   - scope.criteria: research the companies of the people a find would return ("all the +1 contacts").
+  - scope.tzUnknown: companies whose callable people have no time zone or only a guessed one. Every research run also proposes each company's time zone and opening hours.
   - then: what to propose for the companies that MATCH (addToList — the list is created if it doesn't exist; tag — on their contacts), and removeNonMatchesFromList for the ones that clearly don't. setIndustry also proposes each company's industry.
   For "search X, check whether Y, then put the ones that fit in list Z", use ONE start_research with scope.criteria = X, question = Y, then.addToList = Z. Don't run a separate find first.
   To clean up a list that has the wrong companies in it ("it still has restaurants in it"), research the list itself — scope.lists = [that list], the same question — with then.removeNonMatchesFromList = that list.
@@ -16419,20 +16727,28 @@ const recordLabel = (r) => (!r ? "?" : r.kind === "account" ? r.acc.company || "
 function crmDigest(st) {
   const lines = [`TODAY: ${today()}`, dueDigestLine(st)];
   const lists = st.accountLists || [];
+  lines.push(`DEVICE TIME NOW: ${new Date().toString()} — every "their local time" below is this converted to their zone.`);
   lines.push(`\nLISTS (id | name | industry | accounts):`);
   if (!lists.length) lines.push("(none)");
   lists.forEach((l) => lines.push(`${l.id} | ${listName(l)} | ${l.industry || "-"} | ${accountsInList(st, l.id).length}`));
-  lines.push(`\nACCOUNTS (id | company | industry | lists | status) with their contacts indented (id | name | position | status | contacted | temp | tags | phone | email | calls(connected) last-outcome last-stage | touches | sent | wants-email | last touch | fu):`);
+  const run = runOrder(st);
+  lines.push(`\nCALL RUN (${run.length}, in calling order — pos | contact id | name | company):`);
+  if (!run.length) lines.push("(empty)");
+  run.forEach((r) => lines.push(`${r.pos} | ${r.id} | ${r.c.name || "?"} | ${r.acc.company || "?"}`));
+  lines.push(`\nACCOUNTS (id | company | industry | lists | status) with their contacts indented (id | name | position | status | contacted | temp | tags | phone | email | calls(connected) last-outcome last-stage | touches | sent | wants-email | last touch | fu | linkedin | nurture | tz, their local time now, window):`);
   (st.accounts || []).forEach((acc) => {
     const ln = (acc.listIds || []).map((id) => lists.find((l) => l.id === id)).filter(Boolean).map(listName);
-    lines.push(`${acc.id} | ${acc.company || "?"} | ${acc.industry || "-"} | ${ln.join(", ") || "-"} | ${acc.status || "open"}`);
+    lines.push(`${acc.id} | ${acc.company || "?"} | ${acc.industry || "-"} | ${ln.join(", ") || "-"} | ${acc.status || "open"}${acc.timezone ? ` | tz ${acc.timezone}${hoursOf(acc) ? ` open ${hoursOf(acc).open}-${hoursOf(acc).close}` : ""}` : ""}`);
     (acc.contacts || [])
       .filter((c) => !c.archivedAt && !c.tombstoned)
       .forEach((c) => {
         const cs = callStanding(c);
         const last = [...(c.touchpoints || [])].map((t) => t.date).sort().pop() || "-";
         lines.push(
-          `  ${c.id} | ${c.name || "?"} | ${c.position || "-"} | ${c.status || "not contacted"} | ${c.contacted || "-"} | ${c.temperature || "-"} | ${tagsOf(c).join(",") || "-"} | ${hasPhone(c) ? "yes" : "no"} | ${c.email ? "yes" : "no"} | ${cs.count}(${cs.connectedCount}) ${cs.lastOutcome || "-"} ${cs.talkStage || "-"} | ${(c.touchpoints || []).filter((t) => !t.engage).length} | ${sentKindsOf(c).join(",") || "-"} | ${emailRequestOpen(c) ? "yes" : "-"} | ${last} | ${fuDigest(c)}`
+          `  ${c.id} | ${c.name || "?"} | ${c.position || "-"} | ${c.status || "not contacted"} | ${c.contacted || "-"} | ${c.temperature || "-"} | ${tagsOf(c).join(",") || "-"} | ${hasPhone(c) ? "yes" : "no"} | ${c.email ? "yes" : "no"} | ${cs.count}(${cs.connectedCount}) ${cs.lastOutcome || "-"} ${cs.talkStage || "-"} | ${(c.touchpoints || []).filter((t) => !t.engage).length} | ${sentKindsOf(c).join(",") || "-"} | ${emailRequestOpen(c) ? "yes" : "-"} | ${last} | ${fuDigest(c)} | ${c.liStatus || "-"} | ${c.status === "nurture" ? c.nurtureTrack || "no plan" : "-"} | ${(() => {
+            const w = callWindowOf(c, acc);
+            return w.tz ? `${w.tz}${w.guess ? "?" : ""} ${w.local} ${w.window}` : "tz unknown";
+          })()}`
         );
       });
   });
@@ -16466,9 +16782,14 @@ function describeAgentAction(st, a, plannedLists = new Set()) {
       return { ok: true, text: `${[add.length ? `tag ${add.map((t) => `#${t}`).join(" ")}` : "", rm.length ? `untag ${rm.map((t) => `#${t}`).join(" ")}` : ""].filter(Boolean).join(", ")} on ${ppl.length} ${ppl.length === 1 ? "person" : "people"} (${findSummary(a.criteria, st)}): ${ppl.slice(0, 6).map((p) => p.name || "Unnamed").join(", ")}${ppl.length > 6 ? ` +${ppl.length - 6} more` : ""}` };
     }
     case "temperature": {
+      if (a.value && !leadTemp(a.value)) return bad(`Temperature: "${a.value}" isn't cold, warm or hot`);
+      if (a.criteria || Array.isArray(a.ids)) {
+        const ts = actionTargets(st, a);
+        if (!ts.length) return bad(`Temperature: nobody matches`);
+        return { ok: true, text: `${ts.length} people → ${a.value ? `${leadTemp(a.value).icon} ${leadTemp(a.value).label}` : "no temperature"}: ${ts.slice(0, 6).map(recordLabel).join(", ")}${ts.length > 6 ? ` +${ts.length - 6} more` : ""}` };
+      }
       const r = locateRecord(st, a.id);
       if (!r || r.kind === "account") return bad(`Temperature: no contact or lead with id ${a.id}`);
-      if (a.value && !leadTemp(a.value)) return bad(`Temperature: "${a.value}" isn't cold, warm or hot`);
       return { ok: true, text: `${recordLabel(r)} → ${a.value ? `${leadTemp(a.value).icon} ${leadTemp(a.value).label}` : "no temperature"}` };
     }
     case "create_list":
@@ -16553,6 +16874,85 @@ function describeAgentAction(st, a, plannedLists = new Set()) {
       if (out.error) return bad(`${recordLabel(r)}: ${out.error}`);
       return { ok: true, text: `${recordLabel(r)}: ${isPhoneFu({ channel: a.channel }) ? "☎ call" : `${a.channel || "Cold email"} follow-up`} due ${date}` };
     }
+    case "set_status":
+    case "set_nurture":
+    case "set_linkedin":
+    case "log_touchpoint":
+    case "tick_followup": {
+      const targets = actionTargets(st, a);
+      if (!targets.length) return bad(`${personActionWords(a)}: ${a.criteria ? `nobody matches ${findSummary(a.criteria, st)}` : `no contact or lead with id ${a.id || (a.ids || []).join(", ")}`}`);
+      const okT = targets.filter((r) => !personActionProblem(a, r));
+      if (!okT.length) return bad(`${personActionWords(a)}: ${personActionProblem(a, targets[0])}`);
+      const skipped = targets.length - okT.length;
+      return { ok: true, text: `${okT.length === 1 ? recordLabel(okT[0]) : `${okT.length} people`}: ${personActionWords(a)}${okT.length > 1 ? ` — ${okT.slice(0, 6).map(recordLabel).join(", ")}${okT.length > 6 ? ` +${okT.length - 6} more` : ""}` : ""}${skipped ? ` (${skipped} skipped: ${personActionProblem(a, targets.find((r) => personActionProblem(a, r)))})` : ""}` };
+    }
+    case "remove_from_run": {
+      const run = runOrder(st);
+      const pos = parsePositions(a);
+      const byPos = run.filter((r) => pos.includes(r.pos));
+      const byId = run.filter((r) => (a.contactIds || []).includes(r.id));
+      const hit = [...new Map([...byPos, ...byId].map((r) => [r.id, r])).values()].sort((x, y) => x.pos - y.pos);
+      if (!hit.length) return bad(`Call run: ${pos.length ? `no one at position${pos.length > 1 ? "s" : ""} ${pos.join(", ")} (the run has ${run.length})` : "none of those are in the run"}`);
+      return { ok: true, text: `☎ Take ${hit.length} out of the call run: ${hit.map((r) => `#${r.pos} ${r.c.name || "Unnamed"}`).join(", ")}` };
+    }
+    case "clear_run": {
+      const n = runOrder(st).length;
+      return n ? { ok: true, text: `☎ Clear the call run (${n} people)` } : bad("The call run is already empty");
+    }
+    case "move_in_run": {
+      const run = runOrder(st);
+      const r = run.find((x) => x.id === a.contactId);
+      if (!r) return bad(`Call run: ${a.contactId} isn't in the run`);
+      const to = Math.max(1, Math.min(run.length, Math.round(num(a.to) || 1)));
+      return { ok: true, text: `☎ Move ${r.c.name || "Unnamed"} from #${r.pos} to #${to}` };
+    }
+    case "order_run": {
+      const n = runOrder(st).length;
+      if (!n) return bad("The call run is empty");
+      if (!["due", "hottest", "fewest_attempts", "longest_since_call", "company", "callable_now"].includes(a.by)) return bad(`Can't order the run by “${a.by}”`);
+      return { ok: true, text: `☎ Re-order the call run (${n}) by ${String(a.by).replace(/_/g, " ")}` };
+    }
+    case "create_account": {
+      if (!String(a.company || "").trim()) return bad("New account: no company name");
+      if (findAccount(st, a.company)) return bad(`New account: “${a.company}” already exists`);
+      return { ok: true, text: `New account ${String(a.company).trim()}${a.industry ? ` · ${a.industry}` : ""}${arr(a.lists).length ? ` → ${a.lists.join(", ")}` : ""}` };
+    }
+    case "add_contact": {
+      const acc = findAccount(st, a.account || a.accountId);
+      if (!acc) return bad(`New contact: no account “${a.account || a.accountId}”`);
+      if (!String(a.name || "").trim()) return bad("New contact: no name");
+      if (liveContacts(acc).some((c) => (c.name || "").trim().toLowerCase() === String(a.name).trim().toLowerCase())) return bad(`${a.name} is already at ${acc.company}`);
+      return { ok: true, text: `Add ${String(a.name).trim()}${a.position ? ` (${a.position})` : ""} to ${acc.company}${a.phone ? ` · ${a.phone}` : ""}${a.email ? ` · ${a.email}` : ""}` };
+    }
+    case "update_contact": {
+      const r = locateRecord(st, a.id);
+      if (r?.kind !== "contact") return bad(`Update: no contact with id ${a.id}`);
+      const allowed = ["position", "email", "phone", "linkedin", "hook"];
+      const f = Object.entries(a.fields || {}).filter(([k2, v]) => allowed.includes(k2) && String(v ?? "") !== String(r.c[k2] ?? ""));
+      if (!f.length) return bad(`${recordLabel(r)}: nothing to change`);
+      return { ok: true, text: `${recordLabel(r)}: ${f.map(([k2, v]) => `${k2} → ${String(v) || "blank"}`).join(", ")}` };
+    }
+    case "set_timezone": {
+      if (!validTz(a.tz)) return bad(`“${a.tz}” isn't a time zone name (use e.g. America/New_York)`);
+      const hrs = num(a.openHour) != null && num(a.closeHour) != null ? ` · open ${num(a.openHour)}:00–${num(a.closeHour)}:00${arr(a.openDays).length ? ` ${a.openDays.join("/")}` : ""}` : "";
+      if (a.id) {
+        const r = locateRecord(st, a.id);
+        if (r?.kind !== "contact") return bad(`Time zone: no contact with id ${a.id}`);
+        return { ok: true, text: `${recordLabel(r)}: time zone → ${a.tz}` };
+      }
+      const acc = findAccount(st, a.account || a.accountId);
+      if (!acc) return bad(`Time zone: no account “${a.account || a.accountId}”`);
+      const w = callWindowAt(a.tz, new Date(), num(a.openHour) != null ? { open: num(a.openHour), close: num(a.closeHour), days: arr(a.openDays).length ? arr(a.openDays).map((d) => WEEKDAYS.find((x) => x.toLowerCase() === d.slice(0, 3))).filter(Boolean) : WEEKDAYS.slice(0, 5) } : null);
+      return { ok: true, text: `${acc.company}: time zone → ${a.tz}${hrs} (their time now ${w.local} — ${CALL_WINDOWS[w.window].label.toLowerCase()})` };
+    }
+    case "set_account": {
+      const acc = findAccount(st, a.account || a.accountId);
+      if (!acc) return bad(`No account “${a.account || a.accountId}”`);
+      const st2 = a.status === "active" ? "" : a.status;
+      const changes = [a.status !== undefined && ["active", "closed", "bad fit"].includes(a.status) && (acc.status || "") !== st2 ? `status → ${a.status}` : "", typeof a.highConfidence === "boolean" && !!acc.highConfidence !== a.highConfidence ? (a.highConfidence ? "⭐ high confidence" : "not high confidence") : ""].filter(Boolean);
+      if (!changes.length) return bad(`${acc.company}: nothing to change`);
+      return { ok: true, text: `${acc.company}: ${changes.join(", ")}` };
+    }
     case "note": {
       const r = locateRecord(st, a.id);
       if (!r) return bad(`Note: nothing with id ${a.id}`);
@@ -16609,8 +17009,101 @@ function runAgentActions(st0, reviewed) {
         findPeople(st, a.criteria).forEach((p) => patchRecord(locateRecord(st, p.id), (x) => withTags(x, a.add || [], a.remove || [])));
         break;
       case "temperature":
-        patchRecord(r, (x) => ({ ...x, temperature: a.value || "", temperatureAt: a.value ? today() : "" }));
+        (a.criteria || Array.isArray(a.ids) ? actionTargets(st, a) : [r]).forEach((t) => patchRecord(locateRecord(st, (t.kind === "contact" ? t.c : t.app).id), (x) => ({ ...x, temperature: a.value || "", temperatureAt: a.value ? today() : "" })));
         break;
+      case "set_status":
+      case "set_nurture":
+      case "set_linkedin":
+      case "log_touchpoint":
+      case "tick_followup":
+        actionTargets(st, a)
+          .filter((t) => !personActionProblem(a, t))
+          .forEach((t) => patchRecord(locateRecord(st, (t.kind === "contact" ? t.c : t.app).id), (x) => personActionApply(a, x, t.kind)));
+        break;
+      case "remove_from_run": {
+        const run = runOrder(st);
+        const pos = parsePositions(a);
+        const drop = new Set([...run.filter((x) => pos.includes(x.pos)).map((x) => x.id), ...(a.contactIds || [])]);
+        st = { ...st, callSession: (st.callSession || []).filter((id) => !drop.has(id)) };
+        break;
+      }
+      case "clear_run":
+        st = { ...st, callSession: [] };
+        break;
+      case "move_in_run": {
+        const live = runOrder(st).map((x) => x.id).filter((id) => id !== a.contactId);
+        const to = Math.max(1, Math.min(live.length + 1, Math.round(num(a.to) || 1)));
+        live.splice(to - 1, 0, a.contactId);
+        st = { ...st, callSession: live };
+        break;
+      }
+      case "order_run": {
+        const run = runOrder(st);
+        const facts = new Map(run.map((x) => [x.id, callFacts(x.acc, x.c)]));
+        const tr = (id) => TEMP_RANK[facts.get(id).temp] ?? 3;
+        const ids = run.map((x) => x.id);
+        const by = a.by;
+        ids.sort((p, q) => {
+          const P = facts.get(p);
+          const Q = facts.get(q);
+          return by === "hottest"
+            ? tr(p) - tr(q)
+            : by === "fewest_attempts"
+            ? P.attempts - Q.attempts
+            : by === "longest_since_call"
+            ? Q.daysSinceCall - P.daysSinceCall
+            : by === "company"
+            ? (P.acc.company || "").localeCompare(Q.acc.company || "")
+            : by === "callable_now"
+            ? WIN_RANK[callWindowOf(P.c, P.acc).window] - WIN_RANK[callWindowOf(Q.c, Q.acc).window] || tr(p) - tr(q)
+            : (Q.callDue ? 1 : 0) - (P.callDue ? 1 : 0) || tr(p) - tr(q);
+        });
+        st = { ...st, callSession: ids };
+        break;
+      }
+      case "create_account": {
+        const acc = { id: uid(), company: String(a.company).trim(), website: String(a.website || "").trim(), industry: String(a.industry || "").trim(), status: "", notes: "", contacts: [], listIds: [] };
+        st = { ...st, accounts: [acc, ...(st.accounts || [])] };
+        arr(a.lists).forEach((ref) => {
+          const l = findList(st, ref);
+          if (l) st = addAccountsToList(st, l.id, [acc.id]);
+        });
+        break;
+      }
+      case "add_contact": {
+        const acc = findAccount(st, a.account || a.accountId);
+        if (!acc) return;
+        const c = { id: uid(), name: String(a.name).trim(), position: String(a.position || "").trim(), email: String(a.email || "").trim(), phone: String(a.phone || "").trim(), linkedin: String(a.linkedin || "").trim(), notes: String(a.notes || "").trim(), status: "", outreachKind: "", contacted: "", followUps: [], touchpoints: [], linkedApplicationId: null };
+        st = { ...st, accounts: (st.accounts || []).map((x) => (x.id === acc.id ? { ...x, contacts: [...(x.contacts || []), c] } : x)) };
+        touchedAccounts.add(acc.id);
+        break;
+      }
+      case "update_contact": {
+        const allowed = ["position", "email", "phone", "linkedin", "hook"];
+        const patch = Object.fromEntries(Object.entries(a.fields || {}).filter(([k2]) => allowed.includes(k2)).map(([k2, v]) => [k2, String(v ?? "").trim()]));
+        patchRecord(r, (x) => ({ ...x, ...patch }));
+        break;
+      }
+      case "set_timezone": {
+        if (a.id) {
+          patchRecord(r, (x) => ({ ...x, timezone: a.tz }));
+          break;
+        }
+        const acc = findAccount(st, a.account || a.accountId);
+        if (!acc) return;
+        const hours = num(a.openHour) != null && num(a.closeHour) != null ? { open: num(a.openHour), close: num(a.closeHour), days: arr(a.openDays).length ? a.openDays : WEEKDAYS.slice(0, 5) } : acc.businessHours;
+        st = { ...st, accounts: (st.accounts || []).map((x) => (x.id === acc.id ? { ...x, timezone: a.tz, ...(hours ? { businessHours: hours } : {}) } : x)) };
+        break;
+      }
+      case "set_account": {
+        const acc = findAccount(st, a.account || a.accountId);
+        if (!acc) return;
+        const patch = {};
+        if (["active", "closed", "bad fit"].includes(a.status)) patch.status = a.status === "active" ? "" : a.status;
+        if (typeof a.highConfidence === "boolean") patch.highConfidence = a.highConfidence;
+        st = { ...st, accounts: (st.accounts || []).map((x) => (x.id === acc.id ? { ...x, ...patch } : x)) };
+        break;
+      }
       case "create_list":
         st = createAccountList(st, a.name, a.industry).st;
         break;
@@ -16732,7 +17225,9 @@ Rules:
 - You can add or remove PENDING follow-ups. "fu" in the data lists each one as date + channel, with DUE when it's due today or earlier. You cannot tick a follow-up as done, or remove ticked ones.
 - A written follow-up needs the person to have been contacted already ("contacted" date or a status other than "not contacted"); a call follow-up doesn't.
 - To organise lists: create lists, rename them, set their industry, delete empty or redundant ones, and fill them with add_to_list_where (by industry, segment, temperature…). Propose a whole reorganisation in one reply so the user approves it at once.
-- You cannot change statuses, phone numbers or delete accounts, contacts or leads. If asked, say the user needs to do that themselves.
+- "Their local time" is worked out from THIS device's clock converted into each person's time zone. The tz column in the data gives each contact's zone, their local time now and the window (business / after / closed / unknown). For "who can I call now", use criteria callWindow:"callable". For companies whose zone is unknown or a guess, use start_research — it finds HQ location, time zone and opening hours.
+- You can change statuses, nurture plans, LinkedIn status, contact details, call-run order, log what the user did, and create accounts and contacts. Only log or tick something the user says actually happened.
+- You cannot delete or archive accounts, contacts or leads, or change Settings. If asked, say the user needs to do that themselves.
 - Keep reply under 120 words. Mention counts ("tagged 12 contacts") rather than listing everyone.`;
 
 /* ---- finding people ----
@@ -16767,6 +17262,11 @@ function findPeople(st, crit = {}) {
   const wantDue = yes(k.dueFollowUp) || num(k.overdueMinDays) != null || num(k.overdueMaxDays) != null;
   const dueMap = wantDue ? new Map(dueFollowUpPeople(st).map((d) => [d.id, d])) : null;
   let out = people.filter((p) => {
+    if (k.callWindow || k.timezone) {
+      const w = p.kind === "contact" ? callWindowOf(p.rec, p.acc) : callWindowOf({ phone: p.phone }, null);
+      if (k.callWindow && !windowMatches(w.window, String(k.callWindow))) return false;
+      if (k.timezone && !String(w.tz || "").toLowerCase().includes(String(k.timezone).toLowerCase().replace(/\s+/g, "_"))) return false;
+    }
     if (wantDue) {
       const d = dueMap.get(p.id);
       if (!d) return false;
@@ -16890,6 +17390,13 @@ const RESEARCH_BATCH = 8;
 function researchPool(st, scope = {}) {
   const k = scope || {};
   /* "the +1 contacts' companies": accounts of whoever the search returns */
+  /* companies where at least one callable person has no zone, or only a guess */
+  if (k.tzUnknown) {
+    return (st.accounts || [])
+      .filter((a) => isAccountOpen(a) && !validTz(a.timezone) && liveContacts(a).some((c) => hasPhone(c) && c.status !== "closed" && (!tzOf(c, a) || tzOf(c, a).guess)))
+      .sort((a, b) => (a.company || "").localeCompare(b.company || ""))
+      .map((a) => a.id);
+  }
   if (k.criteria && typeof k.criteria === "object") {
     const seen = new Set();
     return findPeople(st, { ...k.criteria, who: "contacts" })
@@ -16939,6 +17446,10 @@ function parseResearchReply(raw, st, batchIds, { question = "", then = {} } = {}
       sources: (Array.isArray(r.sources) ? r.sources : []).filter((u) => /^https?:\/\//.test(String(u))).slice(0, 3),
       /* the user's question: true, false, or null when it couldn't tell */
       matches: r.matches === true || r.matches === "true" ? true : r.matches === false || r.matches === "false" ? false : null,
+      timezone: validTz(r.timezone) ? r.timezone : "",
+      openHour: num(r.openHour),
+      closeHour: num(r.closeHour),
+      openDays: arr(r.openDays).map((d) => WEEKDAYS.find((w) => w.toLowerCase() === d.slice(0, 3))).filter(Boolean),
       location: clip(r.location, 80),
       why: clip(r.why, 200),
     }));
@@ -16979,6 +17490,15 @@ function parseResearchReply(raw, st, batchIds, { question = "", then = {} } = {}
         });
       });
   }
+  /* the company's time zone (and real hours, when published) — proposed for
+     any account that doesn't already have that zone set */
+  results.forEach((r) => {
+    const acc = (st.accounts || []).find((x) => x.id === r.accountId);
+    if (!acc || !r.timezone) return;
+    const hasHours = r.openHour != null && r.closeHour != null && r.closeHour > r.openHour;
+    if (acc.timezone === r.timezone && !hasHours) return;
+    actions.push({ type: "set_timezone", account: acc.id, tz: r.timezone, ...(hasHours ? { openHour: r.openHour, closeHour: r.closeHour, openDays: r.openDays.length ? r.openDays : undefined } : {}), ...(r.confidence === "low" ? { _unchecked: true } : {}) });
+  });
   /* industry and segment tags: the default when there's no question, or
      when asked for alongside one */
   if (!question || t.setIndustry) results.forEach((r) => {
@@ -17160,6 +17680,10 @@ const AGENT_STARTERS = [
   "Read my notes and tell me who's actually worth following up",
   "Organise my accounts into lists by industry",
   "Find everyone with a +1 number",
+  "Take numbers 31–36 out of my call run",
+  "Who can I call right now? Put them first in my run",
+  "Research the time zones of companies I can't place",
+  "Mark everyone at Vandis as replied",
   "Research what industry my untagged accounts are in and tag them",
 ];
 
@@ -17306,7 +17830,7 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
             user: `TODAY: ${today()}
 TASK: Research these companies (${range}). The user's focus: "${r.focus}"
 
-For each company, search the web (use the website if given) and find what industry and segment it is in, and where it is based.${
+For each company, search the web (use the website if given) and find what industry and segment it is in, where it is based (its time zone), and its opening hours if published (leave openHour/closeHour out if not found — never guess hours).${
             r.question
               ? `
 
@@ -17315,7 +17839,7 @@ Judge from what you find on the web, not from the company name or the person's p
               : ""
           }
 Reply with ONE JSON object and nothing else:
-{"reply": "1–3 sentences on this batch", "results": [{"accountId": "<id>", "industry": "short industry label, e.g. Managed IT services", "tags": ["1-3 short lower-case segment tags, e.g. msp, cybersecurity"], "location": "city, state/country of HQ if found", ${r.question ? `"matches": true|false|null, "why": "short evidence for the answer", ` : ""}"summary": "one line: what they do, size or region if found", "confidence": "high|medium|low", "sources": ["https://…"]}]}
+{"reply": "1–3 sentences on this batch", "results": [{"accountId": "<id>", "industry": "short industry label, e.g. Managed IT services", "tags": ["1-3 short lower-case segment tags, e.g. msp, cybersecurity"], "location": "city, state/country of HQ if found", "timezone": "IANA zone of the HQ, e.g. America/New_York", "openHour": 9, "closeHour": 17, "openDays": ["Mon","Tue","Wed","Thu","Fri"], ${r.question ? `"matches": true|false|null, "why": "short evidence for the answer", ` : ""}"summary": "one line: what they do, size or region if found", "confidence": "high|medium|low", "sources": ["https://…"]}]}
 Give a result for EVERY company below, using its id exactly. Reuse these existing tags where they fit: ${Array.from(new Set((state.accounts || []).flatMap((a) => liveContacts(a).flatMap(tagsOf)))).slice(0, 60).join(", ") || "(none yet)"}.
 
 COMPANIES:
@@ -17545,6 +18069,13 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                           ) : null}
                           <span style={{ fontWeight: 700 }}>{acc?.company || "?"}</span> <span style={{ color: C.blue }}>· {r.industry || "not found"}</span>
                           {r.location ? <span style={{ color: C.muted }}> · {r.location}</span> : null}
+                          {r.timezone ? (
+                            <span style={{ color: C.muted }}>
+                              {" "}
+                              · 🕐 {tzCity(r.timezone)}
+                              {r.openHour != null && r.closeHour != null ? ` ${r.openHour}:00–${r.closeHour}:00` : ""}
+                            </span>
+                          ) : null}
                           <span style={{ fontFamily: mono, fontSize: 9, color: col, marginLeft: 6 }}>{r.confidence.toUpperCase()}</span>
                           {r.tags.length > 0 && <span style={{ color: C.muted }}> {r.tags.map((t) => `#${t}`).join(" ")}</span>}
                           {(r.why || r.summary) && <div style={{ color: C.muted, fontSize: 11 }}>{m.research?.question && r.why ? r.why : r.summary}</div>}
@@ -17864,6 +18395,22 @@ function ContactBadges({ contact, style }) {
         </span>
       ))}
     </div>
+  );
+}
+
+/* their local time and whether to call now, for the queue and the run */
+function CallWindowBadge({ contact, account, now }) {
+  const w = callWindowOf(contact, account, now);
+  const meta = CALL_WINDOWS[w.window];
+  const col = TONE_COL[meta.tone] || C.muted;
+  return (
+    <span
+      title={w.tz ? `${tzCity(w.tz)} time (${w.source})${w.hours ? ` · company hours ${w.hours.days[0]}–${w.hours.days[w.hours.days.length - 1]} ${w.hours.open}:00–${w.hours.close}:00` : " · default Mon–Fri 9–5"}${w.guess ? " — a guess; set the account's time zone to be sure" : ""}` : "No time zone — add a +country number or set the account's time zone"}
+      style={{ fontFamily: mono, fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 8, border: `1px solid ${col}`, color: col, whiteSpace: "nowrap" }}
+    >
+      {meta.icon} {meta.short}
+      {w.local ? ` · ${w.local} ${tzCity(w.tz)}${w.guess ? "?" : ""}` : ""}
+    </span>
   );
 }
 
