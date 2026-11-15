@@ -17147,6 +17147,7 @@ const FIND_DOC = `{"type":"find","criteria":{ ...any of these, all must match...
   askedForEmail: true  (on a call they asked to be emailed — at any time)
   emailedAfterAsk: true|false  (after asking, an email was / wasn't sent)
   noteText: "words"  (in your notes or any touch-point note only)
+  anyOf: {"channels":["email"],"sent":["content"],"noteText":["one pager","one-pager"]}  (matches if ANY ONE of these is true — for "emailed OR sent a one-pager". channels: call, email, linkedin, social, text, meeting; sent: content (one-pagers, decks, case studies), video, voicenote)
   touchedWithinDays: N   notTouchedForDays: N  (last touch point of any kind)
   dueFollowUp: true  (has a follow-up due today or overdue — exactly the people in the app's DUE count)
   overdueMinDays / overdueMaxDays: N  (their oldest due follow-up was due at least / at most N days ago; implies dueFollowUp)
@@ -17190,8 +17191,10 @@ ACCOUNTS & CONTACTS:
 - {"type":"set_account","account":"<account id or company>","status":"active"|"closed"|"bad fit","highConfidence":true|false}
 - {"type":"set_timezone","account":"<account id or company>" OR "id":"<contact id>","tz":"America/New_York","openHour":8,"closeHour":18,"openDays":["Mon","Tue","Wed","Thu","Fri"]}   (IANA zone; hours optional — the company's real opening hours in its own time, if known)
 - {"type":"remove_followups","id":"<contact or lead id>","scope":"due"|"all_pending","track":"email"|"call"|"any"}   ("due" = pending and due today or earlier; ticked follow-ups are history and are never removed)
-- {"type":"start_review","focus":"what to judge, in the user's words","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true}}   (all scope keys optional)
+- {"type":"start_review","focus":"what to judge, in the user's words","only":"the TYPE of lead asked for, in plain words","label":"short heading, e.g. Warm leads you've emailed","scope":{"who":"contacts"|"leads"|"all","due":true,"lists":["list"],"temperature":["hot"],"tags":["tag"],"status":["outreach"],"search":"name or company","hasNotes":true,"anyOf":{...as in find},"find":{...any find criteria}}}   (all scope keys optional)
   Use start_review when the user wants you to read their notes, judge who is worth following up, or asks about anything the CRM DATA doesn't show (what was said, notes, touch-point details). The app then sends you full notes and history 50 prospects at a time. It changes nothing and runs straight away.
+  When the user asks for a TYPE of lead ("warm leads I've emailed or sent a one-pager", "who asked for pricing", "people who said call back in January"), set "only" — then ONLY the matching prospects are shown, and everyone else is left out of the chat entirely. Leave "only" out for an open "who's worth following up?" review.
+  Also put every part the data can check into scope, so only those people are read: emailed → anyOf.channels ["email"]; sent a one-pager/deck/content → anyOf.sent ["content"] and anyOf.noteText ["one pager","one-pager"]; "emailed or sent a one-pager" → all of those in ONE anyOf (any one is enough). Temperature, tags, status, lists, due as above. The judgement part ("actually warm, from my notes") goes in "only".
 - {"type":"start_research","mode":"profile","scope":{"inRun":true} | {"accountIds":["<id>"]} | {"names":["Acme Pty Ltd"]} | {"lists":["…"]}}
   COMPANY BRIEFINGS — "what does X do?", "research Acme", "brief me on my call run". Searches the web first, then the company's own website, and returns what they do, services, customers, size, location, recent news and call angles. Works for companies not in the CRM too (names). 5 per batch.
 - {"type":"segment_search","segment":"coaching","match":["coach","life coach","executive coaching"],"tag":"coaching","scope":{ optional: "lists", "criteria", "accountIds", "inRun" },"research":true,"addToList":"optional list name"}
@@ -17745,6 +17748,26 @@ Rules:
    model writes the criteria; this code does the matching, so a count of 23
    is 23 and nobody is invented. */
 
+/* "emailed OR sent a one-pager" — any one part is enough. Email counts any
+   email touch point (and a pipeline lead marked contacted, since that
+   outreach is an email); a one-pager is the "content" sent tag, or the
+   words in a note when it was only written down. */
+const SENT_ALIASES = { "one-pager": "content", "one pager": "content", onepager: "content", deck: "content", pdf: "content", "case study": "content", "voice note": "voicenote", voice: "voicenote", loom: "video" };
+function matchesAnyOf(p, any) {
+  const tps = p.rec.touchpoints || [];
+  const lanes = new Set(tps.map((t) => (/email/i.test(t.channel || "") ? "email" : laneOf(t.channel))));
+  if (p.kind === "lead" && p.rec.contacted) lanes.add("email");
+  const chans = arr(any.channels).map((l) => String(l).toLowerCase()).map((l) => (l === "phone" ? "call" : l));
+  if (chans.some((l) => lanes.has(l))) return true;
+  const kinds = arr(any.sent).map((x) => String(x).toLowerCase()).map((x) => SENT_ALIASES[x] || x);
+  if (kinds.length && tps.some((t) => sentOf(t).some((x) => kinds.includes(x)))) return true;
+  const words = arr(any.noteText).map((x) => String(x).toLowerCase().trim()).filter(Boolean);
+  if (words.length) {
+    const hay = [p.rec.notes, ...tps.map((t) => t.note)].filter(Boolean).join(" ").toLowerCase();
+    if (words.some((w) => hay.includes(w))) return true;
+  }
+  return false;
+}
 function findPeople(st, crit = {}) {
   const k = crit || {};
   const who = k.who || "all";
@@ -17786,6 +17809,7 @@ function findPeople(st, crit = {}) {
       const lanes = new Set((p.rec.touchpoints || []).map((t) => laneOf(t.channel)));
       if (!arr(k.hasChannels).every((l) => lanes.has(l === "phone" ? "call" : l))) return false;
     }
+    if (k.anyOf && typeof k.anyOf === "object" && !matchesAnyOf(p, k.anyOf)) return false;
     if (yes(k.askedForEmail) && !(p.rec.emailRequested || (p.rec.touchpoints || []).some((t) => t.wantsEmail))) return false;
     if (k.emailedAfterAsk !== undefined && k.emailedAfterAsk !== "" && k.emailedAfterAsk !== null) {
       if (!p.rec.emailRequested) return false;
@@ -18170,6 +18194,10 @@ function reviewPool(st, scope = {}) {
   const statuses = arr(k.status);
   const listIds = arr(k.lists).map((ref) => findList(st, ref)).filter(Boolean).map((l) => l.id);
   const search = String(k.search || "").trim().toLowerCase();
+  /* anything find can check narrows who gets read, so "warm leads I've
+     emailed" reads the people who were emailed, not all 460 */
+  const findCrit = { ...(k.find && typeof k.find === "object" ? k.find : {}), ...(k.anyOf && typeof k.anyOf === "object" ? { anyOf: k.anyOf } : {}) };
+  const findOk = Object.keys(findCrit).length ? new Set(findPeople(st, { ...findCrit, who }).map((x) => x.id)) : null;
   const rows = [];
   if (who !== "leads")
     (st.accounts || []).forEach((acc) =>
@@ -18182,6 +18210,7 @@ function reviewPool(st, scope = {}) {
       .filter((a) => !a.fromAccountContact && !a.archivedAt && isOpenApp(a))
       .forEach((a) => rows.push({ kind: "lead", id: a.id, rec: a, acc: null, name: a.contact || a.role, company: a.company, notes: a.notes || "", due: isDue(a) }));
   return rows
+    .filter((r) => !findOk || findOk.has(r.id))
     .filter((r) => !k.due || r.due)
     .filter((r) => !temps.length || temps.includes(r.rec.temperature || "none"))
     .filter((r) => !tags.length || tagsOf(r.rec).some((t) => tags.includes(t)))
@@ -18229,7 +18258,7 @@ const REVIEW_VERDICTS = [
 ];
 /* Review replies must carry verdicts; one without them is treated as a
    failure so it's retried, rather than shown as if the batch had been read. */
-function parseReviewReply(raw, batchIds) {
+function parseReviewReply(raw, batchIds, { only = false } = {}) {
   const text = String(raw || "").trim();
   const a = text.indexOf("{");
   const b = text.lastIndexOf("}");
@@ -18246,7 +18275,13 @@ function parseReviewReply(raw, batchIds) {
   const seen = new Set();
   const verdicts = j.verdicts
     .filter((v) => v && ids.has(v.id) && !seen.has(v.id) && seen.add(v.id))
-    .map((v) => ({ id: v.id, verdict: REVIEW_VERDICTS.some((x) => x.key === v.verdict) ? v.verdict : "unclear", why: clip(v.why, 200), next: clip(v.next, 160) }));
+    .map((v) => ({
+      id: v.id,
+      verdict: REVIEW_VERDICTS.some((x) => x.key === v.verdict) ? v.verdict : only ? "follow_up" : "unclear",
+      why: clip(v.why, 200),
+      next: clip(v.next, 160),
+      ...(only ? { match: v.match === true || v.match === "true" } : {}),
+    }));
   if (!verdicts.length) throw new Error("None of the verdicts matched the prospects sent.");
   return {
     reply: String(j.reply || "").trim(),
@@ -18398,12 +18433,14 @@ function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo
     const poolIds = review.poolIds || reviewPool(state, review.scope);
     const offset = review.offset || 0;
     const batch = poolIds.slice(offset, offset + REVIEW_BATCH).filter((id) => locateRecord(state, id));
-    const r = { focus: review.focus || "Which of these are worth following up, and what should I do next with each?", scope: review.scope || {}, poolIds, offset };
+    const only = String(review.only || "").trim();
+    const r = { focus: review.focus || "Which of these are worth following up, and what should I do next with each?", scope: review.scope || {}, poolIds, offset, ...(only ? { only, label: String(review.label || "").trim() || clip(only, 60), jobId: review.jobId || uid() } : {}) };
     if (!batch.length) {
-      push(base, { role: "assistant", text: poolIds.length ? "That's everyone — no more prospects left to review." : "No open prospects match that." });
+      push(base, { role: "assistant", text: poolIds.length ? "That's everyone — no more prospects left to review." : only ? `Nobody in your CRM fits the first cut for “${r.label}” — no one to read.` : "No open prospects match that." });
       return;
     }
     const range = `${offset + 1}–${offset + batch.length} of ${poolIds.length}`;
+    if (only && offset === 0 && poolIds.length > batch.length) push(base, { role: "assistant", text: `Reading ${poolIds.length} prospects for “${r.label}”, ${REVIEW_BATCH} at a time — only the ones that fit will show here.` });
     try {
       const out = await withRetry(
         async () => {
@@ -18413,7 +18450,16 @@ function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo
             system: AGENT_SYSTEM,
             user: `TODAY: ${today()}
 TASK: Review these prospects (${range}). The user's focus: "${r.focus}"
+${
+  only
+    ? `
+The user ONLY wants prospects that fit: "${only}". Be strict — judge from their notes, touch points and history; if the evidence isn't written down, it isn't a match. Every part of what they asked must hold.
 
+Reply with ONE JSON object:
+{"reply": "1–2 sentences about the matches only — never describe or list the ones that don't fit; if none fit, one short sentence saying so", "verdicts": [{"id": "<id>", "match": true|false, "why": "matches only: the evidence, under 20 words, e.g. emailed 3 Nov; said send pricing", "next": "matches only: one concrete step, under 15 words"}], "actions": [optional changes — only if the user's focus asks for changes]}
+Give {"id","match"} for EVERY prospect below, using its id exactly.
+`
+    : `
 Read each one's notes, touch points, call outcomes, temperature and follow-ups, and judge it:
 - follow_up: worth chasing now
 - nurture: real potential but not now
@@ -18423,23 +18469,50 @@ Read each one's notes, touch points, call outcomes, temperature and follow-ups, 
 Reply with ONE JSON object:
 {"reply": "2–4 sentence summary of this batch: patterns, who stands out", "verdicts": [{"id": "<id>", "verdict": "follow_up|nurture|unclear|drop", "why": "under 20 words, from their notes/history", "next": "concrete next step, under 15 words"}], "actions": [optional changes, same action types as usual — only if the user's focus asks for changes]}
 Give a verdict for EVERY prospect below, using its id exactly.
-
+`
+}
 PROSPECTS:
 ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
           });
-          return parseReviewReply(raw, batch);
+          return parseReviewReply(raw, batch, { only: !!only });
         },
         { onAttempt: attemptNote(`Reviewing ${range}…`), signal: abortRef.current?.signal }
       );
-      push(base, { role: "assistant", kind: "review", text: out.reply || `Reviewed ${range}.`, verdicts: out.verdicts, missing: out.missing, actions: out.actions, review: { ...r, size: batch.length }, at: Date.now() });
+      if (only) {
+        /* only the leads asked for reach the chat; the rest are a count */
+        const hits = out.verdicts.filter((v) => v.match);
+        push(base, {
+          role: "assistant",
+          kind: "review",
+          text: hits.length ? out.reply || `${hits.length} fit.` : `No “${r.label}” in ${range}.`,
+          verdicts: hits,
+          skipped: out.verdicts.length - hits.length,
+          missing: out.missing,
+          actions: out.actions,
+          review: { ...r, size: batch.length },
+          at: Date.now(),
+        });
+      } else push(base, { role: "assistant", kind: "review", text: out.reply || `Reviewed ${range}.`, verdicts: out.verdicts, missing: out.missing, actions: out.actions, review: { ...r, size: batch.length }, at: Date.now() });
+      /* one list of every match once a multi-batch "only" review is done */
+      const finishOnly = (stopped = false) => {
+        if (!only) return;
+        const ids = [];
+        msgsRef.current.forEach((m) => m.kind === "review" && m.review?.jobId === r.jobId && (m.verdicts || []).forEach((v) => v.match && !ids.includes(v.id) && ids.push(v.id)));
+        if (stopped) {
+          if (ids.length) push(null, { role: "assistant", kind: "found", ids, criteria: {}, text: `So far ${ids.length} — ${r.label}` });
+        } else if (poolIds.length > REVIEW_BATCH)
+          push(null, ids.length ? { role: "assistant", kind: "found", ids, criteria: {}, text: `✓ All ${ids.length} — ${r.label}` } : { role: "assistant", text: `✓ Done — none of the ${poolIds.length} fit “${r.label}”.` });
+      };
       /* straight on to the next 50 until the list is done or you press Stop */
       if (offset + REVIEW_BATCH < poolIds.length) {
         if (stopRef.current) {
           push(null, { role: "assistant", text: `Stopped after ${range}. “Review next” picks up from here.` });
+          finishOnly(true);
           notify("done", `Review stopped after ${range}`);
         } else await runReview({ ...r, offset: offset + REVIEW_BATCH });
       } else {
-        if (offset > 0) push(null, { role: "assistant", text: `✓ Review finished — all ${poolIds.length} prospects done.` });
+        if (only) finishOnly();
+        else if (offset > 0) push(null, { role: "assistant", text: `✓ Review finished — all ${poolIds.length} prospects done.` });
         notify("done", `Review finished — ${poolIds.length} prospects reviewed`);
       }
     } catch (e) {
@@ -18700,7 +18773,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
       });
       if (!out.review && !out.research && !out.segment) notify("done", out.actions.length ? `CRM assistant has ${out.actions.length} ${out.actions.length === 1 ? "change" : "changes"} for you to approve` : "CRM assistant replied");
       /* the model asked to read the detail — run the first batch straight away */
-      if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {} }, next);
+      if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {}, only: out.review.only, label: out.review.label }, next);
       if (out.segment) await runSegment(out.segment);
       if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, mode: out.research.mode, question: out.research.question, then: out.research.then, scope: out.research.scope || {} });
     } catch (e) {
@@ -18801,8 +18874,9 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
           const chosen = review.filter((r, k) => r.ok && sel[k]).map((r) => r.action);
           const rv = m.review;
           const remaining = rv ? rv.poolIds.length - (rv.offset + (rv.size || REVIEW_BATCH)) : 0;
+          const quietBatch = rv?.only && !m.verdicts?.length && !m.missing?.length && !m.actions?.length && i !== lastReviewIdx;
           return (
-            m.kind === "tool" ? (
+            m.kind === "tool" || quietBatch ? (
               <div key={i} style={{ fontSize: 11, color: C.muted, margin: "-4px 0 8px 4px", whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
                 {m.text}
               </div>
@@ -18837,7 +18911,25 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                 )}
                 {m.kind === "found" && <FoundList ids={m.ids} state={state} onApply={onApply} />}
                 {/* verdicts, grouped so the ones worth chasing come first */}
-                {m.verdicts?.length > 0 && (
+                {rv?.only && (m.verdicts?.length > 0 || m.missing?.length > 0) && (
+                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
+                    {m.verdicts?.length > 0 && (
+                      <div style={{ fontSize: 11, fontWeight: 800, color: C.green, marginBottom: 3 }}>
+                        🎯 {rv.label} ({m.verdicts.length})
+                      </div>
+                    )}
+                    {(m.verdicts || []).map((v) => (
+                      <div key={v.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>
+                        <span style={{ fontWeight: 700 }}>{recordLabel(locateRecord(state, v.id))}</span>
+                        {v.why ? <span style={{ color: C.muted }}> — {v.why}</span> : null}
+                        {v.next ? <div style={{ color: C.ink, fontSize: 11 }}>→ {v.next}</div> : null}
+                      </div>
+                    ))}
+                    {m.skipped > 0 && <div style={{ fontSize: 11, color: C.muted }}>{m.skipped} others in this batch didn&apos;t fit — left out.</div>}
+                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} in this batch came back unread — “Review again” to retry it.</div>}
+                  </div>
+                )}
+                {!rv?.only && m.verdicts?.length > 0 && (
                   <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
                     {REVIEW_VERDICTS.map((g) => {
                       const vs = m.verdicts.filter((v) => v.verdict === g.key);
