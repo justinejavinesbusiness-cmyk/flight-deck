@@ -419,6 +419,11 @@ const accountsInList = (st, listId) => (st.accounts || []).filter((a) => (a.list
    lower-case and trimmed so "Agency" and "agency " are one tag. */
 const normTag = (t) => String(t || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 40);
 const tagsOf = (x) => (Array.isArray(x?.tags) ? x.tags.filter(Boolean) : []);
+/* Do Not Call: a DNC tag on the person, or on their company, keeps them out
+   of every call run the assistant builds. Spellings people actually use. */
+const DNC_TAG_RE = /^(dnc|d\.n\.c\.?|dnc list|do[\s_-]*not[\s_-]*call|donotcall|don'?t[\s_-]*call|no[\s_-]*calls?|never[\s_-]*call)$/i;
+const isDncTag = (t) => DNC_TAG_RE.test(normTag(t).replace(/^#/, ""));
+const isDnc = (c, acc) => tagsOf(c).some(isDncTag) || tagsOf(acc).some(isDncTag);
 const withTags = (x, add = [], remove = []) => {
   const drop = new Set(remove.map(normTag));
   const next = Array.from(new Set([...tagsOf(x), ...add.map(normTag)].filter((t) => t && !drop.has(t))));
@@ -3460,14 +3465,121 @@ function migrate(saved) {
 }
 
 /* ---------- merge (two-way sync without data loss) ---------- */
-/* union entry lists by id — remote order first, local-only appended; remote wins id collisions */
-function unionById(localArr = [], remoteArr = []) {
-  const remoteIds = new Set(remoteArr.map((x) => x && x.id));
-  return [...remoteArr, ...localArr.filter((x) => x && !remoteIds.has(x.id))];
+/* ---------- change-aware merge ----------
+   The old merge let the server's copy of a record win outright, and every
+   save overwrote the whole server copy. So two devices editing different
+   things (a call logged on the phone, a note on the laptop) quietly undid
+   each other. Now each device remembers a fingerprint of what the server
+   held when it last synced (the "base"). Comparing both sides to that base
+   says who changed what, field by field:
+     changed only here      → keep this device's value
+     changed only there     → take the other device's value
+     changed on both        → lists of records merge record by record; for a
+                              plain value this device's (newer) edit wins
+     removed on one side and untouched on the other → stays removed
+   Without a base (first sync on a device) it falls back to the old rule:
+   the server's copy wins and nothing is dropped. */
+function hashStr(str) {
+  let h1 = 0x811c9dc5;
+  let h2 = 5381;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619);
+    h2 = (Math.imul(h2, 33) + c) | 0;
+  }
+  return (h1 >>> 0).toString(36) + "." + (h2 >>> 0).toString(36);
 }
-function mergeStates(localS, remoteS) {
+const NONE_H = "-";
+const hashJson = (j) => (j === undefined ? NONE_H : hashStr(j));
+const isPlainObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+const isIdItem = (x) => isPlainObj(x) && x.id != null && x.id !== "";
+/* fingerprint of every field: the state's own fields, every plain object
+   inside it (by path), and every record with an id (by id) */
+function buildSyncBase(state) {
+  const B = {};
+  const walk = (obj, key) => {
+    const f = {};
+    for (const k of Object.keys(obj)) {
+      const v = obj[k];
+      f[k] = hashJson(JSON.stringify(v));
+      if (Array.isArray(v)) v.forEach((x) => isIdItem(x) && walk(x, "#" + x.id));
+      else if (isPlainObj(v)) walk(v, key + "." + k);
+    }
+    B[key] = f;
+  };
+  if (isPlainObj(state)) walk(state, "@");
+  return B;
+}
+function recordChangedSince(x, fb) {
+  const keys = new Set([...Object.keys(x), ...Object.keys(fb)]);
+  for (const k of keys) if ((fb[k] || NONE_H) !== hashJson(JSON.stringify(x[k]))) return true;
+  return false;
+}
+function merge3Obj(L, R, key, B) {
+  const fb = key ? B[key] : null;
+  const out = {};
+  const keys = new Set([...Object.keys(R), ...Object.keys(L)]);
+  for (const k of keys) {
+    const a = L[k];
+    const b = R[k];
+    const ja = JSON.stringify(a);
+    const jb = JSON.stringify(b);
+    let v;
+    if (ja === jb) v = b;
+    else {
+      const was = fb ? fb[k] || NONE_H : null;
+      const lc = was == null || hashJson(ja) !== was;
+      const rc = was == null || hashJson(jb) !== was;
+      if (lc && !rc) v = a;
+      else if (rc && !lc) v = b;
+      else v = merge3Val(a, b, B, key ? key + "." + k : null);
+    }
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
+}
+function merge3Val(a, b, B, childKey) {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.every(isIdItem) && b.every(isIdItem)) return merge3List(a, b, B);
+    if ([...a, ...b].every((x) => x === null || typeof x !== "object")) {
+      const seen = new Set(b.map((x) => JSON.stringify(x)));
+      return [...b, ...a.filter((x) => !seen.has(JSON.stringify(x)))];
+    }
+    return B.__noBase ? b : a;
+  }
+  if (isPlainObj(a) && isPlainObj(b)) return merge3Obj(a, b, childKey, B);
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  /* a true clash on one value: with a base it's a fresh edit here, so it
+     wins; without one we can't tell, so the server's copy wins as before */
+  return B.__noBase ? b : a;
+}
+function merge3List(Ls, Rs, B) {
+  const Lm = new Map(Ls.map((x) => [String(x.id), x]));
+  const Rm = new Map(Rs.map((x) => [String(x.id), x]));
+  const out = [];
+  for (const r of Rs) {
+    const id = String(r.id);
+    const l = Lm.get(id);
+    const fb = B["#" + id];
+    if (l) out.push(JSON.stringify(l) === JSON.stringify(r) ? r : merge3Obj(l, r, "#" + id, B));
+    else if (fb && !recordChangedSince(r, fb)) continue; /* removed here, untouched there */
+    else out.push(r);
+  }
+  for (const l of Ls) {
+    const id = String(l.id);
+    if (Rm.has(id)) continue;
+    const fb = B["#" + id];
+    if (fb && !recordChangedSince(l, fb)) continue; /* removed there, untouched here */
+    out.push(l);
+  }
+  return out;
+}
+function mergeStates(localS, remoteS, base = null) {
   if (!remoteS) return localS;
   if (!localS) return remoteS;
+  const B = base && base["@"] ? base : { __noBase: true };
+  const m = merge3Obj(localS, remoteS, B.__noBase ? null : "@", B);
   /* a deletion recorded on EITHER side wins over the other side still holding
      the record — otherwise the union quietly resurrects it */
   const tombs = [...(localS.deletedIds || []), ...(remoteS.deletedIds || [])];
@@ -3475,43 +3587,42 @@ function mergeStates(localS, remoteS) {
   const alive = (arr) => (arr || []).filter((x) => x && !gone.has(x.id));
   const dedupeTombs = Array.from(new Map(tombs.filter((d) => d && d.id).map((d) => [d.id, d])).values());
   return {
-    ...remoteS,
+    ...m,
     deletedIds: dedupeTombs,
-    applications: alive(unionById(localS.applications, remoteS.applications)),
+    applications: alive(m.applications),
     /* contacts live inside accounts, so a deleted contact rides back in on its
        parent account unless it's stripped here too */
-    accounts: alive(unionById(localS.accounts, remoteS.accounts)).map((acc) => ({
+    accounts: alive(m.accounts).map((acc) => ({
       ...acc,
       contacts: (acc.contacts || []).filter((c) => c && !gone.has(c.id)),
     })),
-    content: alive(unionById(localS.content, remoteS.content)),
-    contentGoal: remoteS.contentGoal || localS.contentGoal || { perWeek: 3 },
-    funnel: alive(unionById(localS.funnel, remoteS.funnel)),
-    emotions: alive(unionById(localS.emotions, remoteS.emotions)),
-    decisions: alive(unionById(localS.decisions, remoteS.decisions)),
-    accomplishments: alive(unionById(localS.accomplishments, remoteS.accomplishments)),
-    poolBench: alive(unionById(localS.poolBench, remoteS.poolBench)),
+    content: alive(m.content),
+    contentGoal: m.contentGoal || { perWeek: 3 },
+    funnel: alive(m.funnel),
+    emotions: alive(m.emotions),
+    decisions: alive(m.decisions),
+    accomplishments: alive(m.accomplishments),
+    poolBench: alive(m.poolBench),
     /* keyed by proposal key, not id — union by key so a snooze made on one
        device isn't undone by a sync from another */
     housekeepingSnoozes: Array.from(
       new Map([...(localS.housekeepingSnoozes || []), ...(remoteS.housekeepingSnoozes || [])].filter((x) => x && x.key).map((x) => [x.key, x])).values()
     ),
-    supportSessions: alive(unionById(localS.supportSessions, remoteS.supportSessions)),
-    goal: remoteS.goal || localS.goal || null,
+    supportSessions: alive(m.supportSessions),
+    goal: m.goal || null,
     cycleCount: Math.max(localS.cycleCount || 0, remoteS.cycleCount || 0),
-    runway: remoteS.runway || localS.runway,
-    copyDrafts: alive(unionById(localS.copyDrafts, remoteS.copyDrafts)),
-    /* by id like everything else, so a list made on the phone isn't wiped by
-       the laptop's older copy */
-    accountLists: alive(unionById(localS.accountLists, remoteS.accountLists)),
-    callRuns: alive(unionById(localS.callRuns, remoteS.callRuns)),
+    runway: m.runway,
+    copyDrafts: alive(m.copyDrafts),
+    accountLists: alive(m.accountLists),
+    callRuns: alive(m.callRuns),
     /* the live session: whichever side ended it wins, so a run stopped on
        the phone isn't revived by the laptop */
     callRunSession: (() => {
       const ended = new Set([...(localS.callRuns || []), ...(remoteS.callRuns || [])].map((r) => r && r.id));
-      return [remoteS.callRunSession, localS.callRunSession].find((x) => x && !ended.has(x.id)) || null;
+      const cand = m.callRunSession && !ended.has(m.callRunSession.id) ? m.callRunSession : null;
+      return cand || [remoteS.callRunSession, localS.callRunSession].find((x) => x && !ended.has(x.id)) || null;
     })(),
-    settings: { ...localS.settings, ...remoteS.settings },
+    settings: { ...(m.settings || {}) },
     lastCheckinMonth:
       (remoteS.lastCheckinMonth || "") > (localS.lastCheckinMonth || "")
         ? remoteS.lastCheckinMonth
@@ -4246,6 +4357,38 @@ function assembleDraft(raw, secs, vars) {
 }
 
 /* ---------- supabase rpc ---------- */
+/* the sync base can be a couple of MB, so it lives in IndexedDB rather than
+   competing with the app's own localStorage copy */
+const idbStore = (() => {
+  let dbp = null;
+  const open = () =>
+    dbp ||
+    (dbp = new Promise((res, rej) => {
+      try {
+        const r = indexedDB.open("flightdeck", 1);
+        r.onupgradeneeded = () => r.result.createObjectStore("kv");
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      } catch (e) {
+        rej(e);
+      }
+    }));
+  const run = async (mode, fn) => {
+    try {
+      const db = await open();
+      return await new Promise((res) => {
+        const tx = db.transaction("kv", mode);
+        const req = fn(tx.objectStore("kv"));
+        tx.oncomplete = () => res(req?.result);
+        tx.onerror = () => res(undefined);
+        tx.onabort = () => res(undefined);
+      });
+    } catch (e) {
+      return undefined;
+    }
+  };
+  return { get: (k) => run("readonly", (os) => os.get(k)), set: (k, v) => run("readwrite", (os) => os.put(v, k)) };
+})();
 async function rpc(fn, args, timeoutMs = 6000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -4854,6 +4997,16 @@ export default function FlightDeck() {
   const saveTimer = useRef(null);
   const dirtyRef = useRef(false);
   const pullingRef = useRef(false);
+  /* server revision this device last saw, and the fingerprint of what the
+     server held at that revision — the merge works out changes against it */
+  const revRef = useRef(null);
+  const baseRef = useRef(null);
+  const putModeRef = useRef("put"); /* "set" = server not upgraded yet: old overwrite save */
+  const savingRef = useRef(false);
+  const saveAgainRef = useRef(false);
+  const retryRef = useRef({ timer: null, delay: 0 });
+  const latestRef = useRef({ state: null, coach: null });
+  const serverJsonRef = useRef(null); /* the server's copy, to skip saving what it already has */
   const channelRef = useRef(null);
   const [keyVersion, setKeyVersion] = useState(0);
   const runDailyRef = useRef(null);
@@ -4896,12 +5049,21 @@ export default function FlightDeck() {
       let mergedCoach = localCoach;
       let remoteOk = false;
       try {
-        const remote = await rpc("fd_get", { k: key });
+        const [remote, stored] = await Promise.all([rpc("fd_get", { k: key }, 30000), idbStore.get("sync-base")]);
         remoteOk = true;
+        /* the base only counts if it matches what this browser last saved */
+        let lsRev = null;
+        try {
+          lsRev = localStorage.getItem("fd-sync-rev");
+        } catch (e) {}
+        const base = stored && stored.key === key && lsRev != null && String(stored.rev) === lsRev ? stored.base : null;
         if (remote) {
-          if (remote.data) mergedState = mergeStates(localState, migrate(remote.data));
+          const rd = remote.data ? migrate(remote.data) : null;
+          if (rd) mergedState = mergeStates(localState, rd, base);
           if (remote.coach) mergedCoach = mergeCoach(localCoach, { ...DEFAULT_COACH, ...remote.coach });
-        }
+          if (remote.rev == null) putModeRef.current = "set";
+          rememberServer(remote.rev ?? 0, rd, remote.coach);
+        } else rememberServer(0, null);
         setSyncStatus("synced");
       } catch (e) {
         setSyncStatus("offline");
@@ -5005,56 +5167,168 @@ export default function FlightDeck() {
      backup at the moment you most want one — before a risky change. */
   const exportCurrent = () => exportSnapshot({ date: `${today()}-current`, data: state });
 
+  /* what the server holds now: its revision and a fingerprint of its data */
+  function rememberServer(rev, data, coachData) {
+    revRef.current = rev;
+    serverJsonRef.current = data ? JSON.stringify(data) + "|" + JSON.stringify(coachData ?? null) : null;
+    const base = data ? buildSyncBase(data) : null;
+    baseRef.current = base;
+    const key = syncKeyRef.current;
+    idbStore.set("sync-base", { key, rev, base }).then(() => {
+      try {
+        localStorage.setItem("fd-sync-rev", String(rev));
+      } catch (e) {}
+    });
+  }
+
+  /* fold the server's copy into whatever is on screen — edits made here that
+     haven't saved yet are kept, because they differ from the base */
+  const applyRemote = (remote) => {
+    if (!remote) {
+      if (revRef.current == null) rememberServer(0, null);
+      return false;
+    }
+    const rd = remote.data ? migrate(remote.data) : null;
+    const base = baseRef.current;
+    if (rd)
+      setState((prev) => {
+        const merged = mergeStates(prev, rd, base);
+        return JSON.stringify(merged) === JSON.stringify(prev) ? prev : merged;
+      });
+    if (remote.coach)
+      setCoach((prev) => {
+        const merged = mergeCoach(prev, { ...DEFAULT_COACH, ...remote.coach });
+        return JSON.stringify(merged) === JSON.stringify(prev) ? prev : merged;
+      });
+    if (remote.rev == null) putModeRef.current = "set";
+    rememberServer(remote.rev ?? 0, rd, remote.coach);
+  };
+
+  const scheduleRetry = () => {
+    const r = retryRef.current;
+    if (r.timer) return;
+    r.delay = Math.min(r.delay ? r.delay * 2 : 5000, 60000);
+    r.timer = setTimeout(() => {
+      r.timer = null;
+      if (dirtyRef.current) flushSaveRef.current?.();
+    }, r.delay);
+  };
+
+  /* one save at a time. The server only accepts it if nobody else saved since
+     this device last synced; otherwise it pulls their changes, merges, and
+     saves the merged copy — so nothing anyone did gets overwritten. */
+  const flushSave = async () => {
+    if (!loaded) return;
+    if (savingRef.current) {
+      saveAgainRef.current = true;
+      return;
+    }
+    savingRef.current = true;
+    const k = syncKeyRef.current;
+    try {
+      setSyncStatus("saving");
+      if (putModeRef.current === "put" && revRef.current == null) {
+        /* never reached the server yet (started offline): merge first */
+        applyRemote(await rpc("fd_get", { k }, 30000));
+        saveAgainRef.current = true;
+      } else {
+        const { state: sent, coach: sentCoach } = latestRef.current;
+        let ok = false;
+        let wrote = false;
+        /* nothing new for the server (e.g. just merged its copy in) */
+        if (serverJsonRef.current && serverJsonRef.current === JSON.stringify(sent) + "|" + JSON.stringify(sentCoach ?? null)) ok = true;
+        else if (putModeRef.current === "put") {
+          let res;
+          try {
+            res = await rpc("fd_put", { k, d: sent, c: sentCoach, expected: revRef.current }, 30000);
+          } catch (e) {
+            /* server without the new function — keep syncing the old way */
+            if (/supabase 4\d\d/.test(e?.message || "")) putModeRef.current = "set";
+            else throw e;
+          }
+          if (res && res.ok) {
+            rememberServer(res.rev, sent, sentCoach);
+            ok = wrote = true;
+          } else if (res) {
+            /* another device saved first: take in their changes, then save again */
+            applyRemote(await rpc("fd_get", { k }, 30000));
+            saveAgainRef.current = true;
+          }
+        }
+        if (putModeRef.current === "set" && !ok) {
+          await rpc("fd_set", { k, d: sent, c: sentCoach }, 30000);
+          ok = wrote = true;
+        }
+        if (ok) {
+          if (latestRef.current.state === sent && latestRef.current.coach === sentCoach) dirtyRef.current = false;
+          retryRef.current.delay = 0;
+          setSyncStatus(dirtyRef.current ? "saving" : "synced");
+          /* tell the other devices to pull right now */
+          if (wrote) try {
+            channelRef.current?.send({ type: "broadcast", event: "changed", payload: { t: Date.now() } });
+          } catch (e) {}
+        }
+      }
+    } catch (e) {
+      setSyncStatus("offline");
+      scheduleRetry();
+    } finally {
+      savingRef.current = false;
+      if (saveAgainRef.current) {
+        saveAgainRef.current = false;
+        setTimeout(() => flushSaveRef.current?.(), 250);
+      }
+    }
+  };
+  const flushSaveRef = useRef(null);
+  flushSaveRef.current = flushSave;
+
   /* save: local immediately, remote debounced */
   useEffect(() => {
     if (!loaded) return;
+    latestRef.current = { state, coach };
     dirtyRef.current = true;
     try {
       localStorage.setItem("fd-state", JSON.stringify(state));
       localStorage.setItem("fd-coach", JSON.stringify(coach));
     } catch (e) {}
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(async () => {
-      try {
-        setSyncStatus("saving");
-        await rpc("fd_set", { k: syncKeyRef.current, d: state, c: coach });
-        dirtyRef.current = false;
-        setSyncStatus("synced");
-        /* tell the other devices to pull right now */
-        try {
-          channelRef.current?.send({ type: "broadcast", event: "changed", payload: { t: Date.now() } });
-        } catch (e) {}
-      } catch (e) {
-        setSyncStatus("offline");
-      }
-    }, 800);
+    saveTimer.current = setTimeout(() => flushSaveRef.current?.(), 800);
     return () => saveTimer.current && clearTimeout(saveTimer.current);
   }, [state, coach, loaded]);
 
   /* LIVE RE-SYNC: when the tab regains focus (and every 60s), pull remote
-     changes made on other devices and merge them in. Skipped while local
-     changes are still unsaved, so nothing gets stomped mid-edit. */
+     changes made on other devices and merge them in. A tiny revision check
+     comes first, so nothing big downloads unless something changed. Safe
+     mid-edit: unsaved edits here survive the merge. */
   const pullRemote = useCallback(async () => {
-    if (!loaded || dirtyRef.current || pullingRef.current) return;
+    if (!loaded || pullingRef.current) return;
     if (typeof document !== "undefined" && document.hidden) return;
     pullingRef.current = true;
     try {
-      const remote = await rpc("fd_get", { k: syncKeyRef.current });
-      if (remote && !dirtyRef.current) {
-        setState((prev) => {
-          const merged = remote.data ? mergeStates(prev, migrate(remote.data)) : prev;
-          return JSON.stringify(merged) === JSON.stringify(prev) ? prev : merged;
-        });
-        setCoach((prev) => {
-          const merged = remote.coach ? mergeCoach(prev, { ...DEFAULT_COACH, ...remote.coach }) : prev;
-          return JSON.stringify(merged) === JSON.stringify(prev) ? prev : merged;
-        });
-        setSyncStatus("synced");
+      const k = syncKeyRef.current;
+      if (putModeRef.current === "put" && revRef.current != null) {
+        let rev = null;
+        try {
+          rev = await rpc("fd_rev", { k });
+        } catch (e) {
+          rev = null;
+        }
+        if (rev != null && Number(rev) <= revRef.current) {
+          if (!dirtyRef.current) setSyncStatus("synced");
+          return;
+        }
       }
+      const remote = await rpc("fd_get", { k }, 30000);
+      if (remote && remote.rev != null && revRef.current != null && remote.rev <= revRef.current) return;
+      applyRemote(remote);
+      if (!dirtyRef.current) setSyncStatus("synced");
     } catch (e) {
       /* stay quiet — next cycle will retry */
+    } finally {
+      pullingRef.current = false;
     }
-    pullingRef.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
   useEffect(() => {
@@ -5063,11 +5337,19 @@ export default function FlightDeck() {
     const onVis = () => {
       if (!document.hidden) pullRemote();
     };
+    /* back online: send what piled up, then catch up */
+    const onOnline = () => {
+      retryRef.current.delay = 0;
+      if (dirtyRef.current) flushSaveRef.current?.();
+      else pullRemote();
+    };
     window.addEventListener("focus", onFocus);
+    window.addEventListener("online", onOnline);
     document.addEventListener("visibilitychange", onVis);
     const t = setInterval(pullRemote, 60000);
     return () => {
       window.removeEventListener("focus", onFocus);
+      window.removeEventListener("online", onOnline);
       document.removeEventListener("visibilitychange", onVis);
       clearInterval(t);
     };
@@ -5079,14 +5361,7 @@ export default function FlightDeck() {
   useEffect(() => {
     if (!loaded || !syncKeyRef.current) return;
     const ch = supa.channel("fd-" + syncKeyRef.current, { config: { broadcast: { self: false } } });
-    ch.on("broadcast", { event: "changed" }, () => {
-      if (dirtyRef.current) {
-        /* mid-edit here — retry shortly after our own save lands */
-        setTimeout(pullRemote, 2500);
-      } else {
-        pullRemote();
-      }
-    });
+    ch.on("broadcast", { event: "changed" }, () => pullRemote());
     ch.subscribe();
     channelRef.current = ch;
     return () => {
@@ -7416,28 +7691,30 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       return;
     }
     try {
-      const remote = await rpc("fd_get", { k: key });
+      const remote = await rpc("fd_get", { k: key }, 30000);
       syncKeyRef.current = key;
       localStorage.setItem("fd-sync-key", key);
       /* MERGE this device's data with the other device's — nothing is lost */
       let nextState = state;
       let nextCoach = coach;
+      const rd = remote?.data ? migrate(remote.data) : null;
+      putModeRef.current = remote && remote.rev == null ? "set" : "put";
       if (remote) {
-        if (remote.data) nextState = mergeStates(state, migrate(remote.data));
+        if (rd) nextState = mergeStates(state, rd);
         if (remote.coach) {
           const { coach: rolled, archived } = rolloverCoach(mergeCoach(coach, { ...DEFAULT_COACH, ...remote.coach }), null, nextState.applications);
           nextCoach = rolled;
           if (archived.length) nextState = { ...nextState, accomplishments: [...archived, ...(nextState.accomplishments || [])] };
         }
       }
+      /* the new code's server copy becomes the base, so the merged result
+         saves to it straight away (the usual save picks it up) */
+      rememberServer(remote?.rev ?? 0, rd, remote?.coach);
       setState(nextState);
       setCoach(nextCoach);
-      /* push the merged result right away so BOTH devices converge */
-      try {
-        await rpc("fd_set", { k: key, d: nextState, c: nextCoach });
-        dirtyRef.current = false;
-        setSyncStatus("synced");
-      } catch (e) {}
+      latestRef.current = { state: nextState, coach: nextCoach };
+      dirtyRef.current = true;
+      setTimeout(() => flushSaveRef.current?.(), 50);
       setKeyVersion((v) => v + 1); /* rejoin realtime channel under the new code */
       setTimeout(() => {
         try {
@@ -17336,17 +17613,23 @@ function describeAgentAction(st, a, plannedLists = new Set()) {
       return { ok: true, text: `${recordLabel(r)} industry → ${a.industry || "blank"}` };
     }
     case "add_to_run_where": {
-      const rows = matchCallCriteria(st, a.criteria);
+      const all = matchCallCriteria(st, a.criteria);
+      const dnc = all.filter((r) => isDnc(r.c, r.acc));
+      const rows = all.filter((r) => !isDnc(r.c, r.acc));
       const what = criteriaSummary(st, a.criteria);
-      if (!rows.length) return bad(`Call run (${what}): nobody callable matches — or they're already in the run`);
+      const dncNote = dnc.length ? ` — ⛔ ${dnc.length} left out, tagged DNC: ${dnc.slice(0, 5).map((r) => r.c.name || "Unnamed").join(", ")}${dnc.length > 5 ? ` +${dnc.length - 5} more` : ""}` : "";
+      if (!rows.length) return bad(dnc.length ? `Call run (${what}): everyone who matches is tagged DNC${dncNote}` : `Call run (${what}): nobody callable matches — or they're already in the run`);
       const names = rows.map((r) => `${r.c.name || "Unnamed"} (${r.acc.company || "?"})`);
-      return { ok: true, text: `☎ Add ${rows.length} to the call run — ${what}: ${names.slice(0, 8).join(", ")}${names.length > 8 ? ` +${names.length - 8} more` : ""}` };
+      return { ok: true, text: `☎ Add ${rows.length} to the call run — ${what}: ${names.slice(0, 8).join(", ")}${names.length > 8 ? ` +${names.length - 8} more` : ""}${dncNote}` };
     }
     case "add_to_run": {
       const rs = (a.contactIds || []).map((id) => locateRecord(st, id)).filter((r) => r?.kind === "contact");
-      const callable = rs.filter((r) => hasPhone(r.c) && r.c.status !== "closed");
-      if (!callable.length) return bad("Call run: none of those contacts has a number you can dial");
-      return { ok: true, text: `☎ Add ${callable.length} to the call run: ${callable.slice(0, 6).map(recordLabel).join(", ")}${callable.length > 6 ? ` +${callable.length - 6} more` : ""}${rs.length > callable.length ? ` (${rs.length - callable.length} skipped, no number)` : ""}` };
+      const dnc = rs.filter((r) => isDnc(r.c, r.acc));
+      const callable = rs.filter((r) => hasPhone(r.c) && r.c.status !== "closed" && !isDnc(r.c, r.acc));
+      const noNum = rs.length - callable.length - dnc.length;
+      const notes = [noNum > 0 ? `${noNum} skipped, no number` : "", dnc.length ? `⛔ ${dnc.length} left out, tagged DNC: ${dnc.slice(0, 5).map(recordLabel).join(", ")}${dnc.length > 5 ? ` +${dnc.length - 5} more` : ""}` : ""].filter(Boolean);
+      if (!callable.length) return bad(dnc.length && !noNum ? `Call run: ${dnc.length === 1 ? "that contact is" : "those contacts are"} tagged DNC — not added (${notes.join("; ")})` : `Call run: none of those contacts can be added${notes.length ? ` (${notes.join("; ")})` : ""}`);
+      return { ok: true, text: `☎ Add ${callable.length} to the call run: ${callable.slice(0, 6).map(recordLabel).join(", ")}${callable.length > 6 ? ` +${callable.length - 6} more` : ""}${notes.length ? ` (${notes.join("; ")})` : ""}` };
     }
     case "remove_followups_where": {
       const opts = { scope: a.scope === "all_pending" ? "all_pending" : "due", track: ["email", "call"].includes(a.track) ? a.track : "any", olderThanDays: a.olderThanDays };
@@ -17649,14 +17932,16 @@ function runAgentActions(st0, reviewed) {
         break;
       case "add_to_run_where": {
         const cur = st.callSession || [];
-        st = { ...st, callSession: [...cur, ...matchCallCriteria(st, a.criteria).map((r) => r.c.id).filter((id) => !cur.includes(id))] };
+        /* DNC is checked here, at the moment of adding, so it holds even if
+           the tag went on earlier in the same batch */
+        st = { ...st, callSession: [...cur, ...matchCallCriteria(st, a.criteria).filter((r) => !isDnc(r.c, r.acc)).map((r) => r.c.id).filter((id) => !cur.includes(id))] };
         break;
       }
       case "add_to_run": {
         const cur = st.callSession || [];
         const ids = (a.contactIds || []).filter((id) => {
           const rr = locateRecord(st, id);
-          return rr?.kind === "contact" && hasPhone(rr.c) && rr.c.status !== "closed" && !cur.includes(id);
+          return rr?.kind === "contact" && hasPhone(rr.c) && rr.c.status !== "closed" && !isDnc(rr.c, rr.acc) && !cur.includes(id);
         });
         st = { ...st, callSession: [...cur, ...ids] };
         break;
@@ -17732,6 +18017,7 @@ Rules:
 - The user reviews and approves every action before it applies, so propose the full set in one go (create a list and add to it in the same reply).
 - Tags are short lower-case labels. Reuse existing tags where they fit.
 - "temp" is lead temperature (how keen); it is separate from outreach status.
+- DO NOT CALL: before putting anyone in the call run, check their tags and their company's tags. Anyone tagged DNC (or "do not call") is never added — leave them out of add_to_run ids, and tell the user who you left out and why. The app enforces this too and will drop them, so don't try to work around it; if the user wants someone back in, they remove the DNC tag first.
 - Conditions inside one add_to_run_where must ALL match. For "X, plus Y" or "hot first, then warm", use one add_to_run_where per group, in the order the user wants them called. Someone already added isn't added twice.
 - For any question or change about due/overdue follow-ups across many people, use find (dueFollowUp, overdueMinDays) or remove_followups_where. The FOLLOW-UPS DUE line at the top is the true count — quote it, don't recount from the table.
 - You can add or remove PENDING follow-ups. "fu" in the data lists each one as date + channel, with DUE when it's due today or earlier. You cannot tick a follow-up as done, or remove ticked ones.
@@ -19231,7 +19517,8 @@ function FoundList({ ids, state, onApply }) {
   const [tag, setTag] = useState("");
   const [done, setDone] = useState("");
   const rows = ids.map((id) => locateRecord(state, id)).filter(Boolean);
-  const callable = rows.filter((r) => r.kind === "contact" && hasPhone(r.c) && r.c.status !== "closed");
+  const callable = rows.filter((r) => r.kind === "contact" && hasPhone(r.c) && r.c.status !== "closed" && !isDnc(r.c, r.acc));
+  const dncRows = rows.filter((r) => r.kind === "contact" && isDnc(r.c, r.acc));
   const shown = all ? rows : rows.slice(0, 25);
   const small = { background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 8, fontSize: 11, padding: "4px 9px", cursor: "pointer" };
   if (!rows.length) return null;
@@ -19264,6 +19551,11 @@ function FoundList({ ids, state, onApply }) {
           >
             ☎ Add {callable.length} to run
           </button>
+        )}
+        {dncRows.length > 0 && (
+          <span title={dncRows.map((r) => r.c.name || "Unnamed").join(", ")} style={{ fontSize: 11, color: C.red }}>
+            ⛔ {dncRows.length} tagged DNC — never added to the run
+          </span>
         )}
         {callable.length > 0 && (
           <button onClick={() => triggerCsvDownload(callable.map((r) => callCsvRow(r.c, r.acc.company)), `call-list-${today()}.csv`, CALL_CSV_COLUMNS)} style={small}>
