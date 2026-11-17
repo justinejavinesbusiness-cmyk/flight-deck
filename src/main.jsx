@@ -2794,11 +2794,16 @@ function applyTombstones(state) {
     if (!a.archivedAt || a.tombstoned || a.archivedAt > cutoff) return a;
     return { id: a.id, status: a.status, contacted: a.contacted, outreachKind: a.outreachKind || "", fromAccountContact: !!a.fromAccountContact, archivedAt: a.archivedAt, tombstoned: true };
   });
+  const expired = [];
   const accounts = state.accounts.map((acc) => ({
     ...acc,
-    contacts: (acc.contacts || []).filter((c) => !(c.archivedAt && c.archivedAt <= cutoff)), /* contacts aren't counted directly, so once their window expires they're simply removed — their linked application (if any) already has its own independent archive/tombstone lifecycle */
+    contacts: (acc.contacts || []).filter((c) => {
+      const gone = c.archivedAt && c.archivedAt <= cutoff;
+      if (gone) expired.push(c.id);
+      return !gone;
+    }) /* contacts aren't counted directly, so once their window expires they're simply removed — their linked application (if any) already has its own independent archive/tombstone lifecycle. Tombstoned, so the removal syncs. */,
   }));
-  return { ...state, applications, accounts };
+  return { ...state, applications, accounts, ...(expired.length ? { deletedIds: tombstoneIds(state, expired) } : {}) };
 }
 
 /* ---- CSV backup, captured at the moment something is archived ----
@@ -2878,29 +2883,25 @@ const callCsvRow = (contact, company) => {
    ============================================================ */
 const SNAP_KEY = "fd-snapshots";
 const SNAP_KEEP = 14;
-function readSnapshots() {
-  try {
-    const raw = localStorage.getItem(SNAP_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch (e) {
-    return [];
-  }
-}
-function writeSnapshots(list) {
-  try {
-    localStorage.setItem(SNAP_KEY, JSON.stringify(list.slice(0, SNAP_KEEP)));
-    return true;
-  } catch (e) {
-    /* quota is the realistic failure — drop the oldest and try once more
-       rather than losing the whole history */
+/* legacy: snapshots used to live in localStorage, where 14 full copies were
+   a big part of what filled the quota. Moved to IndexedDB on first load. */
+async function loadSnapshots() {
+  let list = await idbStore.get(SNAP_KEY);
+  if (!Array.isArray(list)) {
+    list = [];
     try {
-      localStorage.setItem(SNAP_KEY, JSON.stringify(list.slice(0, Math.max(3, Math.floor(SNAP_KEEP / 2)))));
-      return true;
-    } catch (e2) {
-      return false;
-    }
+      const raw = localStorage.getItem(SNAP_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(arr) && arr.length) {
+        list = arr;
+        if (await idbStore.set(SNAP_KEY, list.slice(0, SNAP_KEEP))) localStorage.removeItem(SNAP_KEY);
+      }
+    } catch (e) {}
   }
+  return list;
+}
+async function saveSnapshots(list) {
+  return idbStore.set(SNAP_KEY, (list || []).slice(0, SNAP_KEEP));
 }
 /* a snapshot is worth taking only if there's something in it — an empty state
    would otherwise overwrite a good history on a fresh install or failed load */
@@ -3375,6 +3376,17 @@ function migrate(saved) {
      still resurface; 180 days is far beyond that, and pruning keeps the
      synced payload from growing forever */
   s.deletedIds = s.deletedIds.filter((d) => d && d.id && (!d.at || d.at > addDays(today(), -180)));
+  /* call-run removals only need to outlive a sync or two */
+  s.deletedIds = s.deletedIds.filter((d) => !(typeof d.id === "string" && d.id.startsWith(RUN_TOMB)) || !d.at || d.at > addDays(today(), -30));
+  if (!s.callSessionAdded || typeof s.callSessionAdded !== "object") s.callSessionAdded = {};
+  {
+    const keep = {};
+    const cutoff = addDays(today(), -30);
+    Object.entries(s.callSessionAdded).forEach(([id, ts]) => {
+      if (s.callSession.includes(id) || String(ts || "").slice(0, 10) > cutoff) keep[id] = ts;
+    });
+    s.callSessionAdded = keep;
+  }
   /* one-time backfill: pool members created before add-dates were tracked have
      no poolAddedAt, so their build work would read as zero. Stamped once, on
      first load after upgrading — a pool without the date is one that was built
@@ -3476,9 +3488,16 @@ function migrate(saved) {
      changed only there     → take the other device's value
      changed on both        → lists of records merge record by record; for a
                               plain value this device's (newer) edit wins
-     removed on one side and untouched on the other → stays removed
-   Without a base (first sync on a device) it falls back to the old rule:
-   the server's copy wins and nothing is dropped. */
+     anything missing on one side → KEPT. Absence is never read as a delete;
+                              only a tombstone in deletedIds removes a record
+   Without a base (first sync on a device) the server's copy wins clashes.
+
+   (The first version of this inferred deletions from absence: "in the base,
+   missing here, untouched there → removed here". When this browser's local
+   copy silently failed to save but the base kept advancing, a stale copy
+   looked like hundreds of deliberate deletions and wiped them from the
+   server. That inference is gone, and the local copy and base are now
+   written together — see LOCAL CACHE.) */
 function hashStr(str) {
   let h1 = 0x811c9dc5;
   let h2 = 5381;
@@ -3493,6 +3512,12 @@ const NONE_H = "-";
 const hashJson = (j) => (j === undefined ? NONE_H : hashStr(j));
 const isPlainObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 const isIdItem = (x) => isPlainObj(x) && x.id != null && x.id !== "";
+/* Lists of records that are removed ONLY by a tombstone. They are always
+   unioned, even when just one side changed them, so a stale or partial copy
+   can never shrink them. Every user-facing delete of one of these writes a
+   tombstone (see tombstoneIds). Contacts, inside accounts, follow the same rule. */
+const TOMBSTONED_LISTS = ["applications", "accounts", "content", "funnel", "emotions", "decisions", "accomplishments", "poolBench", "supportSessions", "copyDrafts", "accountLists", "callRuns"];
+const TOMBSTONED_SET = new Set(TOMBSTONED_LISTS);
 /* fingerprint of every field: the state's own fields, every plain object
    inside it (by path), and every record with an id (by id) */
 function buildSyncBase(state) {
@@ -3510,11 +3535,6 @@ function buildSyncBase(state) {
   if (isPlainObj(state)) walk(state, "@");
   return B;
 }
-function recordChangedSince(x, fb) {
-  const keys = new Set([...Object.keys(x), ...Object.keys(fb)]);
-  for (const k of keys) if ((fb[k] || NONE_H) !== hashJson(JSON.stringify(x[k]))) return true;
-  return false;
-}
 function merge3Obj(L, R, key, B) {
   const fb = key ? B[key] : null;
   const out = {};
@@ -3530,7 +3550,12 @@ function merge3Obj(L, R, key, B) {
       const was = fb ? fb[k] || NONE_H : null;
       const lc = was == null || hashJson(ja) !== was;
       const rc = was == null || hashJson(jb) !== was;
-      if (lc && !rc) v = a;
+      const mustUnion = (key === "@" && TOMBSTONED_SET.has(k)) || k === "contacts";
+      if (mustUnion && (Array.isArray(a) || Array.isArray(b))) v = unionRecords(Array.isArray(a) ? a : [], Array.isArray(b) ? b : [], B, lc && !rc);
+      /* a field missing on one side isn't a deletion either — keep the value */
+      else if (a === undefined) v = b;
+      else if (b === undefined) v = a;
+      else if (lc && !rc) v = a;
       else if (rc && !lc) v = b;
       else v = merge3Val(a, b, B, key ? key + "." + k : null);
     }
@@ -3540,7 +3565,7 @@ function merge3Obj(L, R, key, B) {
 }
 function merge3Val(a, b, B, childKey) {
   if (Array.isArray(a) && Array.isArray(b)) {
-    if (a.every(isIdItem) && b.every(isIdItem)) return merge3List(a, b, B);
+    if (a.every(isIdItem) && b.every(isIdItem)) return unionRecords(a, b, B, false);
     if ([...a, ...b].every((x) => x === null || typeof x !== "object")) {
       const seen = new Set(b.map((x) => JSON.stringify(x)));
       return [...b, ...a.filter((x) => !seen.has(JSON.stringify(x)))];
@@ -3554,40 +3579,99 @@ function merge3Val(a, b, B, childKey) {
      wins; without one we can't tell, so the server's copy wins as before */
   return B.__noBase ? b : a;
 }
-function merge3List(Ls, Rs, B) {
-  const Lm = new Map(Ls.map((x) => [String(x.id), x]));
-  const Rm = new Map(Rs.map((x) => [String(x.id), x]));
+/* every record from both sides, each id once; shared ids merge field by
+   field. Order follows the side that changed (local when only it did). */
+function unionRecords(Ls, Rs, B, localFirst) {
+  const items = (arr) => arr.filter(isIdItem);
+  const Lm = new Map(items(Ls).map((x) => [String(x.id), x]));
+  const Rm = new Map(items(Rs).map((x) => [String(x.id), x]));
+  const [first, second] = localFirst ? [items(Ls), items(Rs)] : [items(Rs), items(Ls)];
   const out = [];
-  for (const r of Rs) {
-    const id = String(r.id);
+  const seen = new Set();
+  for (const x of [...first, ...second]) {
+    const id = String(x.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
     const l = Lm.get(id);
-    const fb = B["#" + id];
-    if (l) out.push(JSON.stringify(l) === JSON.stringify(r) ? r : merge3Obj(l, r, "#" + id, B));
-    else if (fb && !recordChangedSince(r, fb)) continue; /* removed here, untouched there */
-    else out.push(r);
-  }
-  for (const l of Ls) {
-    const id = String(l.id);
-    if (Rm.has(id)) continue;
-    const fb = B["#" + id];
-    if (fb && !recordChangedSince(l, fb)) continue; /* removed there, untouched here */
-    out.push(l);
+    const r = Rm.get(id);
+    if (l && r) out.push(JSON.stringify(l) === JSON.stringify(r) ? r : merge3Obj(l, r, "#" + id, B));
+    else out.push(l || r);
   }
   return out;
 }
+/* the call run is a list of contact ids, so its removals are tombstoned
+   as "run:<contact id>" with a time, and re-adds carry a time too */
+const RUN_TOMB = "run:";
+function mergeCallSession(localS, remoteS, m, tombs) {
+  const removedAt = new Map();
+  tombs.forEach((t) => {
+    if (t && typeof t.id === "string" && t.id.startsWith(RUN_TOMB)) {
+      const id = t.id.slice(RUN_TOMB.length);
+      const ts = t.ts || t.at || "";
+      if (ts > (removedAt.get(id) || "")) removedAt.set(id, ts);
+    }
+  });
+  const addedAt = { ...(remoteS.callSessionAdded || {}) };
+  Object.entries(localS.callSessionAdded || {}).forEach(([id, ts]) => {
+    if ((ts || "") > (addedAt[id] || "")) addedAt[id] = ts;
+  });
+  const order = [...(m.callSession || []), ...(localS.callSession || []), ...(remoteS.callSession || [])];
+  const out = [];
+  for (const id of order) {
+    if (out.includes(id)) continue;
+    const r = removedAt.get(id);
+    if (r && !((addedAt[id] || "") > r)) continue;
+    out.push(id);
+  }
+  return { callSession: out, callSessionAdded: addedAt };
+}
+/* change the call run, recording adds and removals so they sync */
+function withCallRun(st, nextIds) {
+  const prev = st.callSession || [];
+  const next = Array.from(new Set((nextIds || []).filter(Boolean)));
+  const now = new Date().toISOString();
+  const removed = prev.filter((id) => !next.includes(id));
+  const added = next.filter((id) => !prev.includes(id));
+  const callSessionAdded = { ...(st.callSessionAdded || {}) };
+  added.forEach((id) => (callSessionAdded[id] = now));
+  const day = today();
+  return {
+    ...st,
+    callSession: next,
+    callSessionAdded,
+    deletedIds: removed.length ? [...removed.map((id) => ({ id: RUN_TOMB + id, at: day, ts: now })), ...(st.deletedIds || [])] : st.deletedIds || [],
+  };
+}
+/* module-level tombstone helper for deletes outside the App component */
+const tombstoneIds = (s, ids) => [...ids.filter(Boolean).map((id) => ({ id, at: today() })), ...(s.deletedIds || [])];
 function mergeStates(localS, remoteS, base = null) {
   if (!remoteS) return localS;
   if (!localS) return remoteS;
+  /* a restore (from history, a snapshot or a file) starts a new epoch: the
+     newer epoch replaces the older wholesale instead of being merged, so a
+     restore isn't undone by other devices unioning their copies back in */
+  const le = localS.syncEpoch || "";
+  const re = remoteS.syncEpoch || "";
+  if (le !== re) return le > re ? localS : remoteS;
   const B = base && base["@"] ? base : { __noBase: true };
   const m = merge3Obj(localS, remoteS, B.__noBase ? null : "@", B);
   /* a deletion recorded on EITHER side wins over the other side still holding
-     the record — otherwise the union quietly resurrects it */
+     the record. Tombstones are the ONLY way a record leaves these lists. */
   const tombs = [...(localS.deletedIds || []), ...(remoteS.deletedIds || [])];
   const gone = new Set(tombs.map((d) => d && d.id).filter(Boolean));
   const alive = (arr) => (arr || []).filter((x) => x && !gone.has(x.id));
-  const dedupeTombs = Array.from(new Map(tombs.filter((d) => d && d.id).map((d) => [d.id, d])).values());
+  /* keep the newest copy of each tombstone (run removals carry a time) */
+  const tombMap = new Map();
+  tombs.forEach((d) => {
+    if (!d || !d.id) return;
+    const prev = tombMap.get(d.id);
+    if (!prev || (d.ts || d.at || "") > (prev.ts || prev.at || "")) tombMap.set(d.id, d);
+  });
+  const dedupeTombs = Array.from(tombMap.values());
+  const run = mergeCallSession(localS, remoteS, m, dedupeTombs);
   return {
     ...m,
+    ...run,
     deletedIds: dedupeTombs,
     applications: alive(m.applications),
     /* contacts live inside accounts, so a deleted contact rides back in on its
@@ -3614,7 +3698,10 @@ function mergeStates(localS, remoteS, base = null) {
     runway: m.runway,
     copyDrafts: alive(m.copyDrafts),
     accountLists: alive(m.accountLists),
-    callRuns: alive(m.callRuns),
+    callRuns: alive(m.callRuns)
+      .slice()
+      .sort((x, y) => String(y.endedAt || "").localeCompare(String(x.endedAt || "")))
+      .slice(0, 30),
     /* the live session: whichever side ended it wins, so a run stopped on
        the phone isn't revived by the laptop */
     callRunSession: (() => {
@@ -4357,8 +4444,19 @@ function assembleDraft(raw, secs, vars) {
 }
 
 /* ---------- supabase rpc ---------- */
-/* the sync base can be a couple of MB, so it lives in IndexedDB rather than
-   competing with the app's own localStorage copy */
+/* ============================================================
+   LOCAL CACHE (IndexedDB)
+
+   This browser's copy of everything lives in ONE IndexedDB record:
+     { key, rev, base, state, coach, savedAt }
+   written in ONE transaction. The state and the sync base/revision it was
+   merged against can therefore never drift apart — which is what went wrong
+   when they lived in two places (state in localStorage, which silently hit
+   its quota, base in IndexedDB, which kept advancing).
+
+   A failed write resolves false, so the app can say so out loud.
+   Daily snapshots live here too, under their own key.
+   ============================================================ */
 const idbStore = (() => {
   let dbp = null;
   const open = () =>
@@ -4372,14 +4470,17 @@ const idbStore = (() => {
       } catch (e) {
         rej(e);
       }
-    }));
-  const run = async (mode, fn) => {
+    })).catch((e) => {
+      dbp = null;
+      throw e;
+    });
+  const get = async (k) => {
     try {
       const db = await open();
       return await new Promise((res) => {
-        const tx = db.transaction("kv", mode);
-        const req = fn(tx.objectStore("kv"));
-        tx.oncomplete = () => res(req?.result);
+        const tx = db.transaction("kv", "readonly");
+        const req = tx.objectStore("kv").get(k);
+        tx.oncomplete = () => res(req.result);
         tx.onerror = () => res(undefined);
         tx.onabort = () => res(undefined);
       });
@@ -4387,8 +4488,87 @@ const idbStore = (() => {
       return undefined;
     }
   };
-  return { get: (k) => run("readonly", (os) => os.get(k)), set: (k, v) => run("readwrite", (os) => os.put(v, k)) };
+  /* resolves true only once the transaction has COMMITTED */
+  const set = async (k, v) => {
+    try {
+      const db = await open();
+      return await new Promise((res) => {
+        let tx;
+        try {
+          tx = db.transaction("kv", "readwrite");
+          tx.objectStore("kv").put(v, k);
+        } catch (e) {
+          res(false);
+          return;
+        }
+        tx.oncomplete = () => res(true);
+        tx.onerror = () => res(false);
+        tx.onabort = () => res(false);
+      });
+    } catch (e) {
+      return false;
+    }
+  };
+  const del = async (k) => {
+    try {
+      const db = await open();
+      return await new Promise((res) => {
+        const tx = db.transaction("kv", "readwrite");
+        tx.objectStore("kv").delete(k);
+        tx.oncomplete = () => res(true);
+        tx.onerror = () => res(false);
+        tx.onabort = () => res(false);
+      });
+    } catch (e) {
+      return false;
+    }
+  };
+  return { get, set, del };
 })();
+/* Before saving, compare what's going out with the server's last copy. A
+   save that would remove more than 10 items or 5% (whichever is larger) of
+   accounts, applications or lists — or empty any of them — is held for you
+   to confirm. Returns null when it's fine. */
+const GUARD_KINDS = [
+  { key: "accounts", label: "accounts", name: (x) => x.company || "Unnamed account" },
+  { key: "applications", label: "applications", name: (x) => [x.company, x.role].filter(Boolean).join(" — ") || "Unnamed application" },
+  { key: "accountLists", label: "lists", name: (x) => x.name || "Unnamed list" },
+];
+function massDeletionCheck(server, outgoing, { any = false } = {}) {
+  if (!server) return null;
+  let block = false;
+  const kinds = [];
+  for (const g of GUARD_KINDS) {
+    const sv = (Array.isArray(server[g.key]) ? server[g.key] : []).filter(isIdItem);
+    const og = new Set((Array.isArray(outgoing?.[g.key]) ? outgoing[g.key] : []).filter(isIdItem).map((x) => String(x.id)));
+    const removed = sv.filter((x) => !og.has(String(x.id)));
+    const limit = Math.max(10, Math.ceil(sv.length * 0.05));
+    if (removed.length > limit || (sv.length > 0 && og.size === 0)) block = true;
+    if (removed.length) kinds.push({ key: g.key, label: g.label, before: sv.length, after: og.size, removed: removed.map((x) => ({ id: String(x.id), name: g.name(x) })) });
+  }
+  return (block || (any && kinds.length)) ? kinds : null;
+}
+/* "Keep server data": put back what the save would have removed, and drop
+   the tombstones that removed them */
+function keepServerItems(st, server, kinds) {
+  if (!server) return st;
+  let next = { ...st };
+  const back = new Set();
+  for (const k of kinds) {
+    const ids = new Set(k.removed.map((r) => r.id));
+    const have = new Set((next[k.key] || []).map((x) => String(x?.id)));
+    const add = (server[k.key] || []).filter((x) => isIdItem(x) && ids.has(String(x.id)) && !have.has(String(x.id)));
+    add.forEach((x) => {
+      back.add(String(x.id));
+      (x.contacts || []).forEach((c) => c && back.add(String(c.id)));
+    });
+    next[k.key] = [...(next[k.key] || []), ...add];
+  }
+  next.deletedIds = (next.deletedIds || []).filter((d) => !back.has(String(d?.id)));
+  return next;
+}
+const newSyncEpoch = () => new Date().toISOString() + "-" + Math.random().toString(36).slice(2, 8);
+const STALE_MS = 24 * 60 * 60 * 1000;
 async function rpc(fn, args, timeoutMs = 6000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -4399,7 +4579,13 @@ async function rpc(fn, args, timeoutMs = 6000) {
       body: JSON.stringify(args),
       signal: ctrl.signal,
     });
-    if (!r.ok) throw new Error(`supabase ${r.status}`);
+    if (!r.ok) {
+      let msg = "";
+      try {
+        msg = (await r.text()).slice(0, 160);
+      } catch (e) {}
+      throw new Error(`supabase ${r.status}${msg ? `: ${msg}` : ""}`);
+    }
     return await r.json();
   } finally {
     clearTimeout(t);
@@ -4999,14 +5185,34 @@ export default function FlightDeck() {
   const pullingRef = useRef(false);
   /* server revision this device last saw, and the fingerprint of what the
      server held at that revision — the merge works out changes against it */
-  const revRef = useRef(null);
-  const baseRef = useRef(null);
-  const putModeRef = useRef("put"); /* "set" = server not upgraded yet: old overwrite save */
+  /* syncRef: the server revision the on-screen state already includes, the
+     fingerprint (base) of that server copy, and the copy itself. It is only
+     changed together with the state it describes — inside the same state
+     update, or after a save the state already contains — so the pair written
+     to the local cache is always consistent. */
+  const syncRef = useRef({ rev: null, base: null, server: null, stamp: 0 });
+  /* every change to syncRef gets a new stamp; the state effect copies the
+     stamp that belongs to the committed state, so a save never pairs an old
+     state with a newer revision */
+  const setSync = (pack) => {
+    syncRef.current = { ...pack, stamp: (syncRef.current.stamp || 0) + 1 };
+  };
+  const trustedLocalRef = useRef(true); /* false: an old-style local copy that must not be merged */
   const savingRef = useRef(false);
   const saveAgainRef = useRef(false);
   const retryRef = useRef({ timer: null, delay: 0 });
   const latestRef = useRef({ state: null, coach: null });
-  const serverJsonRef = useRef(null); /* the server's copy, to skip saving what it already has */
+  const [localWarn, setLocalWarn] = useState(""); /* local cache write failed */
+  const [syncError, setSyncError] = useState(""); /* server refused a save */
+  const [massGuard, setMassGuard] = useState(null); /* { kinds, source } — a save held for confirmation */
+  const massGuardRef = useRef(null);
+  const forceNextRef = useRef(false);
+  const staleGateRef = useRef(false); /* refreshing after a long absence: no saves until done */
+  const hiddenAtRef = useRef(null);
+  const lastTickRef = useRef(Date.now());
+  const [persistTick, setPersistTick] = useState(0);
+  const persistTimer = useRef(null);
+  const legacyCleanedRef = useRef(false);
   const channelRef = useRef(null);
   const [keyVersion, setKeyVersion] = useState(0);
   const runDailyRef = useRef(null);
@@ -5020,14 +5226,17 @@ export default function FlightDeck() {
   }, []);
 
   /* ---- SYNC-FIRST BOOT ----
-     1) read local cache  2) fetch remote (remote wins)
-     3) run day rollover (archive done / carry unfinished)
-     4) only THEN, and only if remote was reachable, allow auto-generation */
+     1) read the local cache (one IndexedDB record: state + its sync base/rev)
+     2) fetch the server copy
+        - no trustworthy local copy → use the server's, as is
+        - local copy older than 24h and the server has moved on → use the
+          server's (the local one is kept as a snapshot)
+        - same revision → keep local (it may hold unsaved edits)
+        - otherwise merge, against the base saved WITH the local copy
+     3) run day rollover, then allow auto-generation if the server answered */
   useEffect(() => {
     (async () => {
       let key = null;
-      let localState = DEFAULT_STATE;
-      let localCoach = DEFAULT_COACH;
       try {
         key = localStorage.getItem("fd-sync-key");
         if (!key) {
@@ -5036,44 +5245,93 @@ export default function FlightDeck() {
             (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
           localStorage.setItem("fd-sync-key", key);
         }
-        const ls = localStorage.getItem("fd-state");
-        if (ls) localState = migrate(JSON.parse(ls));
-        const lc = localStorage.getItem("fd-coach");
-        if (lc) localCoach = { ...DEFAULT_COACH, ...JSON.parse(lc) };
       } catch (e) {
         key = key || "fd_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
       }
       syncKeyRef.current = key;
 
-      let mergedState = localState;
-      let mergedCoach = localCoach;
-      let remoteOk = false;
-      try {
-        const [remote, stored] = await Promise.all([rpc("fd_get", { k: key }, 30000), idbStore.get("sync-base")]);
-        remoteOk = true;
-        /* the base only counts if it matches what this browser last saved */
-        let lsRev = null;
+      /* the local copy is trusted only if it came from the single-record cache
+         for this sync code — state, base and rev from the same write */
+      let local = null;
+      let localCoach = null;
+      let trusted = false;
+      let localRev = null;
+      let localBase = null;
+      let savedAt = 0;
+      const rec = await idbStore.get("local");
+      if (rec && rec.key === key && rec.state) {
         try {
-          lsRev = localStorage.getItem("fd-sync-rev");
+          local = migrate(rec.state);
+          localCoach = { ...DEFAULT_COACH, ...(rec.coach || {}) };
+          localRev = rec.rev ?? null;
+          localBase = rec.base || null;
+          savedAt = rec.savedAt || 0;
+          trusted = true;
+        } catch (e) {
+          local = null;
+        }
+      }
+      let legacy = null;
+      let legacyCoach = null;
+      if (!trusted) {
+        try {
+          const ls = localStorage.getItem("fd-state");
+          if (ls) legacy = migrate(JSON.parse(ls));
+          const lc = localStorage.getItem("fd-coach");
+          if (lc) legacyCoach = { ...DEFAULT_COACH, ...JSON.parse(lc) };
         } catch (e) {}
-        const base = stored && stored.key === key && lsRev != null && String(stored.rev) === lsRev ? stored.base : null;
-        if (remote) {
-          const rd = remote.data ? migrate(remote.data) : null;
-          if (rd) mergedState = mergeStates(localState, rd, base);
-          if (remote.coach) mergedCoach = mergeCoach(localCoach, { ...DEFAULT_COACH, ...remote.coach });
-          if (remote.rev == null) putModeRef.current = "set";
-          rememberServer(remote.rev ?? 0, rd, remote.coach);
-        } else rememberServer(0, null);
-        setSyncStatus("synced");
-      } catch (e) {
-        setSyncStatus("offline");
       }
 
-      const { coach: rolled, archived, shouldGenerate } = rolloverCoach(mergedCoach, null, mergedState.applications);
-      if (archived.length) {
-        mergedState = { ...mergedState, accomplishments: [...archived, ...(mergedState.accomplishments || [])] };
+      let nextState = DEFAULT_STATE;
+      let nextCoach = DEFAULT_COACH;
+      let pack = { rev: null, base: null, server: null };
+      let remoteOk = false;
+      try {
+        const remote = await rpc("fd_get", { k: key }, 30000);
+        remoteOk = true;
+        const rd = remote?.data ? migrate(remote.data) : null;
+        const rc = remote?.coach ? { ...DEFAULT_COACH, ...remote.coach } : null;
+        const rrev = remote?.rev ?? 0;
+        if (rd) {
+          const stale = trusted && savedAt && Date.now() - savedAt > STALE_MS && rrev > (localRev ?? -1);
+          if (!trusted || stale) {
+            if (stale && local && snapshotWorthKeeping(local)) {
+              const list = await loadSnapshots();
+              await saveSnapshots([{ date: today(), at: new Date().toISOString(), summary: snapshotSummary(local), data: local, preRestore: true, note: "this device before a server refresh" }, ...list]);
+            }
+            nextState = rd;
+            nextCoach = rc || DEFAULT_COACH;
+          } else if (rrev === localRev) {
+            nextState = local;
+            nextCoach = localCoach || rc || DEFAULT_COACH;
+          } else {
+            nextState = mergeStates(local, rd, localBase);
+            nextCoach = rc ? mergeCoach(localCoach || DEFAULT_COACH, rc) : localCoach || DEFAULT_COACH;
+          }
+          pack = { rev: rrev, base: buildSyncBase(rd), server: { data: rd, coach: remote.coach ?? null, json: JSON.stringify(rd) + "|" + JSON.stringify(remote.coach ?? null) } };
+        } else {
+          /* nothing on the server for this code yet */
+          nextState = (trusted ? local : legacy) || DEFAULT_STATE;
+          nextCoach = (trusted ? localCoach : legacyCoach) || DEFAULT_COACH;
+          pack = { rev: rrev, base: null, server: { data: null, coach: null, json: null } };
+        }
+        setSyncStatus("synced");
+      } catch (e) {
+        /* offline: work from the local copy. It saves only after the server
+           has been read and merged (see flushSave). */
+        nextState = (trusted ? local : legacy) || DEFAULT_STATE;
+        nextCoach = (trusted ? localCoach : legacyCoach) || DEFAULT_COACH;
+        pack = trusted ? { rev: localRev, base: localBase, server: null } : { rev: null, base: null, server: null };
+        setSyncStatus("offline");
       }
-      setState(mergedState);
+      setSync(pack);
+      trustedLocalRef.current = trusted || remoteOk;
+
+      const { coach: rolled, archived, shouldGenerate } = rolloverCoach(nextCoach, null, nextState.applications);
+      if (archived.length) {
+        nextState = { ...nextState, accomplishments: [...archived, ...(nextState.accomplishments || [])] };
+      }
+      setState(nextState);
       setCoach(rolled);
       setLoaded(true);
       setCanAutoGen(remoteOk);
@@ -5089,17 +5347,27 @@ export default function FlightDeck() {
      is yesterday's finished state rather than a half-edited today. */
   /* mirrored into state so the settings list re-renders after a capture,
      restore or delete without needing the modal reopened */
-  const [snapshots, setSnapshots] = useState(() => readSnapshots());
+  const [snapshots, setSnapshots] = useState([]);
   const snapChecked = useRef(false);
+  const refreshSnapshots = async () => setSnapshots(await loadSnapshots());
+  const addSnapshot = async (entry, { replaceTodayPre = false } = {}) => {
+    const list = await loadSnapshots();
+    const rest = replaceTodayPre ? list.filter((x) => !(x.date === today() && x.preRestore)) : list;
+    const ok = await saveSnapshots([entry, ...rest]);
+    if (!ok) flash("⚠ Couldn't store the snapshot on this device (storage full?)");
+    await refreshSnapshots();
+    return ok;
+  };
   useEffect(() => {
     if (!loaded || snapChecked.current) return;
     snapChecked.current = true;
-    if (!snapshotWorthKeeping(state)) return;
-    const list = readSnapshots();
-    if (list[0]?.date === today()) return; /* already have one for today */
-    const next = [{ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state }, ...list];
-    writeSnapshots(next);
-    setSnapshots(readSnapshots());
+    (async () => {
+      const list = await loadSnapshots();
+      setSnapshots(list);
+      if (!snapshotWorthKeeping(state)) return;
+      if (list.some((x) => x.date === today() && !x.preRestore)) return; /* already have one for today */
+      await addSnapshot({ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state });
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
@@ -5107,17 +5375,17 @@ export default function FlightDeck() {
      device converges on the restored copy. A snapshot of the CURRENT state is
      taken first under a separate marker — restoring the wrong day shouldn't be
      the one action you can't undo. */
-  const restoreSnapshot = (snap) => {
+  /* a restore starts a new sync epoch, so other devices take it as a whole
+     instead of merging their own copies back into it */
+  const restoreSnapshot = async (snap) => {
     if (!snap?.data) return;
-    const list = readSnapshots();
-    const withPre = [{ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state, preRestore: true }, ...list.filter((x) => !(x.date === today() && x.preRestore))];
-    writeSnapshots(withPre);
-    setSnapshots(readSnapshots());
-    setState(migrate(snap.data));
+    await addSnapshot({ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state, preRestore: true }, { replaceTodayPre: true });
+    setState({ ...migrate(snap.data), syncEpoch: newSyncEpoch() });
     flash(`↺ Restored ${snap.date} — sync will push it to your other devices`);
   };
-  const deleteSnapshot = (date) => {
-    writeSnapshots(readSnapshots().filter((x) => x.date !== date));
+  const deleteSnapshot = async (date) => {
+    await saveSnapshots((await loadSnapshots()).filter((x) => x.date !== date));
+    await refreshSnapshots();
     flash("Snapshot removed");
   };
   /* Restores from a file. Kept separate from the snapshot list because it's
@@ -5134,10 +5402,8 @@ export default function FlightDeck() {
         if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.applications)) {
           return flash("That doesn't look like a Flight Deck backup");
         }
-        const list = readSnapshots();
-        writeSnapshots([{ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state, preRestore: true }, ...list.filter((x) => !(x.date === today() && x.preRestore))]);
-        setSnapshots(readSnapshots());
-        setState(migrate(parsed));
+        addSnapshot({ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state, preRestore: true }, { replaceTodayPre: true });
+        setState({ ...migrate(parsed), syncEpoch: newSyncEpoch() });
         flash("↺ Backup imported — sync will push it to your other devices");
       } catch (e) {
         flash("Couldn't read that file");
@@ -5167,41 +5433,67 @@ export default function FlightDeck() {
      backup at the moment you most want one — before a risky change. */
   const exportCurrent = () => exportSnapshot({ date: `${today()}-current`, data: state });
 
-  /* what the server holds now: its revision and a fingerprint of its data */
-  function rememberServer(rev, data, coachData) {
-    revRef.current = rev;
-    serverJsonRef.current = data ? JSON.stringify(data) + "|" + JSON.stringify(coachData ?? null) : null;
-    const base = data ? buildSyncBase(data) : null;
-    baseRef.current = base;
-    const key = syncKeyRef.current;
-    idbStore.set("sync-base", { key, rev, base }).then(() => {
-      try {
-        localStorage.setItem("fd-sync-rev", String(rev));
-      } catch (e) {}
-    });
-  }
-
-  /* fold the server's copy into whatever is on screen — edits made here that
-     haven't saved yet are kept, because they differ from the base */
-  const applyRemote = (remote) => {
-    if (!remote) {
-      if (revRef.current == null) rememberServer(0, null);
+  /* ---- writing the local cache ----
+     Runs after each committed change (debounced). The record pairs the state
+     on screen with the server revision/base it already includes. If the write
+     fails, nothing on disk moves — the previous consistent record stays —
+     and a warning stays up until a write succeeds. */
+  const persistLocal = async () => {
+    const { state: st, coach: co } = latestRef.current;
+    if (!st || !syncKeyRef.current) return false;
+    /* only pair the state with the revision it actually includes */
+    if (latestRef.current.stamp !== syncRef.current.stamp) {
+      schedulePersist(200);
       return false;
     }
-    const rd = remote.data ? migrate(remote.data) : null;
-    const base = baseRef.current;
-    if (rd)
-      setState((prev) => {
-        const merged = mergeStates(prev, rd, base);
-        return JSON.stringify(merged) === JSON.stringify(prev) ? prev : merged;
-      });
-    if (remote.coach)
+    const { rev, base } = syncRef.current;
+    const ok = await idbStore.set("local", { key: syncKeyRef.current, rev, base, state: st, coach: co, savedAt: Date.now() });
+    if (ok) {
+      setLocalWarn("");
+      if (!legacyCleanedRef.current) {
+        legacyCleanedRef.current = true;
+        /* the old localStorage copies are what filled the quota */
+        try {
+          localStorage.removeItem("fd-state");
+          localStorage.removeItem("fd-coach");
+          localStorage.removeItem("fd-sync-rev");
+        } catch (e) {}
+        idbStore.del("sync-base");
+      }
+    } else {
+      setLocalWarn("This device couldn't save its local copy (browser storage is full or blocked). Your work is still saving to the server — keep this tab open until it shows SYNCED, and free up browser storage.");
+    }
+    return ok;
+  };
+  const schedulePersist = (ms = 400) => {
+    if (persistTimer.current) clearTimeout(persistTimer.current);
+    persistTimer.current = setTimeout(() => persistLocal(), ms);
+  };
+
+  /* take the server's copy into the state. "replace" uses it as is; otherwise
+     it's merged with what's on screen (unsaved edits survive; nothing is
+     removed except by tombstone). syncRef moves INSIDE the state update, so
+     it always describes the state it was merged into. */
+  const adoptRemote = (remote, { replace = false } = {}) => {
+    const rd = remote?.data ? migrate(remote.data) : null;
+    const rev = remote?.rev ?? 0;
+    const pack = {
+      rev,
+      base: rd ? buildSyncBase(rd) : null,
+      server: { data: rd, coach: remote?.coach ?? null, json: rd ? JSON.stringify(rd) + "|" + JSON.stringify(remote?.coach ?? null) : null },
+    };
+    setState((prev) => {
+      const next = !rd ? prev : replace ? rd : mergeStates(prev, rd, syncRef.current.base);
+      setSync(pack);
+      return next === prev || JSON.stringify(next) === JSON.stringify(prev) ? prev : next;
+    });
+    if (remote?.coach)
       setCoach((prev) => {
-        const merged = mergeCoach(prev, { ...DEFAULT_COACH, ...remote.coach });
-        return JSON.stringify(merged) === JSON.stringify(prev) ? prev : merged;
+        const next = replace ? { ...DEFAULT_COACH, ...remote.coach } : mergeCoach(prev, { ...DEFAULT_COACH, ...remote.coach });
+        return JSON.stringify(next) === JSON.stringify(prev) ? prev : next;
       });
-    if (remote.rev == null) putModeRef.current = "set";
-    rememberServer(remote.rev ?? 0, rd, remote.coach);
+    /* if neither changed, no render follows — persist the new pairing anyway */
+    setPersistTick((t) => t + 1);
   };
 
   const scheduleRetry = () => {
@@ -5214,11 +5506,18 @@ export default function FlightDeck() {
     }, r.delay);
   };
 
-  /* one save at a time. The server only accepts it if nobody else saved since
-     this device last synced; otherwise it pulls their changes, merges, and
-     saves the merged copy — so nothing anyone did gets overwritten. */
+  /* One save at a time, always conditional (fd_put with the revision this
+     state includes). There is no overwrite path:
+       - someone else saved first → read theirs, merge, try again
+       - the save would remove a lot → held for you to confirm (here, before
+         sending, and again on the server)
+       - the server refuses it (4xx) → shown as a sync error, retried later */
   const flushSave = async () => {
     if (!loaded) return;
+    if (massGuardRef.current || staleGateRef.current || pullingRef.current) {
+      if (!massGuardRef.current) setTimeout(() => flushSaveRef.current?.(), 500);
+      return;
+    }
     if (savingRef.current) {
       saveAgainRef.current = true;
       return;
@@ -5227,49 +5526,71 @@ export default function FlightDeck() {
     const k = syncKeyRef.current;
     try {
       setSyncStatus("saving");
-      if (putModeRef.current === "put" && revRef.current == null) {
-        /* never reached the server yet (started offline): merge first */
-        applyRemote(await rpc("fd_get", { k }, 30000));
+      if (latestRef.current.stamp !== syncRef.current.stamp) {
+        /* the state that matches the newest server copy hasn't rendered yet */
         saveAgainRef.current = true;
-      } else {
-        const { state: sent, coach: sentCoach } = latestRef.current;
-        let ok = false;
-        let wrote = false;
-        /* nothing new for the server (e.g. just merged its copy in) */
-        if (serverJsonRef.current && serverJsonRef.current === JSON.stringify(sent) + "|" + JSON.stringify(sentCoach ?? null)) ok = true;
-        else if (putModeRef.current === "put") {
-          let res;
-          try {
-            res = await rpc("fd_put", { k, d: sent, c: sentCoach, expected: revRef.current }, 30000);
-          } catch (e) {
-            /* server without the new function — keep syncing the old way */
-            if (/supabase 4\d\d/.test(e?.message || "")) putModeRef.current = "set";
-            else throw e;
-          }
-          if (res && res.ok) {
-            rememberServer(res.rev, sent, sentCoach);
-            ok = wrote = true;
-          } else if (res) {
-            /* another device saved first: take in their changes, then save again */
-            applyRemote(await rpc("fd_get", { k }, 30000));
-            saveAgainRef.current = true;
-          }
-        }
-        if (putModeRef.current === "set" && !ok) {
-          await rpc("fd_set", { k, d: sent, c: sentCoach }, 30000);
-          ok = wrote = true;
-        }
-        if (ok) {
-          if (latestRef.current.state === sent && latestRef.current.coach === sentCoach) dirtyRef.current = false;
-          retryRef.current.delay = 0;
-          setSyncStatus(dirtyRef.current ? "saving" : "synced");
-          /* tell the other devices to pull right now */
-          if (wrote) try {
-            channelRef.current?.send({ type: "broadcast", event: "changed", payload: { t: Date.now() } });
-          } catch (e) {}
-        }
+        return;
       }
+      if (!syncRef.current.server || syncRef.current.rev == null) {
+        /* this state hasn't been reconciled with the server yet (started
+           offline): read and merge first, then save. An old-style local copy
+           (not written together with its base) is replaced, not merged. */
+        adoptRemote(await rpc("fd_get", { k }, 30000), { replace: !trustedLocalRef.current });
+        trustedLocalRef.current = true;
+        saveAgainRef.current = true;
+        setSyncError("");
+        return;
+      }
+      const { state: sent, coach: sentCoach } = latestRef.current;
+      const { rev, server } = syncRef.current;
+      const sentJson = JSON.stringify(sent) + "|" + JSON.stringify(sentCoach ?? null);
+      let wrote = false;
+      if (server.json && server.json === sentJson) {
+        /* the server already has exactly this */
+      } else {
+        const force = forceNextRef.current;
+        if (!force) {
+          const kinds = massDeletionCheck(server.data, sent);
+          if (kinds) {
+            massGuardRef.current = { kinds, source: "device" };
+            setMassGuard(massGuardRef.current);
+            setSyncStatus("saving");
+            return;
+          }
+        }
+        const res = await rpc("fd_put", { k, d: sent, c: sentCoach, expected: rev, force: !!force }, 30000);
+        if (res && res.ok) {
+          forceNextRef.current = false;
+          /* the server now holds exactly what was sent; the state on screen
+             already contains it (plus anything typed since) */
+          setSync({ rev: res.rev, base: buildSyncBase(sent), server: { data: sent, coach: sentCoach ?? null, json: sentJson } });
+          if (latestRef.current.state === sent) latestRef.current = { ...latestRef.current, stamp: syncRef.current.stamp };
+          setPersistTick((t) => t + 1);
+          wrote = true;
+        } else if (res && res.reason === "mass_delete") {
+          /* the server's own guard caught it — ask, don't retry */
+          const kinds = massDeletionCheck(server.data, sent, { any: true }) || [];
+          massGuardRef.current = { kinds, source: "server", counts: res.counts };
+          setMassGuard(massGuardRef.current);
+          return;
+        } else if (res) {
+          /* another device saved first: take in their changes, then save again */
+          adoptRemote(await rpc("fd_get", { k }, 30000));
+          saveAgainRef.current = true;
+          return;
+        } else throw new Error("supabase: empty reply");
+      }
+      if (latestRef.current.state === sent && latestRef.current.coach === sentCoach) dirtyRef.current = false;
+      retryRef.current.delay = 0;
+      setSyncError("");
+      setSyncStatus(dirtyRef.current ? "saving" : "synced");
+      if (wrote)
+        try {
+          channelRef.current?.send({ type: "broadcast", event: "changed", payload: { t: Date.now() } });
+        } catch (e) {}
     } catch (e) {
+      const m = String(e?.message || "").match(/supabase (4\d\d)(?::\s*(.*))?/);
+      if (m) setSyncError(`The server refused this save (${m[1]}${m[2] ? `: ${m[2].slice(0, 90)}` : ""}). Nothing was overwritten — retrying.`);
       setSyncStatus("offline");
       scheduleRetry();
     } finally {
@@ -5283,45 +5604,74 @@ export default function FlightDeck() {
   const flushSaveRef = useRef(null);
   flushSaveRef.current = flushSave;
 
-  /* save: local immediately, remote debounced */
+  /* the held save: what the buttons in the dialog do */
+  const resolveMassGuard = (choice) => {
+    const g = massGuardRef.current;
+    if (!g) return;
+    massGuardRef.current = null;
+    setMassGuard(null);
+    if (choice === "save") {
+      forceNextRef.current = true;
+    } else {
+      const server = syncRef.current.server?.data;
+      setState((prev) => keepServerItems(prev, server, g.kinds));
+      flash("Kept the server's data");
+    }
+    setTimeout(() => flushSaveRef.current?.(), 100);
+  };
+
+  /* state changed: remember it, write the local cache, save to the server */
   useEffect(() => {
     if (!loaded) return;
-    latestRef.current = { state, coach };
+    latestRef.current = { state, coach, stamp: syncRef.current.stamp };
     dirtyRef.current = true;
-    try {
-      localStorage.setItem("fd-state", JSON.stringify(state));
-      localStorage.setItem("fd-coach", JSON.stringify(coach));
-    } catch (e) {}
+    schedulePersist(300);
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => flushSaveRef.current?.(), 800);
     return () => saveTimer.current && clearTimeout(saveTimer.current);
   }, [state, coach, loaded]);
+  /* the server revision moved without the state changing (a save landed, or
+     a pull brought nothing new): re-write the pairing */
+  useEffect(() => {
+    if (!loaded || !persistTick) return;
+    latestRef.current = { state, coach, stamp: syncRef.current.stamp };
+    schedulePersist(50);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [persistTick]);
 
   /* LIVE RE-SYNC: when the tab regains focus (and every 60s), pull remote
      changes made on other devices and merge them in. A tiny revision check
-     comes first, so nothing big downloads unless something changed. Safe
-     mid-edit: unsaved edits here survive the merge. */
-  const pullRemote = useCallback(async () => {
+     comes first, so nothing big downloads unless something changed. */
+  const pullRemote = useCallback(async ({ replaceIfNewer = false } = {}) => {
     if (!loaded || pullingRef.current) return;
-    if (typeof document !== "undefined" && document.hidden) return;
+    if (!replaceIfNewer && typeof document !== "undefined" && document.hidden) return;
+    if (savingRef.current && !replaceIfNewer) return;
     pullingRef.current = true;
     try {
       const k = syncKeyRef.current;
-      if (putModeRef.current === "put" && revRef.current != null) {
+      const known = syncRef.current.rev;
+      if (known != null && syncRef.current.server) {
         let rev = null;
         try {
           rev = await rpc("fd_rev", { k });
         } catch (e) {
           rev = null;
         }
-        if (rev != null && Number(rev) <= revRef.current) {
+        if (rev != null && Number(rev) <= known) {
           if (!dirtyRef.current) setSyncStatus("synced");
           return;
         }
       }
       const remote = await rpc("fd_get", { k }, 30000);
-      if (remote && remote.rev != null && revRef.current != null && remote.rev <= revRef.current) return;
-      applyRemote(remote);
+      if (remote && remote.rev != null && known != null && syncRef.current.server && remote.rev <= known) return;
+      if (replaceIfNewer && remote?.data) {
+        /* back after a long absence: the server's copy wins outright. What was
+           on screen is kept as a snapshot, in case it held something. */
+        const cur = latestRef.current.state;
+        if (dirtyRef.current && cur && snapshotWorthKeeping(cur)) await addSnapshot({ date: today(), at: new Date().toISOString(), summary: snapshotSummary(cur), data: cur, preRestore: true, note: "this tab before a server refresh" });
+        adoptRemote(remote, { replace: true });
+        dirtyRef.current = false;
+      } else adoptRemote(remote);
       if (!dirtyRef.current) setSyncStatus("synced");
     } catch (e) {
       /* stay quiet — next cycle will retry */
@@ -5331,11 +5681,35 @@ export default function FlightDeck() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
+  /* a tab that was away for more than a day refreshes from the server BEFORE
+     anything it holds can be saved */
+  const refreshIfStale = async (awayMs) => {
+    if (awayMs <= STALE_MS || staleGateRef.current) return false;
+    staleGateRef.current = true;
+    try {
+      await pullRemote({ replaceIfNewer: true });
+    } finally {
+      staleGateRef.current = false;
+    }
+    return true;
+  };
+
   useEffect(() => {
     if (!loaded) return;
-    const onFocus = () => pullRemote();
+    const back = async () => {
+      const away = hiddenAtRef.current ? Date.now() - hiddenAtRef.current : Date.now() - lastTickRef.current;
+      hiddenAtRef.current = null;
+      lastTickRef.current = Date.now();
+      if (!(await refreshIfStale(away))) pullRemote();
+    };
+    const onFocus = () => back();
+    const onBlur = () => {
+      if (!hiddenAtRef.current) hiddenAtRef.current = Date.now();
+    };
     const onVis = () => {
-      if (!document.hidden) pullRemote();
+      if (document.hidden) {
+        if (!hiddenAtRef.current) hiddenAtRef.current = Date.now();
+      } else back();
     };
     /* back online: send what piled up, then catch up */
     const onOnline = () => {
@@ -5343,17 +5717,49 @@ export default function FlightDeck() {
       if (dirtyRef.current) flushSaveRef.current?.();
       else pullRemote();
     };
+    const onHide = () => persistLocal();
+    window.addEventListener("pagehide", onHide);
     window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
     window.addEventListener("online", onOnline);
     document.addEventListener("visibilitychange", onVis);
-    const t = setInterval(pullRemote, 60000);
+    /* the 60s tick also notices a machine that slept with the tab open */
+    const t = setInterval(async () => {
+      const gap = Date.now() - lastTickRef.current;
+      lastTickRef.current = Date.now();
+      if (!(await refreshIfStale(gap))) pullRemote();
+    }, 60000);
     return () => {
+      window.removeEventListener("pagehide", onHide);
       window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
       window.removeEventListener("online", onOnline);
       document.removeEventListener("visibilitychange", onVis);
       clearInterval(t);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, pullRemote]);
+
+  /* ---- server history: list, and restore a saved version ----
+     Every save keeps the version it replaced on the server. Restoring one
+     takes a copy of the current state first, then saves the old version
+     through the normal conditional save, under a new epoch so other devices
+     take it whole. */
+  const restoreServerVersion = async (hid) => {
+    try {
+      const v = await rpc("fd_history_get", { k: syncKeyRef.current, hid }, 30000);
+      if (!v?.data) return flash("That version couldn't be loaded");
+      const cur = latestRef.current.state;
+      if (cur && snapshotWorthKeeping(cur)) await addSnapshot({ date: today(), at: new Date().toISOString(), summary: snapshotSummary(cur), data: cur, preRestore: true, note: "before restoring a server version" }, { replaceTodayPre: true });
+      setState({ ...migrate(v.data), syncEpoch: newSyncEpoch() });
+      if (v.coach) setCoach({ ...DEFAULT_COACH, ...v.coach });
+      flash(`↺ Restored the version from ${new Date(v.saved_at).toLocaleString()} — saving it now`);
+      return true;
+    } catch (e) {
+      flash("Couldn't reach the server to restore");
+      return false;
+    }
+  };
 
   /* REALTIME: private broadcast channel named by the secret sync code.
      Any device that saves sends a ping; every other device pulls within ~1s.
@@ -6543,6 +6949,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       return {
         ...s,
         poolBench: (s.poolBench || []).filter((b) => !ids.includes(b.id)),
+        deletedIds: tombstoneIds(s, (s.poolBench || []).filter((b) => ids.includes(b.id)).map((b) => b.id)),
         applications: [...newApps, ...s.applications],
         accounts: [...newAccts, ...(s.accounts || [])],
       };
@@ -7698,7 +8105,6 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       let nextState = state;
       let nextCoach = coach;
       const rd = remote?.data ? migrate(remote.data) : null;
-      putModeRef.current = remote && remote.rev == null ? "set" : "put";
       if (remote) {
         if (rd) nextState = mergeStates(state, rd);
         if (remote.coach) {
@@ -7709,10 +8115,14 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       }
       /* the new code's server copy becomes the base, so the merged result
          saves to it straight away (the usual save picks it up) */
-      rememberServer(remote?.rev ?? 0, rd, remote?.coach);
+      setSync({
+        rev: remote?.rev ?? 0,
+        base: rd ? buildSyncBase(rd) : null,
+        server: { data: rd, coach: remote?.coach ?? null, json: rd ? JSON.stringify(rd) + "|" + JSON.stringify(remote?.coach ?? null) : null },
+      });
       setState(nextState);
       setCoach(nextCoach);
-      latestRef.current = { state: nextState, coach: nextCoach };
+      latestRef.current = { state: nextState, coach: nextCoach, stamp: syncRef.current.stamp };
       dirtyRef.current = true;
       setTimeout(() => flushSaveRef.current?.(), 50);
       setKeyVersion((v) => v + 1); /* rejoin realtime channel under the new code */
@@ -8391,7 +8801,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       key={a.id}
                       showX={isDesktop}
                       onTap={() => setModal({ kind: "accomplishment", entry: a })}
-                      onDelete={() => mutate((s) => ({ ...s, accomplishments: s.accomplishments.filter((x) => x.id !== a.id) }), "Accomplishment deleted")}
+                      onDelete={() => mutate((s) => ({ ...s, accomplishments: s.accomplishments.filter((x) => x.id !== a.id), deletedIds: tombstoneIds(s, [a.id]) }), "Accomplishment deleted")}
                     >
                       {isCycle ? (
                         <div style={{ margin: "-12px -14px", padding: "12px 14px", background: "rgba(125,176,247,0.08)", borderLeft: `3px solid ${C.blue}`, borderRadius: 12 }}>
@@ -10897,7 +11307,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                     </td>
                     <td style={td} onClick={(e) => e.stopPropagation()}>
                       <button
-                        onClick={() => mutate((s) => ({ ...s, content: s.content.filter((x) => x.id !== c.id) }), "Content deleted")}
+                        onClick={() => mutate((s) => ({ ...s, content: s.content.filter((x) => x.id !== c.id), deletedIds: tombstoneIds(s, [c.id]) }), "Content deleted")}
                         title="Delete"
                         style={{ width: 24, height: 24, borderRadius: 12, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, fontSize: 13, lineHeight: "22px", cursor: "pointer", padding: 0 }}
                       >
@@ -10919,7 +11329,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 key={c.id}
                 showX={false}
                 onTap={() => setModal({ kind: "content", entry: c })}
-                onDelete={() => mutate((s) => ({ ...s, content: s.content.filter((x) => x.id !== c.id) }), "Content deleted")}
+                onDelete={() => mutate((s) => ({ ...s, content: s.content.filter((x) => x.id !== c.id), deletedIds: tombstoneIds(s, [c.id]) }), "Content deleted")}
               >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
                   <div style={{ fontWeight: 700, fontSize: 14 }}>{c.title || "Untitled"}</div>
@@ -11368,7 +11778,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 setModal({ kind: "session", entry: s, localUrl });
               }}
               onDelete={() => {
-                mutate((st) => ({ ...st, supportSessions: st.supportSessions.filter((y) => y.id !== s.id) }), "Session deleted");
+                mutate((st) => ({ ...st, supportSessions: st.supportSessions.filter((y) => y.id !== s.id), deletedIds: tombstoneIds(st, [s.id]) }), "Session deleted");
                 if (s.audioPath) deleteAudio(s.audioPath).catch(() => {});
                 if (s.audioLocal) idbDelete(s.id).catch(() => {});
               }}
@@ -11600,9 +12010,9 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
   const toggleCallSession = (contactId) =>
     mutate((st) => {
       const cur = st.callSession || [];
-      return { ...st, callSession: cur.includes(contactId) ? cur.filter((x) => x !== contactId) : [...cur, contactId] };
+      return withCallRun(st, cur.includes(contactId) ? cur.filter((x) => x !== contactId) : [...cur, contactId]);
     });
-  const clearCallSession = () => mutate((st) => ({ ...st, callSession: [] }), "Run cleared");
+  const clearCallSession = () => mutate((st) => withCallRun(st, []), "Run cleared");
   /* ---- start / pause / stop ---- */
   const [confirmStopRun, setConfirmStopRun] = useState(false);
   const [runSummary, setRunSummary] = useState(null);
@@ -11637,7 +12047,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       const cur = st.callSession || [];
       const dialable = new Set((st.accounts || []).flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt && hasPhone(c) && c.status !== "closed").map((c) => c.id)));
       const add = contactIds.filter((id) => dialable.has(id) && !cur.includes(id));
-      return { ...st, callSession: [...cur, ...add] };
+      return withCallRun(st, [...cur, ...add]);
     }, label);
   const newAccountList = (name, industry) => {
     let made = null;
@@ -11662,7 +12072,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     mutate((st) => addAccountsToList(st, listId, accountIds), `${accountIds.length} ${accountIds.length === 1 ? "account" : "accounts"} added to ${listName((state.accountLists || []).find((l) => l.id === listId))}`);
   /* silent: it fires as part of logging a call, and a second toast on top of
      the call confirmation would just be noise */
-  const dropFromCallSession = (contactId) => mutate((st) => ({ ...st, callSession: (st.callSession || []).filter((x) => x !== contactId) }));
+  const dropFromCallSession = (contactId) => mutate((st) => withCallRun(st, (st.callSession || []).filter((x) => x !== contactId)));
 
   const callQueue = useMemo(() => {
     const rows = (state.accounts || []).flatMap((acc) =>
@@ -11725,7 +12135,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const addShownToRun = () => {
       const ids = rest.filter((r) => r.dialable).map((r) => r.contact.id);
       if (!ids.length) return;
-      mutate((st) => ({ ...st, callSession: [...(st.callSession || []), ...ids.filter((id) => !(st.callSession || []).includes(id))] }), `${ids.length} added to this run`);
+      mutate((st) => withCallRun(st, [...(st.callSession || []), ...ids.filter((id) => !(st.callSession || []).includes(id))]), `${ids.length} added to this run`);
     };
     /* Export works on what's on screen: the run plus whatever the search
        leaves. Only rows with a usable number can go in — a CSV of people to
@@ -12618,6 +13028,21 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       )}
 
       {/* toast */}
+      {(localWarn || syncError) && (
+        <div role="alert" data-sync-warning style={{ position: "fixed", top: "calc(env(safe-area-inset-top, 0px) + 8px)", left: "50%", transform: "translateX(-50%)", width: "min(640px, calc(100% - 24px))", zIndex: 70, display: "flex", flexDirection: "column", gap: 6 }}>
+          {localWarn && (
+            <div style={{ background: "#2a1a0a", border: `1px solid ${C.amber}`, color: C.amber, borderRadius: 10, padding: "9px 12px", fontSize: 12, lineHeight: 1.45 }}>
+              ⚠ {localWarn}
+            </div>
+          )}
+          {syncError && (
+            <div style={{ background: "#2a0f12", border: `1px solid ${C.red}`, color: C.red, borderRadius: 10, padding: "9px 12px", fontSize: 12, lineHeight: 1.45 }}>
+              ⛔ {syncError}
+            </div>
+          )}
+        </div>
+      )}
+      {massGuard && <MassDeleteDialog guard={massGuard} onKeep={() => resolveMassGuard("keep")} onSave={() => resolveMassGuard("save")} />}
       {toast && (
         <div style={{ position: "fixed", bottom: `calc(env(safe-area-inset-bottom, 0px) + ${isDesktop ? 24 : MODES[mode] === "PIPELINE" ? 132 : 84}px)`, left: "50%", transform: "translateX(-50%)", background: C.panelEdge, color: C.ink, fontSize: 13, fontWeight: 600, padding: "8px 18px", borderRadius: 20, zIndex: 60 }}>
           {toast}
@@ -12649,10 +13074,9 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
              happen to log from the queue */
           onCallLogged={dropFromCallSession}
           onImportBackup={importBackupFile}
-          onDeleteSnapshot={(d) => {
-            deleteSnapshot(d);
-            setSnapshots(readSnapshots());
-          }}
+          onDeleteSnapshot={(d) => deleteSnapshot(d)}
+          syncKey={syncKeyRef.current}
+          onRestoreVersion={restoreServerVersion}
         />
       )}
       {modal && modal.kind === "parseJobPost" && (
@@ -12936,7 +13360,139 @@ function ModelPicker({ provider, baseUrl, value, onChange }) {
   );
 }
 
-function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft, isDesktop, snapshots, onRestoreSnapshot, onExportSnapshot, onDeleteSnapshot, onExportCurrent, onImportBackup, onCallLogged }) {
+/* A save held because it would remove a lot. Keeping the server's data is
+   the default (and the focused button); saving anyway sends it once with the
+   server's guard switched off for that one save. */
+function MassDeleteDialog({ guard, onKeep, onSave }) {
+  const [review, setReview] = useState(false);
+  const kinds = guard.kinds || [];
+  const counts = guard.counts || {};
+  const parts = kinds.length
+    ? kinds.map((k) => `${k.removed.length} ${k.label}`)
+    : Object.entries(counts)
+        .filter(([, v]) => Array.isArray(v) && v[0] > v[1])
+        .map(([k, v]) => `${v[0] - v[1]} ${k === "accountLists" ? "lists" : k}`);
+  const keepRef = useRef(null);
+  useEffect(() => {
+    keepRef.current?.focus();
+  }, []);
+  return (
+    <div data-mass-guard style={{ position: "fixed", inset: 0, background: "rgba(6,10,18,0.82)", zIndex: 80, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div style={{ background: C.panel, border: `1px solid ${C.red}`, borderRadius: 14, padding: 18, width: "min(520px, 100%)", maxHeight: "86vh", overflowY: "auto", fontFamily: sans }}>
+        <div style={{ fontSize: 16, fontWeight: 800, color: C.ink, marginBottom: 6 }}>⚠ This save would remove {parts.join(" / ") || "a lot of data"}.</div>
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+          {guard.source === "server" ? "The server refused it as a mass deletion. " : ""}
+          Nothing has been changed on the server. If you didn&apos;t mean to delete these, keep the server&apos;s data — they&apos;ll be put back on this device too.
+        </div>
+        {review && (
+          <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 10, marginBottom: 12, maxHeight: 260, overflowY: "auto" }}>
+            {kinds.map((k) => (
+              <div key={k.key} style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 11, fontWeight: 800, color: C.red, marginBottom: 3 }}>
+                  {k.removed.length} {k.label} ({k.before} → {k.after})
+                </div>
+                {k.removed.slice(0, 60).map((r) => (
+                  <div key={r.id} style={{ fontSize: 12, color: C.ink, lineHeight: 1.4 }}>
+                    · {r.name}
+                  </div>
+                ))}
+                {k.removed.length > 60 && <div style={{ fontSize: 11, color: C.muted }}>+{k.removed.length - 60} more</div>}
+              </div>
+            ))}
+            {!kinds.length && <div style={{ fontSize: 12, color: C.muted }}>No item list available — the server reported the counts only.</div>}
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button ref={keepRef} data-keep onClick={onKeep} style={{ background: C.green, color: "#0b1a10", border: "none", borderRadius: 8, padding: "9px 14px", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>
+            Keep server data
+          </button>
+          <button onClick={() => setReview((v) => !v)} style={{ background: "transparent", color: C.ink, border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "9px 14px", fontSize: 13, cursor: "pointer" }}>
+            {review ? "Hide list" : "Review"}
+          </button>
+          <button data-save-anyway onClick={onSave} style={{ background: "transparent", color: C.red, border: `1px solid ${C.red}`, borderRadius: 8, padding: "9px 14px", fontSize: 13, cursor: "pointer" }}>
+            Save anyway
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Settings → Restore a previous version: what the server kept of each save */
+function VersionHistory({ syncKey, onRestore }) {
+  const [rows, setRows] = useState(null);
+  const [err, setErr] = useState("");
+  const [confirmId, setConfirmId] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = async () => {
+    setErr("");
+    setRows(null);
+    try {
+      const r = await rpc("fd_history_list", { k: syncKey }, 20000);
+      setRows(Array.isArray(r) ? r : []);
+    } catch (e) {
+      setErr("Couldn't reach the server");
+      setRows([]);
+    }
+  };
+  useEffect(() => {
+    if (syncKey) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncKey]);
+  return (
+    <div data-version-history style={{ marginBottom: 16 }}>
+      <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 8 }}>
+        Every save keeps the version it replaced on the server — the last 50, plus the last version of each hour for 14 days. Restoring copies your current state into a
+        snapshot first, then saves the old version to every device.
+      </div>
+      {err && <div style={{ fontSize: 12, color: C.red, marginBottom: 6 }}>{err}</div>}
+      {rows === null ? (
+        <div style={{ fontSize: 12, color: C.muted }}>Loading versions…</div>
+      ) : rows.length === 0 ? (
+        <div style={{ fontSize: 12, color: C.muted }}>No earlier versions yet — they start with the next save.</div>
+      ) : (
+        <div style={{ maxHeight: 300, overflowY: "auto" }}>
+          {rows.map((v) => (
+            <div key={v.id} style={{ display: "flex", alignItems: "center", gap: 8, background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "7px 10px", marginBottom: 5 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontFamily: mono, fontSize: 12, color: C.ink }}>
+                  {new Date(v.saved_at).toLocaleString()} <span style={{ color: C.muted, fontSize: 10 }}>rev {v.rev}</span>
+                </div>
+                <div style={{ fontSize: 11, color: C.muted }}>
+                  {v.accounts} accounts · {v.applications} applications · {v.lists} lists
+                </div>
+              </div>
+              <Btn
+                color={confirmId === v.id ? C.red : undefined}
+                ghost={confirmId !== v.id}
+                disabled={busy}
+                onClick={async () => {
+                  if (confirmId !== v.id) {
+                    setConfirmId(v.id);
+                    setTimeout(() => setConfirmId((c) => (c === v.id ? null : c)), 5000);
+                    return;
+                  }
+                  setBusy(true);
+                  await onRestore(v.id);
+                  setBusy(false);
+                  setConfirmId(null);
+                }}
+                style={{ padding: "5px 10px", fontSize: 11 }}
+              >
+                {confirmId === v.id ? "Restore this?" : "↺ Restore"}
+              </Btn>
+            </div>
+          ))}
+        </div>
+      )}
+      <Btn ghost onClick={load} style={{ padding: "5px 10px", fontSize: 11, marginTop: 4 }}>
+        ↻ Refresh list
+      </Btn>
+    </div>
+  );
+}
+
+function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCsvRows, onOpenApplication, onCopyDraft, isDesktop, snapshots, onRestoreSnapshot, onExportSnapshot, onDeleteSnapshot, onExportCurrent, onImportBackup, onCallLogged, syncKey, onRestoreVersion }) {
   const { kind, entry } = modal;
   const [f, setF] = useState(() => {
     if (kind === "application") {
@@ -14655,6 +15211,9 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                 reversible. This is the recovery path that still works on a new device.
               </div>
 
+              <Label>↺ Restore a previous version</Label>
+              {onRestoreVersion && <VersionHistory syncKey={syncKey} onRestore={onRestoreVersion} />}
+              <Label>Daily snapshots on this device</Label>
               {snapshots.length === 0 ? (
                 <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, marginBottom: 16 }}>
                   No daily snapshots yet — the first is taken the next time you open the app on a new day. Use Export now for an immediate copy.
@@ -14666,7 +15225,7 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
                         <span style={{ fontFamily: mono, fontSize: 12, color: C.ink }}>
                           {snap.date}
-                          {snap.preRestore && <span style={{ color: C.amber, fontSize: 10 }}> · before restore</span>}
+                          {snap.preRestore && <span style={{ color: C.amber, fontSize: 10 }}> · {snap.note || "before restore"}</span>}
                         </span>
                         <span style={{ fontFamily: mono, fontSize: 10, color: C.muted }}>{daysSince(snap.date) === 0 ? "today" : `${daysSince(snap.date)}d ago`}</span>
                       </div>
@@ -17812,17 +18371,17 @@ function runAgentActions(st0, reviewed) {
         const run = runOrder(st);
         const pos = parsePositions(a);
         const drop = new Set([...run.filter((x) => pos.includes(x.pos)).map((x) => x.id), ...(a.contactIds || [])]);
-        st = { ...st, callSession: (st.callSession || []).filter((id) => !drop.has(id)) };
+        st = withCallRun(st, (st.callSession || []).filter((id) => !drop.has(id)));
         break;
       }
       case "clear_run":
-        st = { ...st, callSession: [] };
+        st = withCallRun(st, []);
         break;
       case "move_in_run": {
         const live = runOrder(st).map((x) => x.id).filter((id) => id !== a.contactId);
         const to = Math.max(1, Math.min(live.length + 1, Math.round(num(a.to) || 1)));
         live.splice(to - 1, 0, a.contactId);
-        st = { ...st, callSession: live };
+        st = withCallRun(st, live);
         break;
       }
       case "order_run": {
@@ -17846,7 +18405,7 @@ function runAgentActions(st0, reviewed) {
             ? WIN_RANK[callWindowOf(P.c, P.acc).window] - WIN_RANK[callWindowOf(Q.c, Q.acc).window] || tr(p) - tr(q)
             : (Q.callDue ? 1 : 0) - (P.callDue ? 1 : 0) || tr(p) - tr(q);
         });
-        st = { ...st, callSession: ids };
+        st = withCallRun(st, ids);
         break;
       }
       case "create_account": {
@@ -17934,7 +18493,7 @@ function runAgentActions(st0, reviewed) {
         const cur = st.callSession || [];
         /* DNC is checked here, at the moment of adding, so it holds even if
            the tag went on earlier in the same batch */
-        st = { ...st, callSession: [...cur, ...matchCallCriteria(st, a.criteria).filter((r) => !isDnc(r.c, r.acc)).map((r) => r.c.id).filter((id) => !cur.includes(id))] };
+        st = withCallRun(st, [...cur, ...matchCallCriteria(st, a.criteria).filter((r) => !isDnc(r.c, r.acc)).map((r) => r.c.id).filter((id) => !cur.includes(id))]);
         break;
       }
       case "add_to_run": {
@@ -17943,7 +18502,7 @@ function runAgentActions(st0, reviewed) {
           const rr = locateRecord(st, id);
           return rr?.kind === "contact" && hasPhone(rr.c) && rr.c.status !== "closed" && !isDnc(rr.c, rr.acc) && !cur.includes(id);
         });
-        st = { ...st, callSession: [...cur, ...ids] };
+        st = withCallRun(st, [...cur, ...ids]);
         break;
       }
       case "remove_followups":
