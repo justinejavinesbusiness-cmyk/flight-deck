@@ -1578,6 +1578,17 @@ const callConnected = (t) => {
   return o ? o.connects : true;
 };
 const isUnconnectedCall = (t) => isCallTouch(t) && !callConnected(t);
+/* a call they made to you — returning a missed call, usually. It's a real
+   conversation (connected), but not one of YOUR attempts. */
+const isInboundCall = (t) => isCallTouch(t) && t?.direction === "in";
+const isOutboundCall = (t) => isCallTouch(t) && t?.direction !== "in";
+/* the missed call a call-back would be returning: your latest unanswered
+   call in the last 30 days that hasn't been returned yet */
+const missedCallToReturn = (c) =>
+  (c?.touchpoints || [])
+    .filter((t) => isOutboundCall(t) && !callConnected(t) && !t.returnedAt && (t.date || "") >= addDays(today(), -30))
+    .sort((a, b) => (a.at || a.date || "").localeCompare(b.at || b.date || ""))
+    .pop() || null;
 /* What one logged call was: its outcome, whether it connected, how far it got.
    Newer logs store all three; older ones only have the note, which begins with
    the outcome label and carries the stage after a "·". */
@@ -1598,7 +1609,9 @@ const callStanding = (c) => {
     .map((x) => callInfo(x.t));
   const last = calls[calls.length - 1] || null;
   const lastTalk = calls.filter((x) => x.connected).pop() || null;
-  return { count: calls.length, connectedCount: calls.filter((x) => x.connected).length, lastOutcome: last?.outcome || "", everConnected: !!lastTalk, talkStage: lastTalk?.stage || "" };
+  /* attempts are the calls YOU made; a call-back is counted on its own */
+  const inbound = (c?.touchpoints || []).filter(isInboundCall).length;
+  return { count: calls.length - inbound, inbound, connectedCount: calls.filter((x) => x.connected).length, lastOutcome: last?.outcome || "", everConnected: !!lastTalk, talkStage: lastTalk?.stage || "" };
 };
 
 /* A lead that sits in the funnel ONLY because an unanswered call put it there
@@ -2985,23 +2998,44 @@ const trackPos = (fus, i) => (fus || []).slice(0, i + 1).filter((x) => trackOf(x
    logged (account form, call queue / contact card, application form) so they
    can't drift apart. `phoneKey` and `closes`/`closedStatus` differ between a
    contact and an application; everything else is the same. */
-function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays: cbDays, connected, temperature, wantsEmail }, { phoneKey = "phone", closes = CALL_CLOSES, closedStatus = "closed" } = {}) {
+function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays: cbDays, connected, temperature, wantsEmail, inbound = false }, { phoneKey = "phone", closes = CALL_CLOSES, closedStatus = "closed" } = {}) {
   const o = callOutcome(outcome);
+  /* they rang you: always a real conversation, and it answers the missed
+     call it returns, rather than standing beside it as a separate story */
+  if (inbound) connected = true;
+  const returns = inbound ? missedCallToReturn(c) : null;
   /* an outcome can carry its own call-back — "qualified" books 60 days unless
      you picked another date in the log */
   const callbackDays = cbDays > 0 ? cbDays : o?.autoCallback || 0;
   /* what you indicated in the log, unless the outcome settles it by itself */
-  const reached = o?.fixed || typeof connected !== "boolean" ? !!o?.connects : connected;
+  const reached = inbound ? true : o?.fixed || typeof connected !== "boolean" ? !!o?.connects : connected;
   const st = reached ? callStage(stage) : null;
   /* said out loud only when it differs from what the outcome implies */
   const flag = (reached === !!o?.connects ? "" : reached ? " · connected" : " · didn't connect") + (reached && wantsEmail ? " · asked for an email" : "");
   /* the stage rides in the note so it shows in the timeline without its own row */
-  const note = `${o?.label || "Call"}${flag}${st ? ` · ${st.label}` : ""}${(notes || "").trim() ? ` — ${notes.trim()}` : ""}`;
+  const note = `${inbound ? `↩ They called back${returns ? ` (your ${returns.date} call)` : ""} · ` : ""}${o?.label || "Call"}${inbound ? "" : flag}${inbound && reached && wantsEmail ? " · asked for an email" : ""}${st ? ` · ${st.label}` : ""}${(notes || "").trim() ? ` — ${notes.trim()}` : ""}`;
+  const tpId = uid();
   const next = {
     ...c,
     /* every call is recorded, connected or not — the history and the call
-       counts want the attempts too */
-    touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), at: new Date().toISOString(), channel: PHONE_TRACK, note, outcome, connected: reached, stage: st ? stage : "", ...(leadTemp(temperature) ? { temperature } : {}), ...(reached && wantsEmail ? { wantsEmail: true } : {}) }],
+       counts want the attempts too. A call-back marks the missed call it
+       returns, so that one reads "no answer → they called back". */
+    touchpoints: [
+      ...(c.touchpoints || []).map((t) => (returns && t.id === returns.id ? { ...t, returnedAt: today(), returnedBy: tpId } : t)),
+      {
+        id: tpId,
+        date: today(),
+        at: new Date().toISOString(),
+        channel: PHONE_TRACK,
+        note,
+        outcome,
+        connected: reached,
+        stage: st ? stage : "",
+        ...(inbound ? { direction: "in", ...(returns ? { returnsId: returns.id } : {}) } : {}),
+        ...(leadTemp(temperature) ? { temperature } : {}),
+        ...(reached && wantsEmail ? { wantsEmail: true } : {}),
+      },
+    ],
   };
   if (reached) {
     /* only a call that connected is contact — an untouched record starts here */
@@ -3620,7 +3654,7 @@ function mergeCallSession(localS, remoteS, m, tombs) {
   for (const id of order) {
     if (out.includes(id)) continue;
     const r = removedAt.get(id);
-    if (r && !((addedAt[id] || "") > r)) continue;
+    if (r && !((addedAt[id] || "") >= r)) continue;
     out.push(id);
   }
   return { callSession: out, callSessionAdded: addedAt };
@@ -12084,7 +12118,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
         .filter((c) => !c.archivedAt && !c.tombstoned && (c.phone || "").trim() && c.status !== "closed")
         .map((c) => ({ contact: c, account: acc, accountId: acc.id, company: acc.company, listIds: acc.listIds || [], industry: acc.industry || "" }))
     );
-    const calls = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").length;
+    const calls = (c) => (c.touchpoints || []).filter(isOutboundCall).length;
     const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
     const session = state.callSession || [];
     return rows
@@ -12235,6 +12269,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                 {` (${r.connectedCount} connected), last ${r.lastCall}`}
               </>
             )}
+            {r.inbound > 0 && <span style={{ color: C.green }}> · ↩ called you back{r.inbound > 1 ? ` ×${r.inbound}` : ""}</span>}
             {r.due && <span style={{ color: C.red, fontWeight: 800 }}> · ⚑ DUE {r.dueDate}</span>}
             {/* knowing you last died at the opener changes how you open
                 this one — that's the whole point of tracking it */}
@@ -12894,9 +12929,25 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
 
       {runSummary && (
         <RunSummaryModal
-          run={runSummary}
+          run={(() => {
+            /* re-read when opened, so a call-back that came in after the run
+               ended shows up — but never fewer calls than were saved */
+            if (!runSummary.endedAt) return runSummary;
+            const live = summarizeCallRun(state, runSummary, runSummary.endedAt);
+            const saved = runSummary.summary;
+            return !saved || (live.counts.calls >= (saved.counts?.calls || 0) && live.calls.length >= (saved.calls || []).length) ? { ...runSummary, summary: { ...live, activeMs: saved?.activeMs ?? live.activeMs } } : runSummary;
+          })()}
           onClose={() => setRunSummary(null)}
           canAsk={!!agentControl.current}
+          onDraftEmails={
+            agentControl.current?.draftEmails
+              ? (ids) => {
+                  agentControl.current.draftEmails(ids, `✍ Draft follow-up emails for the ${ids.length} who asked for one on this run`);
+                  setRunSummary(null);
+                  setAgentOpen(true);
+                }
+              : null
+          }
           onEmailFollowUps={(ids) => {
             const n = applyAgentActions(state, ids.map((id) => ({ type: "add_followup", id, date: today(), channel: "Cold email" }))).applied;
             mutate((st) => {
@@ -17096,6 +17147,9 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    follow-up, and a status change when the outcome ends the pursuit. */
 function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES }) {
   const [outcome, setOutcome] = useState("");
+  /* "they called me back": a missed call of yours is what it usually answers */
+  const missed = missedCallToReturn(contact);
+  const [inbound, setInbound] = useState(false);
   /* starts at what you last said about them; tap the lit one to leave it */
   const [temperature, setTemperature] = useState(contact.temperature || "");
   const [wantsEmail, setWantsEmail] = useState(false);
@@ -17106,7 +17160,9 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
   /* null = go with what the outcome implies; set once you say otherwise */
   const [connectedPick, setConnectedPick] = useState(null);
   const picked = callOutcome(outcome);
-  const connected = !picked ? false : picked.fixed || connectedPick === null ? picked.connects : connectedPick;
+  const connected = !picked ? false : inbound ? true : picked.fixed || connectedPick === null ? picked.connects : connectedPick;
+  /* when they rang you, "no answer" and the like don't apply */
+  const outcomesShown = inbound ? CALL_OUTCOMES.filter((o) => o.connects) : CALL_OUTCOMES;
   const fus = Array.isArray(contact.followUps) ? contact.followUps : [];
   /* only a PHONE follow-up can be ticked by a call. Ticking the next entry
      regardless of channel meant logging a call marked an email you hadn't
@@ -17155,9 +17211,41 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
           </div>
         )}
 
+        <Label>Who called?</Label>
+        <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
+          {[
+            [false, "☎ I called them"],
+            [true, "↩ They called me back"],
+          ].map(([val, lab]) => {
+            const on = inbound === val;
+            return (
+              <button
+                key={lab}
+                data-who-called={val ? "them" : "me"}
+                onClick={() => {
+                  setInbound(val);
+                  if (val && outcome && !callOutcome(outcome)?.connects) setOutcome("");
+                  setConnectedPick(null);
+                }}
+                style={{ flex: 1, background: on ? "rgba(74,222,128,0.1)" : "transparent", border: `1px solid ${on ? C.green : C.panelEdge}`, color: on ? C.green : C.muted, borderRadius: 10, padding: "8px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+              >
+                {lab}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
+          {inbound
+            ? missed
+              ? `Answers your ${missed.date} call (${callOutcome(missed.outcome)?.label?.toLowerCase() || "no answer"}) — that one gets marked as returned. Counts as a conversation, not as one of your attempts.`
+              : "Counts as a conversation, not as one of your attempts."
+            : missed
+            ? `Did they ring you back after your ${missed.date} call? Pick "They called me back" so it's linked to it.`
+            : ""}
+        </div>
         <Label>How did it go?</Label>
         <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 12 }}>
-          {CALL_OUTCOMES.map((o) => {
+          {outcomesShown.map((o) => {
             const col = toneCol(o.tone);
             const on = outcome === o.key;
             return (
@@ -17192,7 +17280,7 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
         {/* The line between an attempt and outreach. Only a connected call
             stamps the contact date or counts anywhere as outreach, so it is
             stated here rather than inferred silently. */}
-        {picked && (
+        {picked && !inbound && (
           <button
             onClick={() => !picked.fixed && setConnectedPick(!connected)}
             disabled={picked.fixed}
@@ -17215,7 +17303,7 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
             {connected ? "☑ Connected on the phone" : "☐ Didn't connect on the phone"}
           </button>
         )}
-        {picked && (
+        {picked && !inbound && (
           <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
             {connected
               ? "Counts as outreach."
@@ -17412,7 +17500,7 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
           </Btn>
           <Btn
             disabled={!outcome}
-            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked, stage: connected ? stage : "", callbackDays, connected, temperature, wantsEmail: connected && wantsEmail })}
+            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked, stage: connected ? stage : "", callbackDays, connected, temperature, wantsEmail: connected && wantsEmail, inbound })}
             style={{ flex: 2 }}
           >
             Log call
@@ -17812,7 +17900,13 @@ function summarizeCallRun(st, session, endedAt = new Date().toISOString()) {
   const calls = [];
   const take = (rec, kind, acc) =>
     (rec.touchpoints || []).forEach((t) => {
-      if (!isCallTouch(t) || !t.at || t.at < from || t.at > endedAt) return;
+      if (!isCallTouch(t) || !t.at) return;
+      /* a call-back counts toward the run whose missed call it returns, even
+         when it comes in after the run ended */
+      const inRun = t.at >= from && t.at <= endedAt;
+      const returnsRunCall =
+        isInboundCall(t) && t.returnsId && (rec.touchpoints || []).some((x) => x.id === t.returnsId && x.at && x.at >= from && x.at <= endedAt);
+      if (!inRun && !returnsRunCall) return;
       const info = callInfo(t);
       const next = nextFollowUpOn(rec, "Phone call");
       calls.push({
@@ -17829,13 +17923,22 @@ function summarizeCallRun(st, session, endedAt = new Date().toISOString()) {
         note: (t.note || "").split(" — ").slice(1).join(" — "),
         callback: next && !next.done ? next.date : "",
         email: rec.email || "",
+        inbound: isInboundCall(t),
+        returned: !!t.returnedAt,
       });
     });
   (st.accounts || []).forEach((acc) => (acc.contacts || []).forEach((c) => take(c, "contact", acc)));
   (st.applications || []).filter((a) => !a.fromAccountContact).forEach((a) => take(a, "lead", null));
   calls.sort((a, b) => a.at.localeCompare(b.at));
+  /* a person reached later in the run (or who rang back) isn't also listed
+     as "didn't reach" — their latest call tells the story */
+  const reachedLater = (c) => {
+    const i = calls.indexOf(c);
+    return calls.some((x, j) => j > i && x.id === c.id && x.connected);
+  };
   const by = (fn) => calls.filter(fn);
   const groups = [
+    { key: "returned", icon: "↩", label: "Called you back", tone: "green", items: by((c) => c.inbound) },
     { key: "booked", icon: "📅", label: "Booked a meeting", tone: "green", items: by((c) => c.stage === "booked") },
     { key: "email", icon: "📧", label: "Asked for an email — send one", tone: "blue", items: by((c) => c.wantsEmail) },
     { key: "interest", icon: "✨", label: "Showed real interest", tone: "green", items: by((c) => c.stage === "interest") },
@@ -17844,14 +17947,17 @@ function summarizeCallRun(st, session, endedAt = new Date().toISOString()) {
     { key: "qualified", icon: "🎯", label: "Not now, but qualified (call in 60 days)", tone: "amber", items: by((c) => c.outcome === "qualified") },
     { key: "early", icon: "✋", label: "Hung up early (opener or before)", tone: "muted", items: by((c) => c.connected && (c.stage === "nostart" || c.stage === "opener")) },
     { key: "no", icon: "✖", label: "Not interested", tone: "red", items: by((c) => c.outcome === "notinterested") },
-    { key: "unreached", icon: "📵", label: "Didn't reach (no answer, voicemail, gatekeeper)", tone: "muted", items: by((c) => !c.connected && ["noanswer", "voicemail", "gatekeeper"].includes(c.outcome)) },
+    { key: "unreached", icon: "📵", label: "Didn't reach (no answer, voicemail, gatekeeper)", tone: "muted", items: by((c) => !c.connected && ["noanswer", "voicemail", "gatekeeper"].includes(c.outcome) && !reachedLater(c)) },
     { key: "dead", icon: "☠", label: "Wrong number / can't be reached", tone: "red", items: by((c) => ["wrongnumber", "cannotcontact"].includes(c.outcome)) },
   ].filter((g) => g.items.length);
-  const connected = calls.filter((c) => c.connected).length;
+  /* calls = the dials you made; connected = people you actually spoke to,
+     whoever rang whom */
+  const dials = calls.filter((c) => !c.inbound);
+  const connected = new Set(calls.filter((c) => c.connected).map((c) => c.id)).size;
   return {
     calls,
     groups,
-    counts: { calls: calls.length, people: new Set(calls.map((c) => c.id)).size, connected, booked: calls.filter((c) => c.stage === "booked").length, emails: calls.filter((c) => c.wantsEmail).length },
+    counts: { calls: dials.length, people: new Set(calls.map((c) => c.id)).size, connected, returned: calls.filter((c) => c.inbound).length, booked: calls.filter((c) => c.stage === "booked").length, emails: calls.filter((c) => c.wantsEmail).length },
     activeMs: sessionActiveMs({ ...session, endedAt }),
   };
 }
@@ -17904,7 +18010,12 @@ const peopleAt = (accs) => accs.flatMap((a) => liveContacts(a).filter((c) => c.s
    These only read; nothing here changes the CRM.
    ============================================================ */
 const READ_TOOLS = ["query", "get", "stats"];
-const READ_TOOL_DOC = `READ TOOLS — use these to look at records before answering. Reply with {"tool_calls":[ … ]} (no "reply" needed) and you'll get the results back, then answer or call more tools (max 5 rounds):
+const READ_TOOL_DOC = `READ TOOLS — use these to look at records before answering. Reply with {"progress": "…", "matches": [ids], "next": "…", "tool_calls":[ … ]} and you'll get the results back, then answer or call more tools (max 5 rounds).
+EVERY tool round must show the user something — they see it straight away, not at the end:
+- "matches": ids of the people (or leads/accounts) you have ALREADY confirmed answer their question, from the results you've seen so far. Only new ones each round; [] if none yet.
+- "progress": one short sentence — what you found so far ("7 HR contacts at +61 managed-IT firms so far").
+- "next": one short sentence — what this round's tool calls will check ("next: which of them were never called").
+Don't repeat a query you've already run, and stop calling tools as soon as you can answer.
 - {"tool":"query","criteria":{ same as find },"limit":40}   → full detail (notes, every recent touch point with its note, calls and what was said, follow-ups, email requests) for everyone matching, plus the total count
 - {"tool":"get","ids":["<contact, lead or account id>"]}   → the same full detail for specific records (an account returns its notes and each contact)
 - {"tool":"stats","criteria":{ same as find },"by":"status"|"temperature"|"lastOutcome"|"lastStage"|"company"|"industry"|"list"|"timezone"|"callWindow"|"tag"}   → counts per group`;
@@ -18032,6 +18143,8 @@ const AGENT_ACTION_DOC = `Actions (use ids exactly as they appear in the data):
 - ${CALL_CRITERIA_DOC}
   Use add_to_run_where whenever the user describes WHO they want to call by a quality (warmth, attempts, outcome, stage, touches, list…) rather than naming people. The app finds the matches itself — don't list ids for it.
 - {"type":"note","id":"<account, contact or lead id>","text":"short note"}
+- {"type":"draft_emails","ids":["<contact or lead id>"],"criteria":{ same as find — instead of ids },"purpose":"followup"|"outreach"|"reconnect"|"other","reference":"ask"|"none"|"best"|"<Copy library email title>","instructions":"anything the user said about tone, length or what to mention"}
+  Drafts one email per person from their call notes and history. Changes nothing — the user copies, edits and sends. reference: "ask" (default) lets the user choose whether to base them on an email from their Copy library; "none" if they said not to use one; "best" or a title if they said which. Use it for "draft emails for the people who asked for one", "write Ana a follow-up from my call notes".
 ${READ_TOOL_DOC}
 CALL RUN (positions as numbered on the Calls page, listed under CALL RUN in the data):
 - {"type":"remove_from_run","positions":"31-36"}  or  {"type":"remove_from_run","contactIds":["<id>"]}   (positions also as [31,32,33] or "31,33")
@@ -18572,16 +18685,20 @@ function parseAgentReply(raw) {
         const research = all.find((x) => x?.type === "start_research") || null;
         const segment = all.find((x) => x?.type === "segment_search" && String(x.segment || "").trim()) || null;
         const finds = all.filter((x) => x?.type === "find");
+        const drafts = all.find((x) => x?.type === "draft_emails") || null;
         /* read tools, whether sent as tool_calls or mixed into actions */
         const tools = [...(Array.isArray(j.tool_calls) ? j.tool_calls : []), ...all.filter((x) => READ_TOOLS.includes(x?.type))].filter((x) => READ_TOOLS.includes(x?.tool || x?.type));
-        const actions = all.filter((x) => !["start_review", "start_research", "find", "segment_search", ...READ_TOOLS].includes(x?.type));
-        return { reply: String(j.reply || "").trim() || (actions.length ? "Here's what I'd change:" : review ? "Reviewing…" : research ? "Researching…" : segment ? "Searching…" : finds.length ? "Here's what I found:" : ""), actions, review, research, finds, tools, segment };
+        const actions = all.filter((x) => !["start_review", "start_research", "find", "segment_search", "draft_emails", ...READ_TOOLS].includes(x?.type));
+        const progress = String(j.progress || "").trim();
+        const next = String(j.next || "").trim();
+        const matches = (Array.isArray(j.matches) ? j.matches : []).map(String).filter(Boolean);
+        return { reply: String(j.reply || "").trim() || (tools.length ? "" : actions.length ? "Here's what I'd change:" : review ? "Reviewing…" : research ? "Researching…" : segment ? "Searching…" : drafts ? "Drafting…" : finds.length ? "Here's what I found:" : ""), actions, review, research, finds, tools, segment, progress, next, matches, ...(drafts ? { drafts } : {}) };
       }
     } catch (e) {
       /* fall through to plain text */
     }
   }
-  return { reply: text, actions: [], review: null, research: null, finds: [], tools: [], segment: null };
+  return { reply: text, actions: [], review: null, research: null, finds: [], tools: [], segment: null, progress: "", next: "", matches: [] };
 }
 
 const AGENT_SYSTEM = `You are the CRM assistant inside Flight Deck, a job-search and outreach CRM. You help organise accounts, contacts and leads: tagging, lead temperature, account lists by industry or segment, industries, notes, and building call runs. You answer questions about the data too.
@@ -18593,9 +18710,10 @@ ${AGENT_ACTION_DOC}
 
 Rules:
 - "Find/get/show me <segment> leads" → segment_search, not find.
+- Writing emails → draft_emails. Never write an email body in your reply yourself.
 - "What does <company> do?", "research <company>", "tell me about my call run's companies" → start_research with mode "profile". Don't answer about a company from memory. It runs on its own and reports back.
 - Answer the user's actual request — never a generic reply. If the answer depends on notes, what was said on calls, touch-point details, or anyone not obvious from the CRM DATA table, use the read tools (query / get / stats) FIRST, then answer from what they return. Interpret loose wording sensibly ("prospects I sent an email to when I called them" = people who asked for an email on a call, or who were both called and emailed — query both if unsure and say which you used).
-- When you need tools, reply ONLY with {"tool_calls":[…]}. When you're done, reply with {"reply": …, "actions": [ … ]}. Quote names, dates and the user's own note wording in the reply; keep it skimmable (short lines, one person per line when listing).
+- When you need tools, reply with {"progress": …, "matches": […], "next": …, "tool_calls":[…]} — never tool_calls alone. When you're done, reply with {"reply": …, "matches": [ids of the people your answer names, so they show as a clickable list], "actions": [ … ]}. Quote names, dates and the user's own note wording in the reply; keep it skimmable (short lines, one person per line when listing).
 - Only use ids that appear in the CRM data. Never invent an id. If you can't find something, say so in reply and propose no action for it.
 - Propose actions only when the user asks for changes. For questions, answer in reply with "actions": [].
 - The user reviews and approves every action before it applies, so propose the full set in one go (create a list and add to it in the same reply).
@@ -19367,7 +19485,13 @@ function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo
       push(null, { role: "user", text: "🕐 Find time zones and opening hours for the companies in my call run" });
       await runResearch({ mode: "hours", scope: { inRun: true, onlyMissingTz: true } });
     });
-  if (controlRef) controlRef.current = { stop, researchRunHours, busy: !!busy, ask: (text) => send(text) };
+  /* the run summary can hand people straight over to be emailed */
+  const draftEmailsFor = (ids, label) =>
+    guard(async () => {
+      push(null, { role: "user", text: label || `✍ Draft emails for ${ids.length} ${ids.length === 1 ? "person" : "people"} from my call notes` });
+      await setupDrafts({ ids, purpose: "followup", reference: "ask" });
+    });
+  if (controlRef) controlRef.current = { stop, researchRunHours, busy: !!busy, ask: (text) => send(text), draftEmails: draftEmailsFor };
   useEffect(() => {
     if (open) endRef.current?.scrollIntoView({ block: "end" });
   }, [msgs.length, busy, open]);
@@ -19490,6 +19614,81 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
       }
       push(base, { role: "assistant", error: true, text: `⚠ Review of ${range} failed: ${e.message || "no reply"}`, retry: { kind: "review", review: r } });
       notify("error", `Review of ${range} failed — open the assistant to retry`);
+    }
+  };
+
+  /* who to write to, then (unless the reference is settled) ask which Copy
+     library email to model them on */
+  const setupDrafts = async (spec) => {
+    const st = stateRef.current;
+    const fromIds = (Array.isArray(spec.ids) ? spec.ids : []).map(String).filter((id) => {
+      const r = locateRecord(st, id);
+      return r && r.kind !== "account";
+    });
+    const ids = fromIds.length ? fromIds : spec.criteria ? findPeople(st, spec.criteria).map((p) => p.id) : [];
+    if (!ids.length) {
+      push(null, { role: "assistant", text: "I couldn't find anyone to write to — say who, or describe them (e.g. \"everyone who asked for an email\")." });
+      return;
+    }
+    const purpose = ["followup", "outreach", "reconnect", "other"].includes(spec.purpose) ? spec.purpose : "followup";
+    const draft = { ids: ids.slice(0, 40), purpose, instructions: String(spec.instructions || "").trim(), jobId: uid() };
+    const ref = draftRefFor(st, spec.reference, purpose);
+    if (ref.mode === "ask") {
+      push(null, { role: "assistant", kind: "draftSetup", text: `✍ ${draft.ids.length} email${draft.ids.length === 1 ? "" : "s"} to write — ${draft.ids.slice(0, 5).map((id) => recordLabel(locateRecord(st, id))).join(", ")}${draft.ids.length > 5 ? ` +${draft.ids.length - 5} more` : ""}.`, draft });
+      return;
+    }
+    await runDrafts({ ...draft, refId: ref.mode === "use" ? ref.id : null, offset: 0 });
+  };
+  const runDrafts = async (job) => {
+    const st = stateRef.current;
+    const batch = job.ids.slice(job.offset, job.offset + DRAFT_BATCH);
+    if (!batch.length) return;
+    const ref = job.refId ? (st.copyDrafts || []).find((d) => d.id === job.refId) : null;
+    const range = `${job.offset + 1}–${job.offset + batch.length} of ${job.ids.length}`;
+    try {
+      const out = await withRetry(
+        async () => {
+          const raw = await callAI({
+            ...ai,
+            signal: abortRef.current?.signal,
+            system: "You write short, specific sales emails from a salesperson's own call notes. Never invent facts, meetings or promises that aren't in the notes.",
+            user: `TODAY: ${today()}
+FROM: ${st.settings?.aiSenderName || "the user"} — ${st.settings?.aiPitch || "a designer offering design and creative services"}
+PURPOSE: ${job.purpose === "outreach" ? "first email" : job.purpose === "reconnect" ? "re-engage someone who went quiet" : job.purpose === "other" ? "as the user describes" : "follow-up after a phone call"}${job.instructions ? `\nTHE USER SAID: "${job.instructions}"` : ""}
+${
+  ref
+    ? `REFERENCE EMAIL from their Copy library ("${ref.title || "untitled"}", ${copyPurposeLabel(ref.purpose)}). Model each draft on its structure, tone, length and ask — but write it for THIS person from their notes. Fill its placeholders ([Company], [First name], [Position], [Hook], [Me]) with their real details; drop any line that doesn't fit what was said on the call.
+---
+${ref.body}
+---`
+    : "No reference email — write each one fresh from the notes."
+}
+
+For each person:
+- Open from the actual call: when it was and what was said ("thanks for picking up on Tuesday — you asked me to send…"). If they asked for an email, deliver exactly what they asked for.
+- Use their notes, touch points, temperature and anything they asked for. If there are no call notes, write from their other notes and say so in basedOn.
+- 60–140 words, plain and human. One clear next step. No "I hope this finds you well", no buzzwords.
+
+Reply with ONE JSON object:
+{"drafts": [{"id": "<id exactly as given>", "subject": "…", "body": "…", "basedOn": "the notes you used, in a few words"}]}
+
+PEOPLE (${range}):
+${batch.map((id) => prospectDetail(st, id)).join("\n\n")}`,
+          });
+          return parseDraftReply(raw, batch);
+        },
+        { onAttempt: attemptNote(`Drafting emails ${range}…`), signal: abortRef.current?.signal }
+      );
+      push(null, { role: "assistant", kind: "drafts", text: `✍ Drafts ${range}${ref ? ` — modelled on “${ref.title || "your Copy library email"}”` : " — from the call notes"}`, drafts: out.drafts, missing: out.missing, job });
+      if (job.offset + DRAFT_BATCH < job.ids.length && !stopRef.current) await runDrafts({ ...job, offset: job.offset + DRAFT_BATCH });
+      else notify("done", `${job.ids.length} email draft${job.ids.length === 1 ? "" : "s"} ready`);
+    } catch (e) {
+      if (isAbort(e)) {
+        push(null, { role: "assistant", stopped: true, text: `■ Stopped before drafts ${range}.` });
+        return;
+      }
+      push(null, { role: "assistant", error: true, text: `⚠ Drafts ${range}: ${e.message || "the request failed"}` });
+      notify("error", "CRM assistant: drafting failed — open it to retry");
     }
   };
 
@@ -19737,6 +19936,9 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
          Up to five rounds, then it must answer with what it has. */
       let scratch = "";
       let out = null;
+      /* everyone shown so far, so each round only adds new people */
+      const shownIds = new Set();
+      let interimLists = 0;
       for (let round = 0; round <= 5; round++) {
         const lastRound = round === 5;
         out = await withRetry(
@@ -19758,23 +19960,52 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
         { onAttempt: attemptNote(round ? `Reading records (round ${round + 1})…` : "Thinking…"), signal: abortRef.current?.signal }
       );
         if (!out.tools.length || lastRound) break;
+        /* every round shows something: who's confirmed so far, or what it's
+           checking next — never just silence until the end */
+        const fresh = out.matches.filter((id) => !shownIds.has(id) && locateRecord(stateRef.current, id));
+        fresh.forEach((id) => shownIds.add(id));
+        if (fresh.length) {
+          interimLists++;
+          push(null, {
+            role: "assistant",
+            kind: "found",
+            criteria: {},
+            ids: fresh,
+            text: `${round === 0 ? "Found so far" : `+${fresh.length} more`}: ${fresh.length} ${fresh.length === 1 ? "match" : "matches"}${out.progress ? ` — ${out.progress}` : ""}${out.next ? ` · Next: ${out.next.replace(/^next:\s*/i, "")}` : ""}`,
+          });
+        } else
+          push(null, {
+            role: "assistant",
+            text: `${out.progress || (round === 0 ? "Nothing confirmed yet." : "No new matches this round.")} ${out.next ? `Next: ${out.next.replace(/^next:\s*/i, "")}` : "Checking the records — results in the next round."}`.trim(),
+            interim: true,
+          });
         const results = out.tools.slice(0, 4).map((tc) => runReadTool(stateRef.current, tc));
         /* what it looked at, shown small, so you can see how it got its answer */
         push(null, { role: "assistant", kind: "tool", text: results.map((r) => r.label).join("\n") });
         scratch += `\n\nTOOL ROUND ${round + 1} — you called ${JSON.stringify(out.tools.slice(0, 4))}\nRESULTS:\n${results.map((r) => r.text).join("\n\n")}`;
       }
-      if (out.tools.length && !out.reply && !out.actions.length) out = { ...out, reply: "I looked through the records but couldn't settle on an answer — try asking more specifically." };
+      /* the final answer can name matches too */
+      const lastFresh = (out.matches || []).filter((id) => !shownIds.has(id) && locateRecord(stateRef.current, id));
+      lastFresh.forEach((id) => shownIds.add(id));
+      if (out.tools.length && !out.reply && !out.actions.length) out = { ...out, reply: shownIds.size ? `That's what I could confirm — ${shownIds.size} so far.` : "I looked through the records but couldn't settle on an answer — try asking more specifically." };
       const next = push(history, { role: "assistant", text: out.reply || "(no reply)", actions: out.actions, at: Date.now() });
+      if (lastFresh.length && !out.finds.length) {
+        interimLists++;
+        push(null, { role: "assistant", kind: "found", criteria: {}, ids: lastFresh, text: `${interimLists > 1 ? `+${lastFresh.length} more` : `${lastFresh.length} ${lastFresh.length === 1 ? "match" : "matches"}`}` });
+      }
+      /* found across several rounds → one list of all of them at the end */
+      if (interimLists > 1 && !out.finds.length) push(null, { role: "assistant", kind: "found", criteria: {}, ids: [...shownIds], text: `✓ All ${shownIds.size} together` });
       /* searches run here, against the live CRM, and show their matches */
       out.finds.forEach((fd) => {
         const found = findPeople(stateRef.current, fd.criteria);
         push(null, { role: "assistant", kind: "found", criteria: fd.criteria || {}, ids: found.map((p) => p.id), text: `${found.length} ${found.length === 1 ? "match" : "matches"} — ${findSummary(fd.criteria, stateRef.current)}` });
       });
-      if (!out.review && !out.research && !out.segment) notify("done", out.actions.length ? `CRM assistant has ${out.actions.length} ${out.actions.length === 1 ? "change" : "changes"} for you to approve` : "CRM assistant replied");
+      if (!out.review && !out.research && !out.segment && !out.drafts) notify("done", out.actions.length ? `CRM assistant has ${out.actions.length} ${out.actions.length === 1 ? "change" : "changes"} for you to approve` : "CRM assistant replied");
       /* the model asked to read the detail — run the first batch straight away */
       if (out.review) await runReview({ focus: out.review.focus || history[history.length - 1]?.text, scope: out.review.scope || {}, only: out.review.only, label: out.review.label }, next);
       if (out.segment) await runSegment(out.segment);
       if (out.research) await runResearch({ focus: out.research.focus || history[history.length - 1]?.text, mode: out.research.mode, question: out.research.question, then: out.research.then, scope: out.research.scope || {} });
+      if (out.drafts) await setupDrafts(out.drafts);
     } catch (e) {
       if (isAbort(e)) {
         push(history, { role: "assistant", stopped: true, text: "■ Stopped.", retry: { kind: "chat" } });
@@ -19908,7 +20139,28 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                     </button>
                   </div>
                 )}
-                {m.kind === "found" && <FoundList ids={m.ids} state={state} onApply={onApply} onOpen={onOpenRecord} />}
+                {m.kind === "found" && <FoundList ids={m.ids} state={state} onApply={onApply} onOpen={onOpenRecord} onDraft={(ids) => draftEmailsFor(ids, `✍ Draft emails for these ${ids.length}`)} />}
+                {m.kind === "draftSetup" && (
+                  <DraftSetupCard
+                    msg={m}
+                    lib={(state.copyDrafts || []).slice().sort(rankCopy)}
+                    done={!!m.started}
+                    onStart={(refId) =>
+                      guard(async () => {
+                        commit(msgsRef.current.map((x) => (x === m ? { ...x, started: true } : x)));
+                        await runDrafts({ ...m.draft, refId, offset: 0 });
+                      })
+                    }
+                  />
+                )}
+                {m.kind === "drafts" && (
+                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8 }}>
+                    {(m.drafts || []).map((d) => (
+                      <DraftCard key={d.id} d={d} state={state} onApply={onApply} onOpen={onOpenRecord} />
+                    ))}
+                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} didn&apos;t come back — ask again for them.</div>}
+                  </div>
+                )}
                 {/* verdicts, grouped so the ones worth chasing come first */}
                 {rv?.only && (m.verdicts?.length > 0 || m.missing?.length > 0) && (
                   <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
@@ -20180,7 +20432,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
 }
 
 /* The end-of-run report: numbers first, then who needs what next. */
-function RunSummaryModal({ run, onClose, onEmailFollowUps, onAskAssistant, canAsk }) {
+function RunSummaryModal({ run, onClose, onEmailFollowUps, onAskAssistant, canAsk, onDraftEmails }) {
   const sm = run.summary || { calls: [], groups: [], counts: {} };
   const k = sm.counts || {};
   const started = new Date(run.startedAt);
@@ -20233,9 +20485,16 @@ function RunSummaryModal({ run, onClose, onEmailFollowUps, onAskAssistant, canAs
         ))}
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
           {emailIds.length > 0 && (
-            <Btn onClick={() => onEmailFollowUps(emailIds)} style={{ padding: "8px 12px", fontSize: 12 }}>
-              📧 Add an email follow-up due today ({emailIds.length})
-            </Btn>
+            <>
+              <Btn onClick={() => onEmailFollowUps(emailIds)} style={{ padding: "8px 12px", fontSize: 12 }}>
+                📧 Add an email follow-up due today ({emailIds.length})
+              </Btn>
+              {onDraftEmails && (
+                <Btn ghost onClick={() => onDraftEmails(emailIds)} style={{ padding: "8px 12px", fontSize: 12 }}>
+                  ✍ Draft their emails
+                </Btn>
+              )}
+            </>
           )}
           {canAsk && sm.calls.length > 0 && (
             <Btn ghost onClick={onAskAssistant} style={{ padding: "8px 12px", fontSize: 12 }}>
@@ -20253,6 +20512,119 @@ function RunSummaryModal({ run, onClose, onEmailFollowUps, onAskAssistant, canAs
 
 /* A search result in the chat: who matched, plus the three things you'd
    usually do next with them — call them, export them, or tag them. */
+/* ---- email drafts from call notes ----
+   One email per person, written from what was actually said on their calls
+   (and their other notes). Optionally modelled on an email from the Copy
+   library — you choose which, or none — for structure, tone and length. */
+const DRAFT_BATCH = 4;
+const DRAFT_PURPOSE_COPY = { followup: "followup:1", outreach: "outreach", reconnect: "reconnect", other: "other" };
+function draftRefFor(st, reference, purpose) {
+  const lib = (st.copyDrafts || []).slice().sort(rankCopy);
+  const r = String(reference || "ask").trim();
+  if (r === "none") return { mode: "none" };
+  if (r === "best") {
+    const want = DRAFT_PURPOSE_COPY[purpose] || "followup:1";
+    const best = lib.find((d) => d.purpose === want) || lib.find((d) => String(d.purpose).startsWith("followup")) || lib[0];
+    return best ? { mode: "use", id: best.id } : { mode: "none" };
+  }
+  if (r && r !== "ask") {
+    const hit = lib.find((d) => d.id === r) || lib.find((d) => (d.title || "").toLowerCase() === r.toLowerCase()) || lib.find((d) => (d.title || "").toLowerCase().includes(r.toLowerCase()));
+    if (hit) return { mode: "use", id: hit.id };
+  }
+  return lib.length ? { mode: "ask" } : { mode: "none" };
+}
+function parseDraftReply(raw, ids) {
+  const t = String(raw || "");
+  const a = t.indexOf("{");
+  const b = t.lastIndexOf("}");
+  if (a === -1 || b <= a) throw new Error("The reply wasn't the JSON asked for.");
+  const j = JSON.parse(t.slice(a, b + 1));
+  const list = (Array.isArray(j.drafts) ? j.drafts : [])
+    .filter((d) => d && ids.includes(String(d.id)) && String(d.body || "").trim())
+    .map((d) => ({ id: String(d.id), subject: clip(d.subject, 140) || "Following up", body: String(d.body).trim().slice(0, 3000), basedOn: clip(d.basedOn, 220) }));
+  if (!list.length) throw new Error("No drafts came back for the people asked about.");
+  return { drafts: list, missing: ids.filter((id) => !list.some((d) => d.id === id)) };
+}
+/* choose a Copy library email to model the drafts on — or none */
+function DraftSetupCard({ msg, lib, onStart, done }) {
+  const best = useMemo(() => {
+    const want = DRAFT_PURPOSE_COPY[msg.draft.purpose] || "followup:1";
+    return lib.find((d) => d.purpose === want) || lib.find((d) => String(d.purpose).startsWith("followup")) || null;
+  }, [lib, msg.draft.purpose]);
+  const [pick, setPick] = useState(best ? best.id : "none");
+  const chosen = lib.find((d) => d.id === pick);
+  return (
+    <div data-draft-setup style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
+      <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Base them on an email from your Copy library?</div>
+      <select data-draft-ref value={pick} disabled={done} onChange={(e) => setPick(e.target.value)} style={{ ...inputStyle, fontSize: 12, padding: "6px 8px", marginBottom: 6 }}>
+        <option value="none">No — write each one from the call notes only</option>
+        {lib.map((d) => (
+          <option key={d.id} value={d.id}>
+            {d.title || "Untitled"} · {copyPurposeLabel(d.purpose)}
+            {d.grade ? ` · ${"★".repeat(d.grade)}` : ""}
+            {d.id === best?.id ? " (best match)" : ""}
+          </option>
+        ))}
+      </select>
+      {chosen && <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.45, marginBottom: 6, maxHeight: 64, overflow: "hidden" }}>“{clip(chosen.body, 220)}”</div>}
+      <Btn disabled={done} onClick={() => onStart(pick === "none" ? null : pick)} style={{ padding: "6px 12px", fontSize: 12 }}>
+        ✍ Draft {msg.draft.ids.length} email{msg.draft.ids.length === 1 ? "" : "s"}
+      </Btn>
+    </div>
+  );
+}
+/* one finished draft: edit, copy, open in your mail app, mark as sent */
+function DraftCard({ d, state, onApply, onOpen }) {
+  const r = locateRecord(state, d.id);
+  const to = r?.kind === "contact" ? r.c.email || "" : r?.app?.contactEmail || r?.app?.email || "";
+  const name = r ? (r.kind === "contact" ? r.c.name || "Unnamed" : r.app.contact || r.app.company || "Lead") : "?";
+  const company = r ? (r.kind === "contact" ? r.acc.company : r.app.company) : "";
+  const [subject, setSubject] = useState(d.subject);
+  const [body, setBody] = useState(d.body);
+  const [sent, setSent] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const mailto = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  return (
+    <div data-draft-card style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: 9, marginBottom: 7, whiteSpace: "normal" }}>
+      <div style={{ fontSize: 12, marginBottom: 3 }}>
+        <RecordLink id={d.id} onOpen={onOpen}>{name}</RecordLink>
+        <span style={{ color: C.muted }}> · {company || "?"} · {to || <span style={{ color: C.amber }}>no email on file</span>}</span>
+      </div>
+      <input value={subject} onChange={(e) => setSubject(e.target.value)} style={{ ...inputStyle, fontSize: 12, padding: "5px 8px", fontWeight: 700, marginBottom: 4 }} />
+      <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={Math.min(12, Math.max(5, body.split("\n").length + 1))} style={{ ...inputStyle, fontSize: 12, lineHeight: 1.5, padding: "6px 8px", resize: "vertical", fontFamily: sans }} />
+      {d.basedOn && <div style={{ fontSize: 10, color: C.muted, marginTop: 3 }}>From: {d.basedOn}</div>}
+      <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+        <Btn
+          ghost
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(`Subject: ${subject}\n\n${body}`);
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            } catch (e) {}
+          }}
+          style={{ padding: "4px 10px", fontSize: 11 }}
+        >
+          {copied ? "✓ Copied" : "⧉ Copy"}
+        </Btn>
+        <a href={mailto} style={{ fontSize: 11, color: C.blue, alignSelf: "center", textDecoration: "none", border: `1px solid ${C.panelEdge}`, borderRadius: 8, padding: "4px 10px" }}>
+          ✉ Open in mail
+        </a>
+        <Btn
+          ghost
+          disabled={sent || !r}
+          onClick={() => {
+            const n = onApply([{ type: "log_touchpoint", id: d.id, channel: "Cold email", note: `Emailed: ${subject}` }]);
+            if (n) setSent(true);
+          }}
+          style={{ padding: "4px 10px", fontSize: 11 }}
+        >
+          {sent ? "✓ Logged as sent" : "✓ Mark as sent"}
+        </Btn>
+      </div>
+    </div>
+  );
+}
 /* a name in the assistant that opens the person, lead or company */
 function RecordLink({ id, onOpen, children, style }) {
   if (!onOpen || !id) return <span style={{ fontWeight: 700, ...style }}>{children}</span>;
@@ -20268,7 +20640,7 @@ function RecordLink({ id, onOpen, children, style }) {
     </button>
   );
 }
-function FoundList({ ids, state, onApply, onOpen }) {
+function FoundList({ ids, state, onApply, onOpen, onDraft }) {
   const [all, setAll] = useState(false);
   const [tag, setTag] = useState("");
   const [done, setDone] = useState("");
@@ -20321,6 +20693,11 @@ function FoundList({ ids, state, onApply, onOpen }) {
         {callable.length > 0 && (
           <button onClick={() => triggerCsvDownload(callable.map((r) => callCsvRow(r.c, r.acc.company)), `call-list-${today()}.csv`, CALL_CSV_COLUMNS)} style={small}>
             ⬇ CSV ({callable.length})
+          </button>
+        )}
+        {onDraft && rows.length > 0 && (
+          <button data-draft-btn onClick={() => onDraft(rows.slice(0, 40).map((r) => (r.kind === "contact" ? r.c : r.app).id))} style={{ ...small, color: C.amber, borderColor: C.amber }}>
+            ✍ Draft emails ({Math.min(rows.length, 40)})
           </button>
         )}
         <input value={tag} onChange={(e) => setTag(e.target.value)} placeholder="tag all…" aria-label="Tag everyone found" style={{ fontFamily: mono, fontSize: 11, width: 90, padding: "4px 7px", borderRadius: 8, border: `1px dashed ${C.panelEdge}`, background: "transparent", color: C.ink, outline: "none" }} />
