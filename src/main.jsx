@@ -4037,7 +4037,7 @@ async function callMiniMax({ baseUrl, key, model, system, user, webSearch, cap, 
 }
 /* a Stop pressed mid-request: never retried, never treated as a failure */
 const isAbort = (e) => e?.name === "AbortError" || /aborted/i.test(e?.message || "");
-async function callAI({ provider, model, baseUrl, key, system, user, webSearch, maxTokens, signal }) {
+async function callAI({ provider, model, baseUrl, key, system, user, webSearch, maxTokens, signal, maxSearches = 4 }) {
   const prov = provider || "builtin";
   const mm = isMiniMaxCfg({ provider: prov, baseUrl, model });
   const cap = resolveTokens(mm ? "max" : maxTokens, mm ? "minimax" : prov);
@@ -4092,7 +4092,7 @@ async function callAI({ provider, model, baseUrl, key, system, user, webSearch, 
            response, so no client round-trip is needed. It's the only provider
            here that can actually LOOK — everything else is working from
            training data and must not be asked to "research". */
-        ...(webSearch ? { tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 4 }] } : {}),
+        ...(webSearch ? { tools: [{ type: "web_search_20250305", name: "web_search", max_uses: maxSearches }] } : {}),
       }),
     });
     const data = await res.json();
@@ -12333,9 +12333,25 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             {/* the run you've built, when you've built one — and while a run is
                 live, even after its last call has been made */}
             {(picked > 0 || runSession) && (
-              <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 12, padding: "10px 13px", marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+              /* on a phone: one title line, then one row of small buttons —
+                 the explainer text only on desktop */
+              <div
+                data-run-bar
+                style={{
+                  background: "rgba(245,185,66,0.08)",
+                  border: `1px solid ${C.amber}`,
+                  borderRadius: 12,
+                  padding: isDesktop ? "10px 13px" : "8px 10px",
+                  marginBottom: 10,
+                  display: "flex",
+                  flexDirection: isDesktop ? "row" : "column",
+                  justifyContent: "space-between",
+                  alignItems: isDesktop ? "center" : "stretch",
+                  gap: isDesktop ? 10 : 6,
+                }}
+              >
                 <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: C.amber }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.amber, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                     ▶ This run — {picked} {picked === 1 ? "call" : "calls"}
                     {picked === 0 ? " left" : ""}
                   </div>
@@ -12349,28 +12365,28 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                         </div>
                       );
                     })()
-                  ) : (
+                  ) : isDesktop ? (
                     <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.45, marginTop: 1 }}>Work down from the top. Numbers are the order you picked. Start the run to get a summary at the end.</div>
-                  )}
+                  ) : null}
                 </div>
-                <div style={{ display: "flex", gap: 6, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0, flexWrap: isDesktop ? "wrap" : "nowrap", justifyContent: isDesktop ? "flex-end" : "flex-start", overflowX: isDesktop ? "visible" : "auto" }}>
                   {!runSession && picked > 0 && (
-                    <Btn onClick={startCallRun} style={{ padding: "6px 12px", fontSize: 11 }}>
+                    <Btn onClick={startCallRun} style={{ padding: isDesktop ? "6px 12px" : "4px 10px", fontSize: 11, whiteSpace: "nowrap" }}>
                       ▶ Start
                     </Btn>
                   )}
                   {runSession?.status === "running" && (
-                    <Btn ghost onClick={pauseCallRun} style={{ padding: "6px 11px", fontSize: 11 }}>
+                    <Btn ghost onClick={pauseCallRun} style={{ padding: isDesktop ? "6px 11px" : "4px 10px", fontSize: 11, whiteSpace: "nowrap" }}>
                       ⏸ Pause
                     </Btn>
                   )}
                   {runSession?.status === "paused" && (
-                    <Btn onClick={resumeCallRun} style={{ padding: "6px 12px", fontSize: 11 }}>
+                    <Btn onClick={resumeCallRun} style={{ padding: isDesktop ? "6px 12px" : "4px 10px", fontSize: 11, whiteSpace: "nowrap" }}>
                       ▶ Resume
                     </Btn>
                   )}
                   {runSession && (
-                    <Btn ghost onClick={() => setConfirmStopRun(true)} style={{ padding: "6px 11px", fontSize: 11, color: C.red, borderColor: C.red }}>
+                    <Btn ghost onClick={() => setConfirmStopRun(true)} style={{ padding: isDesktop ? "6px 11px" : "4px 10px", fontSize: 11, color: C.red, borderColor: C.red, whiteSpace: "nowrap" }}>
                       ■ Stop
                     </Btn>
                   )}
@@ -12385,14 +12401,14 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                             agentControl.current?.researchRunHours();
                             flash(`🕐 Looking up ${unsure} ${unsure === 1 ? "company" : "companies"} — the 💬 button shows progress`);
                           }}
-                          style={{ padding: "6px 11px", fontSize: 11 }}
+                          style={{ padding: isDesktop ? "6px 11px" : "4px 10px", fontSize: 11, whiteSpace: "nowrap" }}
                           title="Find each company's HQ, time zone and opening hours on the web — only the companies in this run"
                         >
-                          🕐 Find time zones ({unsure})
+                          🕐 {isDesktop ? "Find time zones" : "Zones"} ({unsure})
                         </Btn>
                       ) : null;
                     })()}
-                  <Btn ghost onClick={clearCallSession} style={{ padding: "6px 11px", fontSize: 11, flexShrink: 0 }}>
+                  <Btn ghost onClick={clearCallSession} style={{ padding: isDesktop ? "6px 11px" : "4px 10px", fontSize: 11, flexShrink: 0, whiteSpace: "nowrap", marginLeft: isDesktop ? 0 : "auto" }}>
                     Clear
                   </Btn>
                 </div>
@@ -12997,6 +13013,15 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       {(
         <AgentPanel
           open={agentOpen}
+          onOpenRecord={(id) => {
+            /* a person opens their card; a pipeline lead or a company opens its
+               full record, above the assistant so the chat stays put */
+            const r = locateRecord(state, id);
+            if (!r) return flash("That record isn't in the CRM any more");
+            if (r.kind === "contact") setContactCard({ contact: r.c, company: r.acc.company, accountId: r.acc.id });
+            else if (r.kind === "account") setModal({ kind: "account", entry: r.acc, overPanel: true });
+            else setModal({ kind: "application", entry: r.app, overPanel: true });
+          }}
           controlRef={agentControl}
           onBusy={setAgentBusy}
           onEvent={onAgentEvent}
@@ -13190,7 +13215,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           onOpenAccount={(id) => {
             const acc = (state.accounts || []).find((a) => a.id === id);
             setContactCard(null);
-            if (acc) setModal({ kind: "account", entry: acc });
+            if (acc) setModal({ kind: "account", entry: acc, overPanel: agentOpen });
           }}
           onCall={(c, accountId) => {
             /* routed through the same modal as the queue, so logging from the
@@ -13826,8 +13851,8 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
       onTouchEnd={(e) => e.stopPropagation()}
       style={
         fullPage
-          ? { position: "fixed", inset: 0, background: C.bg, zIndex: 50, display: "flex", flexDirection: "column" }
-          : { position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }
+          ? { position: "fixed", inset: 0, background: C.bg, zIndex: modal.overPanel ? 61 : 50, display: "flex", flexDirection: "column" }
+          : { position: "fixed", inset: 0, background: "rgba(6,10,18,0.78)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: modal.overPanel ? 61 : 50, padding: 20 }
       }
     >
       {/* sits above the account modal it was opened from */}
@@ -18578,6 +18603,7 @@ Rules:
 - "temp" is lead temperature (how keen); it is separate from outreach status.
 - DO NOT CALL: before putting anyone in the call run, check their tags and their company's tags. Anyone tagged DNC (or "do not call") is never added — leave them out of add_to_run ids, and tell the user who you left out and why. The app enforces this too and will drop them, so don't try to work around it; if the user wants someone back in, they remove the DNC tag first.
 - Conditions inside one add_to_run_where must ALL match. For "X, plus Y" or "hot first, then warm", use one add_to_run_where per group, in the order the user wants them called. Someone already added isn't added twice.
+- When the user asks to find, show, look up or list people or leads — one person by name or a set by criteria — ALWAYS include a find action, so they appear as a clickable list they can open. Don't only write the names in your reply.
 - For any question or change about due/overdue follow-ups across many people, use find (dueFollowUp, overdueMinDays) or remove_followups_where. The FOLLOW-UPS DUE line at the top is the true count — quote it, don't recount from the table.
 - You can add or remove PENDING follow-ups. "fu" in the data lists each one as date + channel, with DUE when it's due today or earlier. You cannot tick a follow-up as done, or remove ticked ones.
 - A written follow-up needs the person to have been contacted already ("contacted" date or a status other than "not contacted"); a call follow-up doesn't.
@@ -18838,13 +18864,101 @@ function researchPool(st, scope = {}) {
     .map((a) => a.id);
 }
 /* ---- company briefings ("what does this company do?") ---- */
-const PROFILE_BATCH = 5;
+/* Two per call, so the search budget goes on two companies, not five. */
+const PROFILE_BATCH = 2;
+/* ---- making sure it's the right company ----
+   Most low-confidence briefings are identity problems: a common name, no
+   website on file, a look-alike company in another country. Everything the
+   CRM already knows that pins the company down goes into the prompt, and the
+   app — not the model — decides how sure the answer is, from what it can
+   check: does the website match a domain we already have, did it read their
+   own site, is there an independent source, are there real quotes. */
+const FREE_MAIL_RE = /^(gmail|googlemail|yahoo|ymail|rocketmail|hotmail|outlook|live|msn|icloud|me|mac|aol|proton|protonmail|pm|gmx|mail|zoho|yandex|bigpond|optusnet|iinet|tpg|qq|163|126)\./i;
+const hostOf = (u) => {
+  const t = String(u || "").trim();
+  if (!t) return "";
+  try {
+    return new URL(/^https?:\/\//i.test(t) ? t : "https://" + t).hostname.replace(/^www\./, "").toLowerCase();
+  } catch (e) {
+    return "";
+  }
+};
+/* acme.com.au and shop.acme.com.au → acme.com.au; acme.com → acme.com */
+const rootDomain = (h) => {
+  const p = String(h || "").toLowerCase().split(".").filter(Boolean);
+  if (p.length <= 2) return p.join(".");
+  const sld = /^(com|co|net|org|gov|edu|ac|ltd|plc|biz|asn|id)$/.test(p[p.length - 2]) && p[p.length - 1].length === 2;
+  return p.slice(sld ? -3 : -2).join(".");
+};
+function knownDomains(acc) {
+  const out = new Set();
+  const w = rootDomain(hostOf(acc?.website));
+  if (w) out.add(w);
+  liveContacts(acc).forEach((c) => {
+    const d = String(c.email || "").split("@")[1];
+    if (d && !FREE_MAIL_RE.test(d)) out.add(rootDomain(d.toLowerCase()));
+  });
+  return [...out];
+}
+function companyClues(acc) {
+  const doms = knownDomains(acc);
+  const people = liveContacts(acc)
+    .slice(0, 4)
+    .map((c) => `${c.name || "?"}${c.position ? ` (${c.position})` : ""}${c.linkedin ? ` ${c.linkedin}` : ""}`);
+  const regions = Array.from(
+    new Set(
+      liveContacts(acc)
+        .map((c) => tzFromPhone(c.phone))
+        .filter(Boolean)
+        .map((x) => tzCity(x.tz))
+    )
+  ).slice(0, 3);
+  return [
+    `website on file: ${acc.website || "none"}`,
+    `their domains (website + work emails): ${doms.join(", ") || "none known"}`,
+    acc.location ? `location on file: ${acc.location}` : "",
+    acc.timezone ? `time zone on file: ${tzCity(acc.timezone)}` : "",
+    regions.length ? `phone numbers point to: ${regions.join(", ")}` : "",
+    `industry on file: ${acc.industry || "-"}`,
+    `people we know there: ${people.join("; ") || "-"}`,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+}
 function companyBriefProfile(st, id) {
-  if (String(id).startsWith("name:")) return `### ${id} | ${id.slice(5)} | not in the CRM`;
+  if (String(id).startsWith("name:")) return `### ${id} | ${id.slice(5)} | not in the CRM — no records to match against`;
   const a = (st.accounts || []).find((x) => x.id === id);
   if (!a) return "";
-  const people = liveContacts(a).slice(0, 4).map((c) => `${c.name || "?"}${c.position ? ` (${c.position})` : ""}`);
-  return `### ${a.id} | ${a.company || "?"} | website: ${a.website || "unknown — find it"} | industry on file: ${a.industry || "-"} | people we know: ${people.join(", ") || "-"}`;
+  return `### ${a.id} | ${a.company || "?"} | ${companyClues(a)}`;
+}
+const CONF_RANK = { low: 0, medium: 1, high: 2 };
+/* the confidence shown is the LOWER of what the model claims and what the
+   app can verify */
+function scoreBriefing(r, acc) {
+  const known = acc ? knownDomains(acc) : [];
+  const site = rootDomain(hostOf(r.website));
+  const urls = [...r.sources, ...r.evidence.map((e) => e.url)].filter(Boolean);
+  const roots = urls.map((u) => rootDomain(hostOf(u))).filter(Boolean);
+  const ownDomains = new Set([site, ...known].filter(Boolean));
+  const domainMatch = !!site && known.includes(site);
+  const ownSite = roots.some((d) => ownDomains.has(d));
+  const independent = roots.some((d) => !ownDomains.has(d));
+  const quotes = r.evidence.filter((e) => e.quote && e.quote.length >= 12 && e.url).length;
+  const matchedBy = r.identity.matchedBy;
+  const identity = domainMatch || matchedBy.includes("people") || (matchedBy.includes("location") && matchedBy.length >= 2);
+  const inCrm = !!acc;
+  let app;
+  if ((identity || (!inCrm && ownSite)) && ownSite && independent && quotes >= 2) app = "high";
+  else if ((identity || matchedBy.length > 0 || !inCrm) && (ownSite || independent) && quotes >= 1) app = "medium";
+  else app = "low";
+  const confidence = CONF_RANK[app] <= CONF_RANK[r.claimed] ? app : r.claimed;
+  const checks = [
+    inCrm ? { ok: identity, text: domainMatch ? "website matches your records" : matchedBy.length ? `identified by ${matchedBy.join(" + ")}` : "not confirmed it's the same company" } : null,
+    { ok: ownSite, text: ownSite ? "read their own site" : "nothing from their own site" },
+    { ok: independent, text: independent ? "independent source" : "no independent source" },
+    { ok: quotes >= 2, text: `${quotes} quote${quotes === 1 ? "" : "s"}` },
+  ].filter(Boolean);
+  return { confidence, checks };
 }
 function parseProfileReply(raw, st, batchIds) {
   const text = String(raw || "").trim();
@@ -18877,9 +18991,18 @@ function parseProfileReply(raw, st, batchIds) {
       timezone: validTz(r.timezone) ? r.timezone : "",
       news: list(r.news, 3),
       angles: list(r.angles, 3),
-      confidence: ["high", "medium", "low"].includes(r.confidence) ? r.confidence : "low",
-      sources: (Array.isArray(r.sources) ? r.sources : []).filter((u) => /^https?:\/\//.test(String(u))).slice(0, 4),
-    }));
+      claimed: ["high", "medium", "low"].includes(r.confidence) ? r.confidence : "low",
+      sources: (Array.isArray(r.sources) ? r.sources : []).filter((u) => /^https?:\/\//.test(String(u))).slice(0, 5),
+      evidence: (Array.isArray(r.evidence) ? r.evidence : [])
+        .filter((e) => e && typeof e === "object")
+        .map((e) => ({ claim: clip(e.claim, 140), url: /^https?:\/\//.test(String(e.url || "")) ? String(e.url) : "", quote: clip(e.quote, 220) }))
+        .slice(0, 4),
+      identity: {
+        matchedBy: arr(r.identity?.matchedBy).filter((x) => ["domain", "people", "location", "phone", "email"].includes(x)),
+        note: clip(r.identity?.note, 200),
+      },
+    }))
+    .map((r) => ({ ...r, ...scoreBriefing(r, (st.accounts || []).find((x) => x.id === r.accountId)) }));
   if (!results.length) throw new Error("None of the briefings matched the companies asked about.");
   /* light hygiene: fill what's blank; the briefing itself can be saved to
      the account's notes, unticked so it's your choice */
@@ -18909,8 +19032,7 @@ function companyBriefHours(st, id) {
 function companyBrief(st, id) {
   const a = (st.accounts || []).find((x) => x.id === id);
   if (!a) return "";
-  const people = liveContacts(a).slice(0, 4).map((c) => `${c.name || "?"}${c.position ? ` (${c.position})` : ""}`);
-  return `### ${a.id} | ${a.company || "?"} | website: ${a.website || "-"} | current industry: ${a.industry || "-"} | people: ${people.join(", ") || "-"}${(a.notes || "").trim() ? ` | notes: ${clip(a.notes, 160)}` : ""}`;
+  return `### ${a.id} | ${a.company || "?"} | ${companyClues(a)}${(a.notes || "").trim() ? ` | notes: ${clip(a.notes, 160)}` : ""}`;
 }
 /* Findings → actions. Industry goes on the account; tags (or the industry
    itself when none are given) go on every live contact there, since tags
@@ -19217,7 +19339,7 @@ const askNotifyPermission = () => {
     /* unsupported (some mobile browsers) — the in-app badge still works */
   }
 };
-function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canUndo, onClose, isDesktop, onBusy, onEvent, controlRef }) {
+function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canUndo, onClose, isDesktop, onBusy, onEvent, controlRef, onOpenRecord }) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState("");
   const [picks, setPicks] = useState({});
@@ -19404,27 +19526,59 @@ ${batch.map((id) => prospectDetail(state, id)).join("\n\n")}`,
       const out = await withRetry(
         async () => {
           if (profile) {
-            const raw = await callAI({
-              ...ai,
-              signal: abortRef.current?.signal,
-              webSearch: true,
-              system: "You brief a salesperson on companies before they call. Use web search. Never describe a company from its name alone.",
-              user: `TODAY: ${today()}
-TASK: Brief me on these companies (${range}) — what does each one do?${r.focus && !/^what does/i.test(r.focus) ? ` The user asked: "${r.focus}"` : ""}
-
+            const ask = (ids, extra = "") =>
+              callAI({
+                ...ai,
+                signal: abortRef.current?.signal,
+                webSearch: true,
+                maxSearches: 6 * ids.length,
+                system: "You brief a salesperson on companies before they call. Use web search. Never describe a company from its name alone. Only state what a page you found actually says.",
+                user: `TODAY: ${today()}
+TASK: Brief me on these companies — what does each one do?${r.focus && !/^what does/i.test(r.focus) ? ` The user asked: "${r.focus}"` : ""}
+${extra}
 For each company, in this order:
-1. Search the web for the company name (add the city or country if known) — the search results, Google Business / LinkedIn listings and directories tell you what it is and where.
-2. Then go to its own website (search site:<its domain>) — the home, about and services pages — for what it actually sells and to whom.
-3. Check for anything recent (news, hiring, launches, awards) in the last 12 months.
+1. MAKE SURE IT'S THE RIGHT COMPANY. Use the clues given (their domains, work-email domains, people we know, location, phone region). Search the domain itself first if one is known. A company whose website domain matches one of their domains, or whose site/LinkedIn lists the people we know, is the right one. If several companies share the name, pick the one that fits the clues and say how you decided. If none fits, say so — don't describe a different company.
+2. Read its OWN website (search site:<its domain>) — home, about and services pages — for what it actually sells and to whom.
+3. Find at least one INDEPENDENT source (LinkedIn company page, Google Business, a directory, news) that agrees.
+4. Check for anything recent (news, hiring, launches, awards) in the last 12 months.
+
+Back every key claim with a short EXACT quote from the page or search result, and its URL.
 
 Reply with ONE JSON object and nothing else:
-{"reply": "1–2 sentences on this batch", "results": [{"accountId": "<id exactly as given>", "name": "official company name", "website": "https://…", "whatTheyDo": "2–3 plain sentences: what they do, for whom, how", "services": ["main services/products"], "customers": "who they serve", "size": "staff count / revenue band if found", "location": "HQ city, country", "industry": "short label", "timezone": "IANA zone of HQ", "news": ["recent items, with month/year"], "angles": ["1–2 specific things worth mentioning on a call"], "confidence": "high|medium|low", "sources": ["https://… search result or page used"]}]}
+{"reply": "1–2 sentences on this batch", "results": [{"accountId": "<id exactly as given>", "name": "official company name", "website": "https://… (their own site)", "identity": {"matchedBy": ["domain"|"email"|"people"|"location"|"phone"], "note": "how you know it's this company"}, "whatTheyDo": "2–3 plain sentences: what they do, for whom, how", "services": ["main services/products"], "customers": "who they serve", "size": "staff count / revenue band if found", "location": "HQ city, country", "industry": "short label", "timezone": "IANA zone of HQ", "news": ["recent items, with month/year"], "angles": ["1–2 specific things worth mentioning on a call"], "evidence": [{"claim": "what this backs", "url": "https://…", "quote": "exact words from that page"}], "confidence": "high|medium|low", "sources": ["https://… every page or result used"]}]}
 Give a result for EVERY company below, using its id exactly. Leave out anything you couldn't find rather than guessing.
 
 COMPANIES:
-${batch.map((id) => companyBriefProfile(state, id)).join("\n")}`,
-            });
-            return parseProfileReply(raw, stateRef.current, batch);
+${ids.map((id) => companyBriefProfile(state, id)).join("\n")}`,
+              });
+            const first = parseProfileReply(await ask(batch), stateRef.current, batch);
+            /* second pass: anything short of HIGH gets one focused re-check on
+               its own, told exactly what was missing. Kept only if it scores
+               at least as well. */
+            const weak = first.results.filter((x) => x.confidence !== "high");
+            for (const w of weak) {
+              if (stopRef.current || abortRef.current?.signal?.aborted) break;
+              setBusy(`Double-checking ${w.name || "a company"} — ${weak.indexOf(w) + 1} of ${weak.length}…`);
+              try {
+                const gaps = w.checks.filter((c) => !c.ok).map((c) => c.text).join("; ");
+                const again = parseProfileReply(
+                  await ask(
+                    [w.accountId],
+                    `\nTHIS IS A SECOND CHECK. A first pass found: ${w.name || "?"} — ${w.website || "no website"} — "${clip(w.whatTheyDo, 200)}". What it couldn't confirm: ${gaps || "not enough evidence"}. Fix exactly that: confirm the official domain, quote their own site, and find an independent source. If the first pass described the wrong company, correct it.\n`
+                  ),
+                  stateRef.current,
+                  [w.accountId]
+                );
+                const nw = again.results[0];
+                if (nw && CONF_RANK[nw.confidence] >= CONF_RANK[w.confidence]) {
+                  first.results = first.results.map((x) => (x.accountId === w.accountId ? { ...nw, rechecked: true } : x));
+                  first.actions = [...first.actions.filter((a) => (a.accountId || a.account || a.id) !== w.accountId), ...again.actions];
+                } else first.results = first.results.map((x) => (x.accountId === w.accountId ? { ...x, rechecked: true } : x));
+              } catch (e) {
+                if (isAbort(e)) throw e;
+              }
+            }
+            return first;
           }
           const raw = hoursOnly
             ? await callAI({
@@ -19754,7 +19908,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                     </button>
                   </div>
                 )}
-                {m.kind === "found" && <FoundList ids={m.ids} state={state} onApply={onApply} />}
+                {m.kind === "found" && <FoundList ids={m.ids} state={state} onApply={onApply} onOpen={onOpenRecord} />}
                 {/* verdicts, grouped so the ones worth chasing come first */}
                 {rv?.only && (m.verdicts?.length > 0 || m.missing?.length > 0) && (
                   <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
@@ -19765,7 +19919,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                     )}
                     {(m.verdicts || []).map((v) => (
                       <div key={v.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>
-                        <span style={{ fontWeight: 700 }}>{recordLabel(locateRecord(state, v.id))}</span>
+                        <RecordLink id={v.id} onOpen={onOpenRecord}>{recordLabel(locateRecord(state, v.id))}</RecordLink>
                         {v.why ? <span style={{ color: C.muted }}> — {v.why}</span> : null}
                         {v.next ? <div style={{ color: C.ink, fontSize: 11 }}>→ {v.next}</div> : null}
                       </div>
@@ -19786,7 +19940,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                           </div>
                           {vs.map((v) => (
                             <div key={v.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>
-                              <span style={{ fontWeight: 700 }}>{recordLabel(locateRecord(state, v.id))}</span>
+                              <RecordLink id={v.id} onOpen={onOpenRecord}>{recordLabel(locateRecord(state, v.id))}</RecordLink>
                               {v.why ? <span style={{ color: C.muted }}> — {v.why}</span> : null}
                               {v.next ? <div style={{ color: C.ink, fontSize: 11 }}>→ {v.next}</div> : null}
                             </div>
@@ -19811,7 +19965,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                       return (
                         <div key={r.accountId} style={{ borderTop: `1px solid ${C.panelEdge}`, padding: "8px 0" }}>
                           <div style={{ fontSize: 13, fontWeight: 800, color: C.ink }}>
-                            {r.name || acc?.company || String(r.accountId).replace(/^name:/, "")}
+                            <RecordLink id={acc?.id} onOpen={onOpenRecord}>{r.name || acc?.company || String(r.accountId).replace(/^name:/, "")}</RecordLink>
                             {host && (
                               <a href={r.website} target="_blank" rel="noreferrer" style={{ fontSize: 11, fontWeight: 400, color: C.blue, marginLeft: 6 }}>
                                 {host}
@@ -19820,7 +19974,35 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                             <span style={{ fontFamily: mono, fontSize: 9, marginLeft: 6, color: r.confidence === "high" ? C.green : r.confidence === "medium" ? C.amber : C.red }}>{r.confidence.toUpperCase()}</span>
                           </div>
                           <div style={{ fontSize: 11, color: C.muted }}>{[r.industry, r.location, r.size].filter(Boolean).join(" · ")}</div>
+                          {r.checks?.length > 0 && (
+                            <div style={{ fontSize: 10, marginTop: 2 }}>
+                              {r.checks.map((c, k) => (
+                                <span key={k} style={{ color: c.ok ? C.green : C.amber, marginRight: 8 }}>
+                                  {c.ok ? "✓" : "✗"} {c.text}
+                                </span>
+                              ))}
+                              {r.rechecked && <span style={{ color: C.muted }}>· double-checked</span>}
+                            </div>
+                          )}
+                          {r.identity?.note && <div style={{ fontSize: 11, color: C.muted }}>Identified: {r.identity.note}</div>}
                           {r.whatTheyDo && <div style={{ fontSize: 12, color: C.ink, lineHeight: 1.5, marginTop: 4 }}>{r.whatTheyDo}</div>}
+                          {r.evidence?.some((e) => e.quote) && (
+                            <div style={{ fontSize: 11, color: C.muted, marginTop: 3, borderLeft: `2px solid ${C.panelEdge}`, paddingLeft: 7 }}>
+                              {r.evidence
+                                .filter((e) => e.quote)
+                                .slice(0, 2)
+                                .map((e, k) => (
+                                  <div key={k}>
+                                    “{e.quote}”{" "}
+                                    {e.url && (
+                                      <a href={e.url} target="_blank" rel="noreferrer" style={{ color: C.blue }}>
+                                        {hostOf(e.url) || "source"}
+                                      </a>
+                                    )}
+                                  </div>
+                                ))}
+                            </div>
+                          )}
                           {r.services.length > 0 && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>Services: {r.services.join(" · ")}</div>}
                           {r.customers && <div style={{ fontSize: 11, color: C.muted }}>Serves: {r.customers}</div>}
                           {r.news.length > 0 && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>📰 {r.news.join(" · ")}</div>}
@@ -19868,7 +20050,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
                               {r.matches === true ? "✓" : r.matches === false ? "✗" : "?"}
                             </span>
                           ) : null}
-                          <span style={{ fontWeight: 700 }}>{acc?.company || "?"}</span>
+                          <RecordLink id={acc?.id} onOpen={onOpenRecord}>{acc?.company || "?"}</RecordLink>
                           {m.research?.mode !== "hours" && <span style={{ color: C.blue }}> · {r.industry || "not found"}</span>}
                           {r.location ? <span style={{ color: C.muted }}> · {r.location}</span> : null}
                           {r.timezone ? (
@@ -20071,7 +20253,22 @@ function RunSummaryModal({ run, onClose, onEmailFollowUps, onAskAssistant, canAs
 
 /* A search result in the chat: who matched, plus the three things you'd
    usually do next with them — call them, export them, or tag them. */
-function FoundList({ ids, state, onApply }) {
+/* a name in the assistant that opens the person, lead or company */
+function RecordLink({ id, onOpen, children, style }) {
+  if (!onOpen || !id) return <span style={{ fontWeight: 700, ...style }}>{children}</span>;
+  return (
+    <button
+      type="button"
+      data-record-link={id}
+      onClick={() => onOpen(id)}
+      title="Open their details"
+      style={{ background: "none", border: "none", padding: 0, margin: 0, font: "inherit", fontWeight: 700, color: C.ink, textDecoration: "underline", textDecorationStyle: "dotted", textDecorationColor: C.blue, textUnderlineOffset: 3, cursor: "pointer", textAlign: "left", ...style }}
+    >
+      {children}
+    </button>
+  );
+}
+function FoundList({ ids, state, onApply, onOpen }) {
   const [all, setAll] = useState(false);
   const [tag, setTag] = useState("");
   const [done, setDone] = useState("");
@@ -20087,8 +20284,13 @@ function FoundList({ ids, state, onApply }) {
         const x = r.kind === "contact" ? r.c : r.app;
         return (
           <div key={x.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 3 }}>
-            <span style={{ fontWeight: 700 }}>{r.kind === "contact" ? x.name || "Unnamed" : x.contact || x.role || "Lead"}</span>
-            <span style={{ color: C.muted }}> · {r.kind === "contact" ? r.acc.company : x.company}</span>
+            <RecordLink id={x.id} onOpen={onOpen}>
+              {r.kind === "contact" ? x.name || "Unnamed" : x.contact || x.role || "Lead"}
+            </RecordLink>
+            <span style={{ color: C.muted }}>
+              {" "}
+              · {r.kind === "contact" ? <RecordLink id={r.acc.id} onOpen={onOpen} style={{ fontWeight: 400, color: C.muted }}>{r.acc.company || "?"}</RecordLink> : x.company}
+            </span>
             {(r.kind === "contact" ? x.phone : x.contactPhone) && <span style={{ fontFamily: mono, fontSize: 11, color: C.blue }}> · {r.kind === "contact" ? x.phone : x.contactPhone}</span>}
             {x.status && <span style={{ fontSize: 10, color: C.muted }}> · {x.status}</span>}
           </div>
