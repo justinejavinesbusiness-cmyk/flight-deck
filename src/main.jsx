@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, memo, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { createClient } from "@supabase/supabase-js";
 
@@ -5506,8 +5506,10 @@ export default function FlightDeck() {
   const [digestOpen, setDigestOpen] = useState(false);
   const [patternsNarrative, setPatternsNarrative] = useState("");
   const [patternsNarrativeLoading, setPatternsNarrativeLoading] = useState(false);
-  const [toast, setToast] = useState("");
-  const [syncStatus, setSyncStatus] = useState("local");
+  const toastSig = useMemo(() => createSignal(""), []); /* see createSignal */
+  const setToast = toastSig.set;
+  const syncStatusSig = useMemo(() => createSignal("local"), []); /* see createSignal */
+  const setSyncStatus = syncStatusSig.set;
   const [crmView, setCrmView] = useState("applications"); /* toggle inside the CRM tab: applications / accounts / pool */
   const [pipeFilter, setPipeFilter] = useState("active");
   const [pipeSearch, setPipeSearch] = useState("");
@@ -9754,7 +9756,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const dueQueuedIds = new Set(dueSplit.queued.map((a) => a.id));
     const visible = pipeFilter === "due" && dueSplit.queued.length > 0 && !showQueuedDue ? dueSplit.batch : shown;
     const shownPage = visible.slice(pipePage * PAGE_SIZE, (pipePage + 1) * PAGE_SIZE);
-    /* a page draws 30 rows first and the rest as you scroll — each row is a
+    /* a page draws 20 rows first and the rest as you scroll — each row is a
        full set of editable cells, and 100 at once took ~1s on a phone */
     const pipeShowKey = `${pipePage}|${pipeFilter}|${pipeSearch}|${pipeSourceFilter}|${pipeStatusFilter}|${showQueuedDue}`;
     const pipeShowN = pipeShow.key === pipeShowKey ? pipeShow.n : ROWS_STEP;
@@ -13391,7 +13393,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const callListObj = (state.accountLists || []).find((l) => l.id === callList) || null;
     const rest = unpicked.filter((r) => matches(r) && (!activeFilter || activeFilter.test(r)) && (!attemptsTest || attemptsTest(r.calls)) && (!callListObj || r.listIds.includes(callListObj.id)));
     const filterCounts = callFilterCounts();
-    /* the remainder draws 50 rows at a time, more as you scroll — the whole
+    /* the remainder draws 30 rows at a time, more as you scroll — the whole
        queue at once was ~14,000 elements and froze phones for seconds */
     const showKey = `${callSearch}|${callFilter}|${callAttempts}|${callList}`;
     const showN = callShow.key === showKey ? callShow.n : LIST_STEP;
@@ -14156,9 +14158,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
 
         {/* footer */}
         <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center", marginTop: 16, paddingBottom: isDesktop ? 0 : MODES[mode] === "PIPELINE" ? 142 : 74 }}>
-          <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.15em", color: syncStatus === "synced" ? C.green : syncStatus === "saving" ? C.amber : C.muted }}>
-            {syncStatus === "synced" ? "● SYNCED" : syncStatus === "saving" ? "◌ SAVING" : "○ LOCAL ONLY"}
-          </div>
+          <SyncBadge sig={syncStatusSig} />
         </div>
       </div>
 
@@ -14399,11 +14399,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
         </div>
       )}
       {massGuard && <MassDeleteDialog guard={massGuard} onKeep={() => resolveMassGuard("keep")} onSave={() => resolveMassGuard("save")} />}
-      {toast && (
-        <div style={{ position: "fixed", bottom: `calc(env(safe-area-inset-bottom, 0px) + ${isDesktop ? 24 : MODES[mode] === "PIPELINE" ? 132 : 84}px)`, left: "50%", transform: "translateX(-50%)", background: C.panelEdge, color: C.ink, fontSize: 13, fontWeight: 600, padding: "8px 18px", borderRadius: 20, zIndex: 60 }}>
-          {toast}
-        </div>
-      )}
+      <ToastView sig={toastSig} bottom={`calc(env(safe-area-inset-bottom, 0px) + ${isDesktop ? 24 : MODES[mode] === "PIPELINE" ? 132 : 84}px)`} />
 
       {modal && modal.kind !== "parseJobPost" && (
         <Modal
@@ -19590,7 +19586,35 @@ ACCOUNTS & CONTACTS:
 - {"type":"add_followup","id":"<contact or lead id>","date":"YYYY-MM-DD"}  or  {"type":"add_followup","id":"...","inDays":7}   optional "channel": "Cold email" (default) | "LinkedIn" | "Phone call" | "Text/SMS" | "Facebook" | "Instagram"`;
 
 /* every record the assistant may point at, by id */
+/* Finding a record by id used to scan the whole CRM every time; the
+   assistant's lists do hundreds of lookups per redraw. After a couple of
+   lookups against the same version of the CRM, an id index is built and kept
+   for that version (the same first-match order as the scan, so the answers
+   are identical). One-off lookups while actions are applied step by step
+   still just scan. */
+const LOCATE_INDEX = new WeakMap();
+const NO_RECORDS = [];
 function locateRecord(st, id) {
+  if (!id || !st) return locateRecordScan(st || {}, id);
+  const accs = st.accounts || NO_RECORDS;
+  const apps = st.applications || NO_RECORDS;
+  let e = LOCATE_INDEX.get(accs);
+  if (!e || e.apps !== apps) {
+    e = { apps, hits: 0, map: null };
+    LOCATE_INDEX.set(accs, e);
+  }
+  if (!e.map && ++e.hits > 2) {
+    const map = new Map();
+    for (const acc of accs) {
+      if (acc?.id != null && !map.has(acc.id)) map.set(acc.id, { kind: "account", acc });
+      for (const c of acc?.contacts || []) if (c?.id != null && !map.has(c.id)) map.set(c.id, { kind: "contact", acc, c });
+    }
+    for (const a of apps) if (a?.id != null && !map.has(a.id)) map.set(a.id, { kind: "lead", app: a });
+    e.map = map;
+  }
+  return e.map ? e.map.get(id) || null : locateRecordScan(st, id);
+}
+function locateRecordScan(st, id) {
   if (!id) return null;
   for (const acc of st.accounts || []) {
     if (acc.id === id) return { kind: "account", acc };
@@ -19865,6 +19889,19 @@ function reviewAgentActions(st, actions) {
     if (d.ok) sim = runAgentActions(sim, [{ action: a, ok: true }]).st;
     return { action: a, ...d };
   });
+}
+
+/* the chat shows every pending suggestion checked against the CRM; that check
+   simulates each change, so it's kept per suggestion and redone only when the
+   CRM itself changes — not on every keystroke or click */
+const REVIEW_CACHE = new WeakMap();
+function reviewAgentActionsCached(st, actions) {
+  if (!actions || typeof actions !== "object") return reviewAgentActions(st, actions);
+  const hit = REVIEW_CACHE.get(actions);
+  if (hit && hit.st === st) return hit.out;
+  const out = reviewAgentActions(st, actions);
+  REVIEW_CACHE.set(actions, { st, out });
+  return out;
 }
 
 const stampNote = (old, text) => `${(old || "").trim() ? `${old.trim()}\n` : ""}${today()}: ${String(text).trim()}`;
@@ -20862,11 +20899,378 @@ const askNotifyPermission = () => {
     /* unsupported (some mobile browsers) — the in-app badge still works */
   }
 };
-function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canUndo, onClose, isDesktop, onBusy, onEvent, controlRef, onOpenRecord }) {
+/* The conversation. Drawn only when something it shows changes, so clicks
+   elsewhere in the app no longer redraw every message while the panel is
+   open. Handlers arrive through `h` — one object the panel refreshes on every
+   render — and are looked up at click time, so a click always runs the
+   current version. */
+const AGENT_SMALL_BTN = { background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 8, fontSize: 11, padding: "4px 9px", cursor: "pointer" };
+const AGENT_RECENT = 12; /* messages drawn when the panel opens; earlier ones on request */
+const AgentMessageList = memo(function AgentMessageList({ msgs, state, picks, busy, lastReviewIdx, canUndo, h, start = 0 }) {
+  const smallBtn = AGENT_SMALL_BTN;
+  const fn = (k) => (...args) => h[k](...args);
+  const retry = fn("retry");
+  const onApply = fn("onApply");
+  const onOpenRecord = fn("onOpenRecord");
+  const draftEmailsFor = fn("draftEmailsFor");
+  const guard = fn("guard");
+  const commit = fn("commit");
+  const runDrafts = fn("runDrafts");
+  const reviewNext = fn("reviewNext");
+  const reviewAgain = fn("reviewAgain");
+  const researchNext = fn("researchNext");
+  const onUndo = fn("onUndo");
+  const setPicks = fn("setPicks");
+  const msgsRef = h.msgsRef;
+  return (
+    <>
+      {start > 0 && (
+        <button onClick={() => h.showOlder()} style={{ ...smallBtn, display: "block", margin: "0 auto 10px" }}>
+          Show {Math.min(AGENT_RECENT, start)} earlier message{Math.min(AGENT_RECENT, start) === 1 ? "" : "s"}
+        </button>
+      )}
+    {msgs.map((m, i) => {
+      if (i < start) return null; /* indexes stay those of the full list */
+      const mine = m.role === "user";
+      /* once applied, show the list as it was approved — re-checking it
+         against the changed CRM would mark every line as already done */
+      const review = m.appliedReview ? m.appliedReview.map((r) => ({ ...r, action: {} })) : !mine && m.actions?.length ? reviewAgentActionsCached(state, m.actions) : [];
+      const sel = m.appliedReview ? m.appliedReview.map((r) => r.on) : picks[i] || review.map((r) => r.ok && !r.action._unchecked);
+      const chosen = review.filter((r, k) => r.ok && sel[k]).map((r) => r.action);
+      const rv = m.review;
+      const remaining = rv ? rv.poolIds.length - (rv.offset + (rv.size || REVIEW_BATCH)) : 0;
+      const quietBatch = rv?.only && !m.verdicts?.length && !m.missing?.length && !m.actions?.length && i !== lastReviewIdx;
+      return (
+        m.kind === "tool" || quietBatch ? (
+          <div key={i} style={{ fontSize: 11, color: C.muted, margin: "-4px 0 8px 4px", whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+            {m.text}
+          </div>
+        ) : (
+        <div key={i} style={{ display: "flex", justifyContent: mine ? "flex-end" : "flex-start", marginBottom: 10 }}>
+          <div
+            style={{
+              maxWidth: m.kind === "review" ? "100%" : "88%",
+              background: mine ? "rgba(125,176,247,0.12)" : C.panel,
+              border: `1px solid ${mine ? C.blue : m.error ? C.red : C.panelEdge}`,
+              borderRadius: 12,
+              padding: "9px 11px",
+              fontSize: 13,
+              color: m.error ? C.red : C.ink,
+              lineHeight: 1.5,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+            }}
+          >
+            {rv && (
+              <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted, marginBottom: 4 }}>
+                REVIEWED {rv.offset + 1}–{rv.offset + (rv.size || 0)} OF {rv.poolIds.length}
+              </div>
+            )}
+            {m.text}
+            {(m.error || m.stopped) && m.retry && i === msgs.length - 1 && (
+              <div style={{ marginTop: 6 }}>
+                <button onClick={() => retry(i)} disabled={!!busy} style={{ ...smallBtn, color: C.amber, borderColor: C.amber }}>
+                  {m.stopped ? "▶ Resume from here" : "↻ Retry"}
+                </button>
+              </div>
+            )}
+            {m.kind === "found" && <FoundList ids={m.ids} state={state} onApply={onApply} onOpen={onOpenRecord} onDraft={(ids) => draftEmailsFor(ids, `✍ Draft emails for these ${ids.length}`)} />}
+            {m.kind === "draftSetup" && (
+              <DraftSetupCard
+                msg={m}
+                lib={(state.copyDrafts || []).slice().sort(rankCopy)}
+                done={!!m.started}
+                onStart={(refId) =>
+                  guard(async () => {
+                    commit(msgsRef.current.map((x) => (x === m ? { ...x, started: true } : x)));
+                    await runDrafts({ ...m.draft, refId, offset: 0 });
+                  })
+                }
+              />
+            )}
+            {m.kind === "drafts" && (
+              <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8 }}>
+                {(m.drafts || []).map((d) => (
+                  <DraftCard key={d.id} d={d} state={state} onApply={onApply} onOpen={onOpenRecord} />
+                ))}
+                {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} didn&apos;t come back — ask again for them.</div>}
+              </div>
+            )}
+            {/* verdicts, grouped so the ones worth chasing come first */}
+            {rv?.only && (m.verdicts?.length > 0 || m.missing?.length > 0) && (
+              <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
+                {m.verdicts?.length > 0 && (
+                  <div style={{ fontSize: 11, fontWeight: 800, color: C.green, marginBottom: 3 }}>
+                    🎯 {rv.label} ({m.verdicts.length})
+                  </div>
+                )}
+                {(m.verdicts || []).map((v) => (
+                  <div key={v.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>
+                    <RecordLink id={v.id} onOpen={onOpenRecord}>{recordLabel(locateRecord(state, v.id))}</RecordLink>
+                    {v.why ? <span style={{ color: C.muted }}> — {v.why}</span> : null}
+                    {v.next ? <div style={{ color: C.ink, fontSize: 11 }}>→ {v.next}</div> : null}
+                  </div>
+                ))}
+                {m.skipped > 0 && <div style={{ fontSize: 11, color: C.muted }}>{m.skipped} others in this batch didn&apos;t fit — left out.</div>}
+                {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} in this batch came back unread — “Review again” to retry it.</div>}
+              </div>
+            )}
+            {!rv?.only && m.verdicts?.length > 0 && (
+              <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
+                {REVIEW_VERDICTS.map((g) => {
+                  const vs = m.verdicts.filter((v) => v.verdict === g.key);
+                  if (!vs.length) return null;
+                  return (
+                    <div key={g.key} style={{ marginBottom: 8 }}>
+                      <div style={{ fontSize: 11, fontWeight: 800, color: TONE_COL[g.tone], marginBottom: 3 }}>
+                        {g.icon} {g.label} ({vs.length})
+                      </div>
+                      {vs.map((v) => (
+                        <div key={v.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>
+                          <RecordLink id={v.id} onOpen={onOpenRecord}>{recordLabel(locateRecord(state, v.id))}</RecordLink>
+                          {v.why ? <span style={{ color: C.muted }}> — {v.why}</span> : null}
+                          {v.next ? <div style={{ color: C.ink, fontSize: 11 }}>→ {v.next}</div> : null}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+                {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} in this batch got no verdict — “Review again” to retry it.</div>}
+              </div>
+            )}
+            {m.research?.mode === "profile" && m.results?.length > 0 && (
+              <div style={{ marginTop: 8, whiteSpace: "normal" }}>
+                {m.results.map((r) => {
+                  const acc = (state.accounts || []).find((x) => x.id === r.accountId);
+                  const host = (() => {
+                    try {
+                      return r.website ? new URL(r.website).hostname.replace(/^www\./, "") : "";
+                    } catch (e) {
+                      return "";
+                    }
+                  })();
+                  return (
+                    <div key={r.accountId} style={{ borderTop: `1px solid ${C.panelEdge}`, padding: "8px 0" }}>
+                      <div style={{ fontSize: 13, fontWeight: 800, color: C.ink }}>
+                        <RecordLink id={acc?.id} onOpen={onOpenRecord}>{r.name || acc?.company || String(r.accountId).replace(/^name:/, "")}</RecordLink>
+                        {host && (
+                          <a href={r.website} target="_blank" rel="noreferrer" style={{ fontSize: 11, fontWeight: 400, color: C.blue, marginLeft: 6 }}>
+                            {host}
+                          </a>
+                        )}
+                        <span style={{ fontFamily: mono, fontSize: 9, marginLeft: 6, color: r.confidence === "high" ? C.green : r.confidence === "medium" ? C.amber : C.red }}>{r.confidence.toUpperCase()}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: C.muted }}>{[r.industry, r.location, r.size].filter(Boolean).join(" · ")}</div>
+                      {r.checks?.length > 0 && (
+                        <div style={{ fontSize: 10, marginTop: 2 }}>
+                          {r.checks.map((c, k) => (
+                            <span key={k} style={{ color: c.ok ? C.green : C.amber, marginRight: 8 }}>
+                              {c.ok ? "✓" : "✗"} {c.text}
+                            </span>
+                          ))}
+                          {r.rechecked && <span style={{ color: C.muted }}>· double-checked</span>}
+                        </div>
+                      )}
+                      {r.identity?.note && <div style={{ fontSize: 11, color: C.muted }}>Identified: {r.identity.note}</div>}
+                      {r.whatTheyDo && <div style={{ fontSize: 12, color: C.ink, lineHeight: 1.5, marginTop: 4 }}>{r.whatTheyDo}</div>}
+                      {r.evidence?.some((e) => e.quote) && (
+                        <div style={{ fontSize: 11, color: C.muted, marginTop: 3, borderLeft: `2px solid ${C.panelEdge}`, paddingLeft: 7 }}>
+                          {r.evidence
+                            .filter((e) => e.quote)
+                            .slice(0, 2)
+                            .map((e, k) => (
+                              <div key={k}>
+                                “{e.quote}”{" "}
+                                {e.url && (
+                                  <a href={e.url} target="_blank" rel="noreferrer" style={{ color: C.blue }}>
+                                    {hostOf(e.url) || "source"}
+                                  </a>
+                                )}
+                              </div>
+                            ))}
+                        </div>
+                      )}
+                      {r.services.length > 0 && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>Services: {r.services.join(" · ")}</div>}
+                      {r.customers && <div style={{ fontSize: 11, color: C.muted }}>Serves: {r.customers}</div>}
+                      {r.news.length > 0 && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>📰 {r.news.join(" · ")}</div>}
+                      {r.angles.length > 0 && (
+                        <div style={{ fontSize: 11, color: C.green, marginTop: 3 }}>
+                          ☎ Worth mentioning: {r.angles.join(" · ")}
+                        </div>
+                      )}
+                      {r.sources.length > 0 && (
+                        <div style={{ fontSize: 10, marginTop: 3 }}>
+                          {r.sources.map((u, k) => (
+                            <a key={k} href={u} target="_blank" rel="noreferrer" style={{ color: C.blue, marginRight: 8 }}>
+                              {(() => {
+                                try {
+                                  return new URL(u).hostname.replace(/^www\./, "");
+                                } catch (e) {
+                                  return "source";
+                                }
+                              })()}
+                            </a>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} came back without a briefing.</div>}
+              </div>
+            )}
+            {m.research?.mode !== "profile" && m.results?.length > 0 && (
+              <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
+                {m.research?.question && (
+                  <div style={{ fontSize: 11, color: C.muted, marginBottom: 6 }}>
+                    Checked: “{m.research.question}” — {m.results.filter((r) => r.matches === true).length} match, {m.results.filter((r) => r.matches === false).length} don&apos;t,{" "}
+                    {m.results.filter((r) => r.matches === null).length} unclear
+                  </div>
+                )}
+                {m.results.map((r) => {
+                  const acc = (state.accounts || []).find((x) => x.id === r.accountId);
+                  const col = r.confidence === "high" ? C.green : r.confidence === "medium" ? C.amber : C.red;
+                  return (
+                    <div key={r.accountId} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 7 }}>
+                      {r.matches !== undefined && m.research?.question ? (
+                        <span style={{ fontWeight: 800, color: r.matches === true ? C.green : r.matches === false ? C.red : C.amber, marginRight: 4 }}>
+                          {r.matches === true ? "✓" : r.matches === false ? "✗" : "?"}
+                        </span>
+                      ) : null}
+                      <RecordLink id={acc?.id} onOpen={onOpenRecord}>{acc?.company || "?"}</RecordLink>
+                      {m.research?.mode !== "hours" && <span style={{ color: C.blue }}> · {r.industry || "not found"}</span>}
+                      {r.location ? <span style={{ color: C.muted }}> · {r.location}</span> : null}
+                      {r.timezone ? (
+                        <span style={{ color: C.muted }}>
+                          {" "}
+                          · 🕐 {tzCity(r.timezone)}
+                          {r.openHour != null && r.closeHour != null ? ` ${r.openHour}:00–${r.closeHour}:00` : ""}
+                        </span>
+                      ) : null}
+                      <span style={{ fontFamily: mono, fontSize: 9, color: col, marginLeft: 6 }}>{r.confidence.toUpperCase()}</span>
+                      {r.tags.length > 0 && <span style={{ color: C.muted }}> {r.tags.map((t) => `#${t}`).join(" ")}</span>}
+                      {(r.why || r.summary) && <div style={{ color: C.muted, fontSize: 11 }}>{(m.research?.question || m.research?.mode === "hours") && r.why ? r.why : r.summary}</div>}
+                      {r.sources.length > 0 && (
+                        <div style={{ fontSize: 10 }}>
+                          {r.sources.map((u, k) => (
+                            <a key={k} href={u} target="_blank" rel="noreferrer" style={{ color: C.blue, marginRight: 8 }}>
+                              {(() => {
+                                try {
+                                  return new URL(u).hostname.replace(/^www\./, "");
+                                } catch (e) {
+                                  return "source";
+                                }
+                              })()}
+                            </a>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} {m.missing.length === 1 ? "company" : "companies"} came back without a result.</div>}
+                {m.actions?.some((x) => x._unchecked) && <div style={{ fontSize: 11, color: C.muted }}>Low-confidence findings are listed unticked below.</div>}
+              </div>
+            )}
+            {!busy && m.research && i === msgs.map((x) => x.kind === "research").lastIndexOf(true) && m.research.poolIds.length - (m.research.offset + (m.research.size || m.research.batchSize || RESEARCH_BATCH)) > 0 && (
+              <div style={{ marginTop: 6 }}>
+                <Btn onClick={() => researchNext(m)} disabled={!!busy} style={{ padding: "6px 11px", fontSize: 11 }}>
+                  Research next {Math.min(m.research.batchSize || RESEARCH_BATCH, m.research.poolIds.length - (m.research.offset + m.research.size))} ({m.research.poolIds.length - (m.research.offset + m.research.size)} left)
+                </Btn>
+              </div>
+            )}
+            {!busy && rv && i === lastReviewIdx && (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+                {remaining > 0 && (
+                  <Btn onClick={() => reviewNext(m)} disabled={!!busy} style={{ padding: "6px 11px", fontSize: 11 }}>
+                    Review next {Math.min(REVIEW_BATCH, remaining)} ({remaining} left)
+                  </Btn>
+                )}
+                <button onClick={() => reviewAgain(m)} disabled={!!busy} style={smallBtn}>
+                  ↻ Review again
+                </button>
+              </div>
+            )}
+            {review.length > 0 && (
+              <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8 }}>
+                {review.map((r, k) => (
+                  <label key={k} style={{ display: "flex", gap: 7, alignItems: "flex-start", fontSize: 12, color: r.ok ? C.ink : C.muted, marginBottom: 5, cursor: r.ok && !m.applied ? "pointer" : "default", whiteSpace: "normal" }}>
+                    <input
+                      type="checkbox"
+                      disabled={!r.ok || !!m.applied}
+                      checked={!!((r.ok || m.appliedReview) && sel[k])}
+                      onChange={() => setPicks({ ...picks, [i]: sel.map((v, x) => (x === k ? !v : v)) })}
+                      style={{ marginTop: 2 }}
+                    />
+                    <span style={{ textDecoration: r.ok ? "none" : "line-through" }}>{r.text}</span>
+                  </label>
+                ))}
+                {m.applied ? (
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
+                    <span style={{ fontSize: 11, color: C.green, fontWeight: 700 }}>✓ Applied {m.applied}</span>
+                    {canUndo && i === msgs.length - 1 && (
+                      <button onClick={onUndo} style={smallBtn}>
+                        ↩ Undo
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <Btn
+                    disabled={!chosen.length}
+                    onClick={() => {
+                      const n = onApply(chosen);
+                      const frozen = review.map((r, k) => ({ text: r.text, ok: r.ok, on: !!(r.ok && sel[k]) }));
+                      commit(msgsRef.current.map((x, xi) => (xi === i ? { ...x, applied: n, appliedReview: frozen } : x)));
+                    }}
+                    style={{ padding: "7px 12px", fontSize: 12, marginTop: 4 }}
+                  >
+                    Apply {chosen.length} {chosen.length === 1 ? "change" : "changes"}
+                  </Btn>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+        )
+      );
+    })}
+    </>
+  );
+});
+/* The message box keeps what you're typing to itself, so a keystroke redraws
+   just the box — not the whole conversation above it. */
+function AgentComposer({ busy, onSend }) {
   const [draft, setDraft] = useState("");
+  const go = () => {
+    if (onSend(draft)) setDraft("");
+  };
+  return (
+    <div style={{ display: "flex", gap: 8, padding: "10px 12px calc(env(safe-area-inset-bottom, 0px) + 10px)", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0 }}>
+      <textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            go();
+          }
+        }}
+        rows={2}
+        placeholder="e.g. Review my hot leads' notes — who should I call this week?"
+        style={{ ...inputStyle, flex: 1, resize: "none", fontSize: 14 }}
+      />
+      <Btn disabled={!!busy || !draft.trim()} onClick={go} style={{ padding: "0 16px" }}>
+        Send
+      </Btn>
+    </div>
+  );
+}
+function AgentPanel({ open, state, msgs, setMsgs, ai, canSearch, onApply, onUndo, canUndo, onClose, isDesktop, onBusy, onEvent, controlRef, onOpenRecord }) {
   const [busy, setBusy] = useState("");
   const [picks, setPicks] = useState({});
   const endRef = useRef(null);
+  const handlersRef = useRef({}); /* see AgentMessageList */
+  const [olderShown, setOlderShown] = useState(0);
   /* latest messages, for async steps that finish after a re-render */
   const msgsRef = useRef(msgs);
   msgsRef.current = msgs;
@@ -21433,11 +21837,12 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
       setBusy("");
     }
   };
+  /* true when it went — the message box only clears then */
   const send = (textIn) => {
-    const text = String(textIn ?? draft).trim();
-    if (!text || busy) return;
-    setDraft("");
+    const text = String(textIn ?? "").trim();
+    if (!text || busy) return false;
     guard(() => runChat(push(msgsRef.current, { role: "user", text })));
+    return true;
   };
   /* drop the failed message and send the same request again */
   const retry = (i) => {
@@ -21454,6 +21859,8 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
   });
   const startReview = () => guard(() => runReview({ focus: "Which of these are worth following up, and what should I do next with each?", scope: {} }, push(msgsRef.current, { role: "user", text: "🔍 Review my prospects — who's worth following up?" })));
 
+  const showOlder = () => setOlderShown((n) => n + AGENT_RECENT);
+  const h = Object.assign(handlersRef.current, { retry, onApply, onOpenRecord, draftEmailsFor, guard, commit, runDrafts, reviewNext, reviewAgain, researchNext, onUndo, setPicks, msgsRef, showOlder });
   /* Closing only hides the panel: it stays mounted, so a review or research
      run keeps going in the background and reports back when it's done. */
   if (!open) return null;
@@ -21500,310 +21907,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
             ))}
           </div>
         )}
-        {msgs.map((m, i) => {
-          const mine = m.role === "user";
-          /* once applied, show the list as it was approved — re-checking it
-             against the changed CRM would mark every line as already done */
-          const review = m.appliedReview ? m.appliedReview.map((r) => ({ ...r, action: {} })) : !mine && m.actions?.length ? reviewAgentActions(state, m.actions) : [];
-          const sel = m.appliedReview ? m.appliedReview.map((r) => r.on) : picks[i] || review.map((r) => r.ok && !r.action._unchecked);
-          const chosen = review.filter((r, k) => r.ok && sel[k]).map((r) => r.action);
-          const rv = m.review;
-          const remaining = rv ? rv.poolIds.length - (rv.offset + (rv.size || REVIEW_BATCH)) : 0;
-          const quietBatch = rv?.only && !m.verdicts?.length && !m.missing?.length && !m.actions?.length && i !== lastReviewIdx;
-          return (
-            m.kind === "tool" || quietBatch ? (
-              <div key={i} style={{ fontSize: 11, color: C.muted, margin: "-4px 0 8px 4px", whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
-                {m.text}
-              </div>
-            ) : (
-            <div key={i} style={{ display: "flex", justifyContent: mine ? "flex-end" : "flex-start", marginBottom: 10 }}>
-              <div
-                style={{
-                  maxWidth: m.kind === "review" ? "100%" : "88%",
-                  background: mine ? "rgba(125,176,247,0.12)" : C.panel,
-                  border: `1px solid ${mine ? C.blue : m.error ? C.red : C.panelEdge}`,
-                  borderRadius: 12,
-                  padding: "9px 11px",
-                  fontSize: 13,
-                  color: m.error ? C.red : C.ink,
-                  lineHeight: 1.5,
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                }}
-              >
-                {rv && (
-                  <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted, marginBottom: 4 }}>
-                    REVIEWED {rv.offset + 1}–{rv.offset + (rv.size || 0)} OF {rv.poolIds.length}
-                  </div>
-                )}
-                {m.text}
-                {(m.error || m.stopped) && m.retry && i === msgs.length - 1 && (
-                  <div style={{ marginTop: 6 }}>
-                    <button onClick={() => retry(i)} disabled={!!busy} style={{ ...smallBtn, color: C.amber, borderColor: C.amber }}>
-                      {m.stopped ? "▶ Resume from here" : "↻ Retry"}
-                    </button>
-                  </div>
-                )}
-                {m.kind === "found" && <FoundList ids={m.ids} state={state} onApply={onApply} onOpen={onOpenRecord} onDraft={(ids) => draftEmailsFor(ids, `✍ Draft emails for these ${ids.length}`)} />}
-                {m.kind === "draftSetup" && (
-                  <DraftSetupCard
-                    msg={m}
-                    lib={(state.copyDrafts || []).slice().sort(rankCopy)}
-                    done={!!m.started}
-                    onStart={(refId) =>
-                      guard(async () => {
-                        commit(msgsRef.current.map((x) => (x === m ? { ...x, started: true } : x)));
-                        await runDrafts({ ...m.draft, refId, offset: 0 });
-                      })
-                    }
-                  />
-                )}
-                {m.kind === "drafts" && (
-                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8 }}>
-                    {(m.drafts || []).map((d) => (
-                      <DraftCard key={d.id} d={d} state={state} onApply={onApply} onOpen={onOpenRecord} />
-                    ))}
-                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} didn&apos;t come back — ask again for them.</div>}
-                  </div>
-                )}
-                {/* verdicts, grouped so the ones worth chasing come first */}
-                {rv?.only && (m.verdicts?.length > 0 || m.missing?.length > 0) && (
-                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
-                    {m.verdicts?.length > 0 && (
-                      <div style={{ fontSize: 11, fontWeight: 800, color: C.green, marginBottom: 3 }}>
-                        🎯 {rv.label} ({m.verdicts.length})
-                      </div>
-                    )}
-                    {(m.verdicts || []).map((v) => (
-                      <div key={v.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>
-                        <RecordLink id={v.id} onOpen={onOpenRecord}>{recordLabel(locateRecord(state, v.id))}</RecordLink>
-                        {v.why ? <span style={{ color: C.muted }}> — {v.why}</span> : null}
-                        {v.next ? <div style={{ color: C.ink, fontSize: 11 }}>→ {v.next}</div> : null}
-                      </div>
-                    ))}
-                    {m.skipped > 0 && <div style={{ fontSize: 11, color: C.muted }}>{m.skipped} others in this batch didn&apos;t fit — left out.</div>}
-                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} in this batch came back unread — “Review again” to retry it.</div>}
-                  </div>
-                )}
-                {!rv?.only && m.verdicts?.length > 0 && (
-                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
-                    {REVIEW_VERDICTS.map((g) => {
-                      const vs = m.verdicts.filter((v) => v.verdict === g.key);
-                      if (!vs.length) return null;
-                      return (
-                        <div key={g.key} style={{ marginBottom: 8 }}>
-                          <div style={{ fontSize: 11, fontWeight: 800, color: TONE_COL[g.tone], marginBottom: 3 }}>
-                            {g.icon} {g.label} ({vs.length})
-                          </div>
-                          {vs.map((v) => (
-                            <div key={v.id} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 4 }}>
-                              <RecordLink id={v.id} onOpen={onOpenRecord}>{recordLabel(locateRecord(state, v.id))}</RecordLink>
-                              {v.why ? <span style={{ color: C.muted }}> — {v.why}</span> : null}
-                              {v.next ? <div style={{ color: C.ink, fontSize: 11 }}>→ {v.next}</div> : null}
-                            </div>
-                          ))}
-                        </div>
-                      );
-                    })}
-                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} in this batch got no verdict — “Review again” to retry it.</div>}
-                  </div>
-                )}
-                {m.research?.mode === "profile" && m.results?.length > 0 && (
-                  <div style={{ marginTop: 8, whiteSpace: "normal" }}>
-                    {m.results.map((r) => {
-                      const acc = (state.accounts || []).find((x) => x.id === r.accountId);
-                      const host = (() => {
-                        try {
-                          return r.website ? new URL(r.website).hostname.replace(/^www\./, "") : "";
-                        } catch (e) {
-                          return "";
-                        }
-                      })();
-                      return (
-                        <div key={r.accountId} style={{ borderTop: `1px solid ${C.panelEdge}`, padding: "8px 0" }}>
-                          <div style={{ fontSize: 13, fontWeight: 800, color: C.ink }}>
-                            <RecordLink id={acc?.id} onOpen={onOpenRecord}>{r.name || acc?.company || String(r.accountId).replace(/^name:/, "")}</RecordLink>
-                            {host && (
-                              <a href={r.website} target="_blank" rel="noreferrer" style={{ fontSize: 11, fontWeight: 400, color: C.blue, marginLeft: 6 }}>
-                                {host}
-                              </a>
-                            )}
-                            <span style={{ fontFamily: mono, fontSize: 9, marginLeft: 6, color: r.confidence === "high" ? C.green : r.confidence === "medium" ? C.amber : C.red }}>{r.confidence.toUpperCase()}</span>
-                          </div>
-                          <div style={{ fontSize: 11, color: C.muted }}>{[r.industry, r.location, r.size].filter(Boolean).join(" · ")}</div>
-                          {r.checks?.length > 0 && (
-                            <div style={{ fontSize: 10, marginTop: 2 }}>
-                              {r.checks.map((c, k) => (
-                                <span key={k} style={{ color: c.ok ? C.green : C.amber, marginRight: 8 }}>
-                                  {c.ok ? "✓" : "✗"} {c.text}
-                                </span>
-                              ))}
-                              {r.rechecked && <span style={{ color: C.muted }}>· double-checked</span>}
-                            </div>
-                          )}
-                          {r.identity?.note && <div style={{ fontSize: 11, color: C.muted }}>Identified: {r.identity.note}</div>}
-                          {r.whatTheyDo && <div style={{ fontSize: 12, color: C.ink, lineHeight: 1.5, marginTop: 4 }}>{r.whatTheyDo}</div>}
-                          {r.evidence?.some((e) => e.quote) && (
-                            <div style={{ fontSize: 11, color: C.muted, marginTop: 3, borderLeft: `2px solid ${C.panelEdge}`, paddingLeft: 7 }}>
-                              {r.evidence
-                                .filter((e) => e.quote)
-                                .slice(0, 2)
-                                .map((e, k) => (
-                                  <div key={k}>
-                                    “{e.quote}”{" "}
-                                    {e.url && (
-                                      <a href={e.url} target="_blank" rel="noreferrer" style={{ color: C.blue }}>
-                                        {hostOf(e.url) || "source"}
-                                      </a>
-                                    )}
-                                  </div>
-                                ))}
-                            </div>
-                          )}
-                          {r.services.length > 0 && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>Services: {r.services.join(" · ")}</div>}
-                          {r.customers && <div style={{ fontSize: 11, color: C.muted }}>Serves: {r.customers}</div>}
-                          {r.news.length > 0 && <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>📰 {r.news.join(" · ")}</div>}
-                          {r.angles.length > 0 && (
-                            <div style={{ fontSize: 11, color: C.green, marginTop: 3 }}>
-                              ☎ Worth mentioning: {r.angles.join(" · ")}
-                            </div>
-                          )}
-                          {r.sources.length > 0 && (
-                            <div style={{ fontSize: 10, marginTop: 3 }}>
-                              {r.sources.map((u, k) => (
-                                <a key={k} href={u} target="_blank" rel="noreferrer" style={{ color: C.blue, marginRight: 8 }}>
-                                  {(() => {
-                                    try {
-                                      return new URL(u).hostname.replace(/^www\./, "");
-                                    } catch (e) {
-                                      return "source";
-                                    }
-                                  })()}
-                                </a>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} came back without a briefing.</div>}
-                  </div>
-                )}
-                {m.research?.mode !== "profile" && m.results?.length > 0 && (
-                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8, whiteSpace: "normal" }}>
-                    {m.research?.question && (
-                      <div style={{ fontSize: 11, color: C.muted, marginBottom: 6 }}>
-                        Checked: “{m.research.question}” — {m.results.filter((r) => r.matches === true).length} match, {m.results.filter((r) => r.matches === false).length} don&apos;t,{" "}
-                        {m.results.filter((r) => r.matches === null).length} unclear
-                      </div>
-                    )}
-                    {m.results.map((r) => {
-                      const acc = (state.accounts || []).find((x) => x.id === r.accountId);
-                      const col = r.confidence === "high" ? C.green : r.confidence === "medium" ? C.amber : C.red;
-                      return (
-                        <div key={r.accountId} style={{ fontSize: 12, lineHeight: 1.45, marginBottom: 7 }}>
-                          {r.matches !== undefined && m.research?.question ? (
-                            <span style={{ fontWeight: 800, color: r.matches === true ? C.green : r.matches === false ? C.red : C.amber, marginRight: 4 }}>
-                              {r.matches === true ? "✓" : r.matches === false ? "✗" : "?"}
-                            </span>
-                          ) : null}
-                          <RecordLink id={acc?.id} onOpen={onOpenRecord}>{acc?.company || "?"}</RecordLink>
-                          {m.research?.mode !== "hours" && <span style={{ color: C.blue }}> · {r.industry || "not found"}</span>}
-                          {r.location ? <span style={{ color: C.muted }}> · {r.location}</span> : null}
-                          {r.timezone ? (
-                            <span style={{ color: C.muted }}>
-                              {" "}
-                              · 🕐 {tzCity(r.timezone)}
-                              {r.openHour != null && r.closeHour != null ? ` ${r.openHour}:00–${r.closeHour}:00` : ""}
-                            </span>
-                          ) : null}
-                          <span style={{ fontFamily: mono, fontSize: 9, color: col, marginLeft: 6 }}>{r.confidence.toUpperCase()}</span>
-                          {r.tags.length > 0 && <span style={{ color: C.muted }}> {r.tags.map((t) => `#${t}`).join(" ")}</span>}
-                          {(r.why || r.summary) && <div style={{ color: C.muted, fontSize: 11 }}>{(m.research?.question || m.research?.mode === "hours") && r.why ? r.why : r.summary}</div>}
-                          {r.sources.length > 0 && (
-                            <div style={{ fontSize: 10 }}>
-                              {r.sources.map((u, k) => (
-                                <a key={k} href={u} target="_blank" rel="noreferrer" style={{ color: C.blue, marginRight: 8 }}>
-                                  {(() => {
-                                    try {
-                                      return new URL(u).hostname.replace(/^www\./, "");
-                                    } catch (e) {
-                                      return "source";
-                                    }
-                                  })()}
-                                </a>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                    {m.missing?.length > 0 && <div style={{ fontSize: 11, color: C.amber }}>{m.missing.length} {m.missing.length === 1 ? "company" : "companies"} came back without a result.</div>}
-                    {m.actions?.some((x) => x._unchecked) && <div style={{ fontSize: 11, color: C.muted }}>Low-confidence findings are listed unticked below.</div>}
-                  </div>
-                )}
-                {!busy && m.research && i === msgs.map((x) => x.kind === "research").lastIndexOf(true) && m.research.poolIds.length - (m.research.offset + (m.research.size || m.research.batchSize || RESEARCH_BATCH)) > 0 && (
-                  <div style={{ marginTop: 6 }}>
-                    <Btn onClick={() => researchNext(m)} disabled={!!busy} style={{ padding: "6px 11px", fontSize: 11 }}>
-                      Research next {Math.min(m.research.batchSize || RESEARCH_BATCH, m.research.poolIds.length - (m.research.offset + m.research.size))} ({m.research.poolIds.length - (m.research.offset + m.research.size)} left)
-                    </Btn>
-                  </div>
-                )}
-                {!busy && rv && i === lastReviewIdx && (
-                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
-                    {remaining > 0 && (
-                      <Btn onClick={() => reviewNext(m)} disabled={!!busy} style={{ padding: "6px 11px", fontSize: 11 }}>
-                        Review next {Math.min(REVIEW_BATCH, remaining)} ({remaining} left)
-                      </Btn>
-                    )}
-                    <button onClick={() => reviewAgain(m)} disabled={!!busy} style={smallBtn}>
-                      ↻ Review again
-                    </button>
-                  </div>
-                )}
-                {review.length > 0 && (
-                  <div style={{ marginTop: 8, borderTop: `1px solid ${C.panelEdge}`, paddingTop: 8 }}>
-                    {review.map((r, k) => (
-                      <label key={k} style={{ display: "flex", gap: 7, alignItems: "flex-start", fontSize: 12, color: r.ok ? C.ink : C.muted, marginBottom: 5, cursor: r.ok && !m.applied ? "pointer" : "default", whiteSpace: "normal" }}>
-                        <input
-                          type="checkbox"
-                          disabled={!r.ok || !!m.applied}
-                          checked={!!((r.ok || m.appliedReview) && sel[k])}
-                          onChange={() => setPicks({ ...picks, [i]: sel.map((v, x) => (x === k ? !v : v)) })}
-                          style={{ marginTop: 2 }}
-                        />
-                        <span style={{ textDecoration: r.ok ? "none" : "line-through" }}>{r.text}</span>
-                      </label>
-                    ))}
-                    {m.applied ? (
-                      <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
-                        <span style={{ fontSize: 11, color: C.green, fontWeight: 700 }}>✓ Applied {m.applied}</span>
-                        {canUndo && i === msgs.length - 1 && (
-                          <button onClick={onUndo} style={smallBtn}>
-                            ↩ Undo
-                          </button>
-                        )}
-                      </div>
-                    ) : (
-                      <Btn
-                        disabled={!chosen.length}
-                        onClick={() => {
-                          const n = onApply(chosen);
-                          const frozen = review.map((r, k) => ({ text: r.text, ok: r.ok, on: !!(r.ok && sel[k]) }));
-                          commit(msgsRef.current.map((x, xi) => (xi === i ? { ...x, applied: n, appliedReview: frozen } : x)));
-                        }}
-                        style={{ padding: "7px 12px", fontSize: 12, marginTop: 4 }}
-                      >
-                        Apply {chosen.length} {chosen.length === 1 ? "change" : "changes"}
-                      </Btn>
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
-            )
-          );
-        })}
+        <AgentMessageList msgs={msgs} state={state} picks={picks} busy={busy} lastReviewIdx={lastReviewIdx} canUndo={canUndo} h={h} start={Math.max(0, msgs.length - AGENT_RECENT - olderShown)} />
         {busy && (
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: C.muted, padding: "4px 2px" }}>
             <span>{busy}</span>
@@ -21814,24 +21918,7 @@ ${batch.map((id) => companyBrief(state, id)).join("\n")}`,
         )}
         <div ref={endRef} />
       </div>
-      <div style={{ display: "flex", gap: 8, padding: "10px 12px calc(env(safe-area-inset-bottom, 0px) + 10px)", borderTop: `1px solid ${C.panelEdge}`, flexShrink: 0 }}>
-        <textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send();
-            }
-          }}
-          rows={2}
-          placeholder="e.g. Review my hot leads' notes — who should I call this week?"
-          style={{ ...inputStyle, flex: 1, resize: "none", fontSize: 14 }}
-        />
-        <Btn disabled={!!busy || !draft.trim()} onClick={() => send()} style={{ padding: "0 16px" }}>
-          Send
-        </Btn>
-      </div>
+      <AgentComposer busy={busy} onSend={send} />
     </div>
   );
 }
@@ -22033,11 +22120,46 @@ function DraftCard({ d, state, onApply, onOpen }) {
 /* A compact dropdown for phones: a small label, with the real (invisible)
    select laid over it. iOS needs selects at 16px or it zooms the page, which
    made these the biggest things on screen. */
+/* A value only a small part of the screen shows (the save status, the
+   toast). Changing it redraws that part alone — as app state, every save and
+   every toast redrew the whole app two or three extra times. */
+function createSignal(initial) {
+  let v = initial;
+  const subs = new Set();
+  return {
+    get: () => v,
+    set: (n) => {
+      const next = typeof n === "function" ? n(v) : n;
+      if (Object.is(next, v)) return;
+      v = next;
+      subs.forEach((f) => f());
+    },
+    subscribe: (f) => {
+      subs.add(f);
+      return () => subs.delete(f);
+    },
+  };
+}
+const useSignal = (sig) => useSyncExternalStore(sig.subscribe, sig.get, sig.get);
+function SyncBadge({ sig }) {
+  const syncStatus = useSignal(sig);
+  return (
+    <div style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.15em", color: syncStatus === "synced" ? C.green : syncStatus === "saving" ? C.amber : C.muted }}>
+      {syncStatus === "synced" ? "● SYNCED" : syncStatus === "saving" ? "◌ SAVING" : "○ LOCAL ONLY"}
+    </div>
+  );
+}
+function ToastView({ sig, bottom }) {
+  const toast = useSignal(sig);
+  if (!toast) return null;
+  return <div style={{ position: "fixed", bottom, left: "50%", transform: "translateX(-50%)", background: C.panelEdge, color: C.ink, fontSize: 13, fontWeight: 600, padding: "8px 18px", borderRadius: 20, zIndex: 60 }}>{toast}</div>;
+}
+
 /* Long lists draw their first rows straight away and the rest as you scroll
    down to them (or tap). Building hundreds of rows in one go is what made the
    bigger lists freeze on a phone. */
-const LIST_STEP = 50;
-const ROWS_STEP = 30; /* heavier rows (the applications sheet) */
+const LIST_STEP = 30;
+const ROWS_STEP = 20; /* heavier rows (the applications sheet) */
 function AutoMore({ shown, total, step = LIST_STEP, onMore }) {
   const ref = useRef(null);
   const more = useRef(onMore);
@@ -22054,7 +22176,7 @@ function AutoMore({ shown, total, step = LIST_STEP, onMore }) {
           more.current?.();
         }
       },
-      { rootMargin: "700px 0px" }
+      { rootMargin: "400px 0px" }
     );
     io.observe(el);
     return () => io.disconnect();
@@ -22101,9 +22223,14 @@ function FoundList({ ids, state, onApply, onOpen, onDraft }) {
   const [all, setAll] = useState(false);
   const [tag, setTag] = useState("");
   const [done, setDone] = useState("");
-  const rows = ids.map((id) => locateRecord(state, id)).filter(Boolean);
-  const callable = rows.filter((r) => r.kind === "contact" && hasPhone(r.c) && r.c.status !== "closed" && !isDnc(r.c, r.acc));
-  const dncRows = rows.filter((r) => r.kind === "contact" && isDnc(r.c, r.acc));
+  const { rows, callable, dncRows } = useMemo(() => {
+    const rows = (ids || []).map((id) => locateRecord(state, id)).filter(Boolean);
+    return {
+      rows,
+      callable: rows.filter((r) => r.kind === "contact" && hasPhone(r.c) && r.c.status !== "closed" && !isDnc(r.c, r.acc)),
+      dncRows: rows.filter((r) => r.kind === "contact" && isDnc(r.c, r.acc)),
+    };
+  }, [ids, state]);
   const shown = all ? rows : rows.slice(0, 25);
   const small = { background: "transparent", border: `1px solid ${C.panelEdge}`, color: C.muted, borderRadius: 8, fontSize: 11, padding: "4px 9px", cursor: "pointer" };
   if (!rows.length) return null;
