@@ -419,6 +419,9 @@ const accountsInList = (st, listId) => (st.accounts || []).filter((a) => (a.list
    lower-case and trimmed so "Agency" and "agency " are one tag. */
 const normTag = (t) => String(t || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 40);
 const tagsOf = (x) => (Array.isArray(x?.tags) ? x.tags.filter(Boolean) : []);
+/* "business consulting", "Business-Consulting" and "#business_consulting"
+   are one tag when filtering */
+const tagKey = (t) => normTag(t).replace(/^#/, "").replace(/[\s_]+/g, "-");
 /* Do Not Call: a DNC tag on the person, or on their company, keeps them out
    of every call run the assistant builds. Spellings people actually use. */
 const DNC_TAG_RE = /^(dnc|d\.n\.c\.?|dnc list|do[\s_-]*not[\s_-]*call|donotcall|don'?t[\s_-]*call|no[\s_-]*calls?|never[\s_-]*call)$/i;
@@ -1584,6 +1587,437 @@ const isInboundCall = (t) => isCallTouch(t) && t?.direction === "in";
 const isOutboundCall = (t) => isCallTouch(t) && t?.direction !== "in";
 /* the missed call a call-back would be returning: your latest unanswered
    call in the last 30 days that hasn't been returned yet */
+
+/* ============================================================
+   CALL CADENCES
+
+   Before you've reached someone, every lead is on a sequence: calls on set
+   days (the retries at the OTHER half of their day), a voicemail, a LinkedIn
+   touch and two short emails, then a rest and one last call. Each step comes
+   due on its own; logging the touch — from the queue, a run, the contact
+   card, the account form or the assistant — moves the lead on to the next.
+
+   A cadence stops the moment you get a conversation (a connected call or a
+   reply): from then on the next step is whatever you agreed on the call, set
+   in the call log. It also stops when the lead is closed or tagged DNC, and
+   it ends after the last call if they never pick up.
+
+   State lives on the contact as `cadence`; the steps themselves are derived
+   from its definition, so changing a cadence later doesn't rewrite history.
+   ============================================================ */
+const CADENCES = [
+  {
+    key: "standard",
+    label: "Standard",
+    sub: "4 calls, LinkedIn and 2 emails over 11 days, then one call 60 days later",
+    rest: 60,
+    steps: [
+      { day: 0, ch: "call", label: "First call" },
+      { day: 2, ch: "call", flip: true, label: "Call 2 — the other half of their day" },
+      { day: 4, ch: "call", vm: true, label: "Call 3 — leave a voicemail" },
+      { day: 4, ch: "linkedin", label: "LinkedIn — connect or message" },
+      { day: 7, ch: "email", label: "Email — short intro" },
+      { day: 10, ch: "call", flip: true, label: "Call 4 — the other half of their day" },
+      { day: 11, ch: "email", breakup: true, label: "Email — closing the loop" },
+    ],
+  },
+  {
+    key: "highvalue",
+    label: "High-value",
+    sub: "slower and more personal: 4 calls, LinkedIn and 2 emails over 18 days, then a call 45 days later",
+    rest: 45,
+    steps: [
+      { day: 0, ch: "call", label: "First call" },
+      { day: 3, ch: "call", flip: true, label: "Call 2 — the other half of their day" },
+      { day: 5, ch: "linkedin", label: "LinkedIn — connect with a note" },
+      { day: 7, ch: "email", label: "Email — something specific to them" },
+      { day: 10, ch: "call", vm: true, label: "Call 3 — leave a voicemail" },
+      { day: 14, ch: "call", flip: true, label: "Call 4 — the other half of their day" },
+      { day: 18, ch: "email", breakup: true, label: "Email — closing the loop" },
+    ],
+  },
+  {
+    key: "quick",
+    label: "Quick",
+    sub: "3 calls and an email in a week, then a call 90 days later",
+    rest: 90,
+    steps: [
+      { day: 0, ch: "call", label: "First call" },
+      { day: 2, ch: "call", flip: true, label: "Call 2 — the other half of their day" },
+      { day: 5, ch: "call", vm: true, label: "Call 3 — leave a voicemail" },
+      { day: 6, ch: "email", breakup: true, label: "Email — closing the loop" },
+    ],
+  },
+];
+const CADENCE_CH = { call: { icon: "☎", label: "call", channel: "Phone call" }, email: { icon: "✉", label: "email", channel: "Cold email" }, linkedin: { icon: "in", label: "LinkedIn", channel: "LinkedIn" } };
+const cadenceDef = (k) => CADENCES.find((x) => x.key === k) || null;
+const cadenceActive = (c) => !!(c?.cadence && c.cadence.key && !c.cadence.stoppedAt);
+const touchMatches = (t, ch) => (ch === "call" ? isOutboundCall(t) : ch === "email" ? /email/i.test(t?.channel || "") : ch === "linkedin" ? /linkedin/i.test(t?.channel || "") : false);
+/* local half of the day a call was made in: "am" or "pm" (their time) */
+function halfOfDayFor(c, acc, iso) {
+  const z = tzOf(c, acc);
+  if (!z || !iso) return "";
+  const w = callWindowAt(z.tz, new Date(iso));
+  return w.hour == null ? "" : w.hour < 12 ? "am" : "pm";
+}
+/* the step that's next, with its due date and what to do — or null */
+function cadenceNext(c) {
+  if (!cadenceActive(c)) return null;
+  const def = cadenceDef(c.cadence.key);
+  if (!def) return null;
+  const i = c.cadence.step || 0;
+  const rest = i >= def.steps.length;
+  const st = rest ? { ch: "call", label: `Last call — ${def.rest} days on`, rest: true } : def.steps[i];
+  return { ...st, index: i, total: def.steps.length + 1, due: c.cadence.due || today(), window: c.cadence.window || "", def };
+}
+/* what to actually do for this step, given what you know about them */
+function cadenceStepText(n, c) {
+  if (!n) return "";
+  if (n.ch === "linkedin") {
+    const st = c?.liStatus || "";
+    if (st === "connected") return "LinkedIn — you're connected: send a short message";
+    if (st === "requested") return `LinkedIn — request pending${c.liStatusAt ? ` ${daysSince(c.liStatusAt)}d` : ""}: message once they accept, or skip`;
+    if (st === "declined" || st === "withdrawn") return "LinkedIn — can't re-request yet: skip, or message without connecting";
+    if (st === "na") return "LinkedIn — message them again";
+    return "LinkedIn — send a connection request with a note";
+  }
+  if (n.ch === "email" && !String(c?.email || "").includes("@")) return `${n.label} (no email on file — will be skipped)`;
+  return n.label;
+}
+/* ---- the other half of their day ----
+   A retry made at the same local hour as the miss tends to miss again, so
+   each retry aims for the half of their day you haven't tried. */
+function halfNow(c, acc, now = new Date()) {
+  const z = tzOf(c, acc);
+  if (!z) return { half: "", hour: null };
+  const w = callWindowAt(z.tz, now);
+  return { half: w.hour == null ? "" : w.hour < 12 ? "am" : "pm", hour: w.hour, window: w.window };
+}
+function retryHalf(c, acc) {
+  const n = cadenceNext(c);
+  if (n && n.ch === "call" && n.window) return n.window;
+  const calls = (c?.touchpoints || []).filter(isOutboundCall).sort((a, b) => (a.at || a.date || "").localeCompare(b.at || b.date || ""));
+  const last = calls[calls.length - 1];
+  if (!last || callConnected(last) || !last.at) return "";
+  const h = halfOfDayFor(c, acc, last.at);
+  return h ? (h === "am" ? "pm" : "am") : "";
+}
+/* { want: "am"|"pm"|"", ok: now is the half to try, inHours: until it starts } */
+function retryTiming(c, acc, now = new Date()) {
+  const want = retryHalf(c, acc);
+  if (!want) return { want: "" };
+  const { half, hour } = halfNow(c, acc, now);
+  if (!half) return { want, ok: false, inHours: null };
+  if (half === want) return { want, ok: true, inHours: 0 };
+  /* morning starts at 9, afternoon at 12, their time */
+  const inHours = want === "pm" ? Math.max(0, Math.ceil(12 - hour)) : Math.ceil(24 - hour + 9);
+  return { want, ok: false, inHours };
+}
+const halfLabel = (h) => (h === "am" ? "morning" : h === "pm" ? "afternoon" : "");
+const cadenceDue = (c) => {
+  const n = cadenceNext(c);
+  return !!(n && n.due <= today());
+};
+/* when the step after `i` is due, given the day step `i` was actually done */
+function cadenceDueAfter(def, i, doneDate) {
+  const next = i + 1;
+  if (next < def.steps.length) return addDays(doneDate, Math.max(0, def.steps[next].day - def.steps[i].day));
+  return addDays(doneDate, def.rest);
+}
+function startCadence(c, key, { firstCallAt = "", firstCallId = "", acc = null, due = "" } = {}) {
+  const def = cadenceDef(key);
+  if (!def) return c;
+  const start = firstCallAt ? firstCallAt.slice(0, 10) : today();
+  /* already made the first call: step 1 is next */
+  const step = firstCallAt ? 1 : 0;
+  const nextDue = due || (firstCallAt ? cadenceDueAfter(def, 0, start) : today());
+  const half = firstCallAt ? halfOfDayFor(c, acc, firstCallAt) : "";
+  const nx = def.steps[step];
+  return {
+    ...c,
+    cadence: {
+      key,
+      startedAt: start,
+      step,
+      due: nextDue,
+      window: nx?.flip && half ? (half === "am" ? "pm" : "am") : "",
+      done: firstCallAt ? [{ step: 0, date: start }] : [],
+      used: firstCallId ? [firstCallId] : [],
+      /* touches at or before this moment belong to before the cadence */
+      since: firstCallAt || new Date().toISOString(),
+    },
+  };
+}
+const stopCadence = (c, reason) => (cadenceActive(c) ? { ...c, cadence: { ...c.cadence, stoppedAt: today(), reason } } : c);
+/* which cadence a lead gets: its list's, else the default */
+function cadenceKeyFor(st, acc) {
+  const map = st?.settings?.listCadence || {};
+  for (const id of acc?.listIds || []) if (map[id] && cadenceDef(map[id])) return map[id];
+  const d = st?.settings?.cadenceDefault;
+  return cadenceDef(d) ? d : "standard";
+}
+/* move one contact along: stop, advance past whatever was done, or start */
+function cadenceSweepContact(c, acc, st) {
+  if (!c || c.archivedAt) return c;
+  const tps = c.touchpoints || [];
+  if (cadenceActive(c)) {
+    const cad = c.cadence;
+    const def = cadenceDef(cad.key);
+    if (!def) return c;
+    const since = cad.since || cad.startedAt || "";
+    const after = (t) => (t.at || `${t.date}T23:59:59`) >= since;
+    if (c.status === "closed" || acc?.status === "closed" || acc?.status === "bad fit" || isDnc(c, acc)) return stopCadence(c, "closed or do-not-call");
+    if (tps.some((t) => after(t) && isCallTouch(t) && callConnected(t)) || (c.gotReply && (c.gotReplyAt || "9999") >= cad.startedAt)) return stopCadence(c, "you're talking");
+    /* tick off every step the touch points already cover, in order */
+    let cur = { ...cad, done: [...(cad.done || [])], used: [...(cad.used || [])] };
+    const used = new Set(cur.used);
+    for (let guard = 0; guard < 20; guard++) {
+      const i = cur.step || 0;
+      const rest = i >= def.steps.length;
+      const ch = rest ? "call" : def.steps[i].ch;
+      /* a step this lead can't take is skipped rather than left due forever:
+         no email address, no LinkedIn profile, or blocked there */
+      const cantTake = !rest && ((ch === "email" && !String(c.email || "").includes("@")) || (ch === "linkedin" && (!String(c.linkedin || "").trim() || c.liStatus === "blocked")));
+      if (cantTake) {
+        const nx = def.steps[i + 1];
+        cur = { ...cur, done: [...cur.done, { step: i, date: today(), skipped: ch === "email" ? "no email" : "no LinkedIn" }], step: i + 1, due: cur.due > today() ? cur.due : today(), window: nx?.flip ? cur.window || (cur.lastHalf ? (cur.lastHalf === "am" ? "pm" : "am") : "") : "" };
+        continue;
+      }
+      /* a request sent or a message marked on their LinkedIn status counts */
+      const liHit =
+        ch === "linkedin" && c.liStatusAt && ["requested", "connected", "na"].includes(c.liStatus) && `${c.liStatusAt}T23:59:59` >= since && !used.has(`li:${c.liStatus}:${c.liStatusAt}`)
+          ? { id: `li:${c.liStatus}:${c.liStatusAt}`, date: c.liStatusAt, at: `${c.liStatusAt}T12:00:00.000Z` }
+          : null;
+      const hit = [
+        ...tps.filter((t) => after(t) && !used.has(t.id) && touchMatches(t, ch)),
+        ...(liHit ? [liHit] : []),
+      ].sort((a, b) => (a.at || a.date || "").localeCompare(b.at || b.date || ""))[0];
+      if (!hit) break;
+      used.add(hit.id);
+      cur.used = [...used].slice(-20);
+      const date = hit.date || today();
+      if (rest) {
+        cur = { ...cur, done: [...cur.done, { step: i, date }], stoppedAt: today(), reason: "no answer after the whole cadence" };
+        break;
+      }
+      const half = ch === "call" ? halfOfDayFor(c, acc, hit.at) : "";
+      const lastHalf = half || cur.lastHalf || "";
+      const nextStep = def.steps[i + 1];
+      const override = cur.override && cur.override.tp === hit.id ? cur.override.due : "";
+      if (cur.override && cur.override.tp === hit.id) {
+        cur = { ...cur };
+        delete cur.override;
+      }
+      cur = {
+        ...cur,
+        done: [...cur.done, { step: i, date }],
+        step: i + 1,
+        due: override || cadenceDueAfter(def, i, date),
+        lastHalf,
+        window: nextStep?.flip && lastHalf ? (lastHalf === "am" ? "pm" : "am") : nextStep ? "" : lastHalf ? (lastHalf === "am" ? "pm" : "am") : "",
+      };
+    }
+    return JSON.stringify(cur) === JSON.stringify(cad) ? c : { ...c, cadence: cur };
+  }
+  /* auto-start: an unanswered call made since cadences were switched on, on
+     someone never reached, who hasn't been on one before */
+  if (c.cadence || st?.settings?.cadenceAuto === false) return c;
+  const since = st?.settings?.cadenceSince || "";
+  if (!since || c.status === "closed" || isDnc(c, acc) || !hasPhone(c)) return c;
+  const calls = tps.filter(isCallTouch);
+  if (calls.some(callConnected) || c.gotReply) return c;
+  const first = calls.filter((t) => isOutboundCall(t) && (t.at || "") >= since).sort((a, b) => (a.at || "").localeCompare(b.at || ""))[0];
+  if (!first) return c;
+  /* the calls before and including this one belong to before the cadence */
+  const priorIds = calls.filter((t) => (t.at || "") <= first.at).map((t) => t.id);
+  const started = startCadence(c, cadenceKeyFor(st, acc), { firstCallAt: first.at, firstCallId: first.id, acc });
+  return cadenceSweepContact({ ...started, cadence: { ...started.cadence, used: priorIds } }, acc, st);
+}
+/* the whole state; returns the same object when nothing moved */
+function cadenceSweep(st) {
+  if (!st || !Array.isArray(st.accounts)) return st;
+  let changed = false;
+  const accounts = st.accounts.map((acc) => {
+    let accChanged = false;
+    const contacts = (acc.contacts || []).map((c) => {
+      const n = cadenceSweepContact(c, acc, st);
+      if (n !== c) accChanged = true;
+      return n;
+    });
+    if (!accChanged) return acc;
+    changed = true;
+    return { ...acc, contacts };
+  });
+  return changed ? { ...st, accounts } : st;
+}
+/* ---- the daily calling plan ----
+   Due steps first (cadence calls and call-backs you promised), then new
+   leads to fill up to the day's target. Ordered for calling: whoever it's
+   business hours for right now — and the right half of their day — first. */
+function buildDailyPlan(rows, { target = 40, now = new Date() } = {}) {
+  const ok = rows.filter((r) => r.dialable && r.contact.status !== "closed" && !isDnc(r.contact, r.account));
+  const due = ok.filter((r) => r.callDue).sort((a, b) => String(a.dueDate || "").localeCompare(String(b.dueDate || "")));
+  const fresh = ok
+    .filter((r) => !r.callDue && r.calls === 0)
+    .sort((a, b) => (PLAN_TEMP_RANK[b.contact.temperature] || 0) - (PLAN_TEMP_RANK[a.contact.temperature] || 0));
+  const picked = [...due, ...fresh.slice(0, Math.max(0, target - due.length))];
+  const scored = picked.map((r) => {
+    const w = callWindowOf(r.contact, r.account, now);
+    const rt = retryTiming(r.contact, r.account, now);
+    const rank = (WIN_RANK[w.window] ?? 2) * 2 + (rt.want && !rt.ok ? 1 : 0);
+    return { ...r, win: w, rt, rank, why: r.cadCall ? "cadence" : r.callDue ? "follow-up" : "new" };
+  });
+  return scored.sort((a, b) => a.rank - b.rank || (a.why === "new" ? 1 : 0) - (b.why === "new" ? 1 : 0));
+}
+const PLAN_TEMP_RANK = { hot: 3, warm: 2, cold: 1 };
+/* every call on a contact or a pipeline lead, with when it was in THEIR day */
+function allCalls(st) {
+  const out = [];
+  (st.accounts || []).forEach((acc) =>
+    (acc.contacts || []).forEach((c) =>
+      (c.touchpoints || []).forEach((t) => {
+        if (!isCallTouch(t)) return;
+        out.push({ t, c, acc, listIds: acc.listIds || [], out: isOutboundCall(t), connected: callConnected(t), date: t.date || "", localHour: t.at ? (() => { const z = tzOf(c, acc); return z ? Math.floor(callWindowAt(z.tz, new Date(t.at)).hour) : null; })() : null });
+      })
+    )
+  );
+  (st.applications || []).forEach((a) =>
+    (a.touchpoints || []).forEach((t) => {
+      if (isCallTouch(t)) out.push({ t, c: a, acc: null, listIds: [], out: isOutboundCall(t), connected: callConnected(t), date: t.date || "", localHour: null });
+    })
+  );
+  return out;
+}
+function dialStats(st) {
+  const calls = allCalls(st);
+  const t0 = today();
+  const since = (d) => addDays(t0, -d);
+  const period = (from) => {
+    const xs = calls.filter((x) => x.date >= from);
+    const dials = xs.filter((x) => x.out).length;
+    const connects = xs.filter((x) => x.connected).length;
+    return { dials, connects, rate: dials ? connects / dials : 0, meetings: xs.filter((x) => x.t.stage === "booked").length, emails: xs.filter((x) => x.t.wantsEmail).length, returned: xs.filter((x) => !x.out).length };
+  };
+  /* connect rate by the hour it was in their day (30 days, outbound only) */
+  const hours = Array.from({ length: 13 }, (_, i) => ({ hour: 7 + i, dials: 0, connects: 0 }));
+  calls
+    .filter((x) => x.out && x.date >= since(30) && x.localHour != null)
+    .forEach((x) => {
+      const b = hours.find((h) => h.hour === x.localHour);
+      if (b) {
+        b.dials++;
+        if (x.connected) b.connects++;
+      }
+    });
+  /* how many tries it took to first reach someone */
+  const byPerson = new Map();
+  calls
+    .slice()
+    .sort((a, b) => (a.t.at || a.date).localeCompare(b.t.at || b.date))
+    .forEach((x) => {
+      const k = x.c.id;
+      const p = byPerson.get(k) || { tries: 0, reachedAt: 0 };
+      if (!p.reachedAt) {
+        if (x.out) p.tries++;
+        if (x.connected) p.reachedAt = Math.max(1, p.tries);
+      }
+      byPerson.set(k, p);
+    });
+  const tries = [1, 2, 3, 4, 5].map((n) => ({ n, people: [...byPerson.values()].filter((p) => (n < 5 ? p.reachedAt === n : p.reachedAt >= 5)).length }));
+  const neverReached = [...byPerson.values()].filter((p) => !p.reachedAt);
+  const days = Array.from({ length: 14 }, (_, i) => {
+    const d = addDays(t0, i - 13);
+    const xs = calls.filter((x) => x.date === d);
+    return { d, dials: xs.filter((x) => x.out).length, connects: xs.filter((x) => x.connected).length };
+  });
+  return { today: period(t0), week: period(since(6)), month: period(since(29)), hours, tries, neverReached: neverReached.length, givenUp: neverReached.filter((p) => p.tries === 1).length, days, calls };
+}
+/* per list: who's in it, how much of it you've worked, and what came of it */
+function listStats(st, calls = allCalls(st)) {
+  const lists = [...(st.accountLists || []).map((l) => ({ id: l.id, name: listName(l), industry: l.industry || "" })), { id: "", name: "Not in a list", industry: "" }];
+  return lists
+    .map((l) => {
+      const accs = (st.accounts || []).filter((a) => (l.id ? (a.listIds || []).includes(l.id) : !(a.listIds || []).some((id) => (st.accountLists || []).some((x) => x.id === id))));
+      const people = accs.flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt));
+      const ids = new Set(people.map((c) => c.id));
+      const xs = calls.filter((x) => ids.has(x.c.id));
+      const dials = xs.filter((x) => x.out).length;
+      const connects = xs.filter((x) => x.connected).length;
+      const called = new Set(xs.filter((x) => x.out).map((x) => x.c.id)).size;
+      const dialable = people.filter(hasPhone).length;
+      const hourBest = (() => {
+        const hs = {};
+        xs.filter((x) => x.out && x.localHour != null).forEach((x) => {
+          const h = (hs[x.localHour] = hs[x.localHour] || { d: 0, c: 0 });
+          h.d++;
+          if (x.connected) h.c++;
+        });
+        const best = Object.entries(hs)
+          .filter(([, v]) => v.d >= 3 && v.c > 0)
+          .sort((a, b) => b[1].c / b[1].d - a[1].c / a[1].d || b[1].c - a[1].c)[0];
+        return best ? +best[0] : null;
+      })();
+      return {
+        ...l,
+        accounts: accs.length,
+        people: people.length,
+        dialable,
+        called,
+        coverage: dialable ? called / dialable : 0,
+        dials,
+        connects,
+        rate: dials ? connects / dials : 0,
+        meetings: xs.filter((x) => x.t.stage === "booked").length,
+        onCadence: people.filter(cadenceActive).length,
+        hot: people.filter((c) => c.temperature === "hot").length,
+        bestHour: hourBest,
+      };
+    })
+    .filter((l) => l.id || l.accounts);
+}
+const pct = (x) => `${Math.round((x || 0) * 100)}%`;
+const hourLabel = (h) => (h == null ? "" : `${h % 12 || 12}${h < 12 ? "am" : "pm"}`);
+
+/* people called once or more who were never reached and never put on a
+   cadence — the backlog worth restarting */
+function cadenceBacklog(st) {
+  const out = [];
+  (st.accounts || []).forEach((acc) =>
+    (acc.contacts || []).forEach((c) => {
+      if (c.archivedAt || c.cadence || c.status === "closed" || isDnc(c, acc) || !hasPhone(c) || c.gotReply) return;
+      const calls = (c.touchpoints || []).filter(isCallTouch);
+      if (!calls.some(isOutboundCall) || calls.some(callConnected)) return;
+      out.push({ c, acc, last: calls.filter(isOutboundCall).map((t) => t.at || `${t.date}T12:00:00`).sort().pop(), ids: calls.map((t) => t.id) });
+    })
+  );
+  return out;
+}
+/* start the backlog on cadences, spread so no day gets more than `perDay` */
+function startCadenceBacklog(st, perDay = 40) {
+  const rows = cadenceBacklog(st).sort((a, b) => (a.last || "").localeCompare(b.last || ""));
+  const plan = new Map();
+  rows.forEach((r, k) => plan.set(r.c.id, { at: r.last, ids: r.ids, due: addDays(today(), Math.floor(k / Math.max(1, perDay))) }));
+  return {
+    st: {
+      ...st,
+      accounts: (st.accounts || []).map((acc) =>
+        (acc.contacts || []).some((c) => plan.has(c.id))
+          ? {
+              ...acc,
+              contacts: acc.contacts.map((c) => {
+                if (!plan.has(c.id)) return c;
+                const p = plan.get(c.id);
+                const n = startCadence(c, cadenceKeyFor(st, acc), { firstCallAt: p.at, acc, due: p.due });
+                return { ...n, cadence: { ...n.cadence, used: p.ids } };
+              }),
+            }
+          : acc
+      ),
+    },
+    count: rows.length,
+  };
+}
+
 const missedCallToReturn = (c) =>
   (c?.touchpoints || [])
     .filter((t) => isOutboundCall(t) && !callConnected(t) && !t.returnedAt && (t.date || "") >= addDays(today(), -30))
@@ -1655,6 +2089,9 @@ const CALL_FILTER_GROUPS = [
     label: "Needs a call",
     items: [
       { key: "due", label: "⚑ Due for a call", test: (r) => r.callDue },
+      { key: "cadDue", label: "🔁 Cadence call due today", test: (r) => r.cadCall },
+      { key: "cadOn", label: "🔁 On a cadence", test: (r) => !!r.cad },
+      { key: "cadNone", label: "Called, not on a cadence", test: (r) => r.calls > 0 && !r.everConnected && !r.contact.cadence },
       { key: "never", label: "Never called", test: (r) => r.calls === 0 },
       { key: "unreached", label: "Called, never connected", test: (r) => r.calls > 0 && !r.everConnected },
     ],
@@ -2998,7 +3435,7 @@ const trackPos = (fus, i) => (fus || []).slice(0, i + 1).filter((x) => trackOf(x
    logged (account form, call queue / contact card, application form) so they
    can't drift apart. `phoneKey` and `closes`/`closedStatus` differ between a
    contact and an application; everything else is the same. */
-function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays: cbDays, connected, temperature, wantsEmail, inbound = false }, { phoneKey = "phone", closes = CALL_CLOSES, closedStatus = "closed" } = {}) {
+function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, callbackDays: cbDays, connected, temperature, wantsEmail, inbound = false, nextStep = null }, { phoneKey = "phone", closes = CALL_CLOSES, closedStatus = "closed" } = {}) {
   const o = callOutcome(outcome);
   /* they rang you: always a real conversation, and it answers the missed
      call it returns, rather than standing beside it as a separate story */
@@ -3061,8 +3498,30 @@ function applyCallLog(c, { outcome, notes, tickFollowUp, followUpIndex, stage, c
   if (outcome === "qualified") next.qualifiedAt = today();
   /* furthest stage ever reached, so a weaker later call doesn't erase it */
   if (st && callStageIdx(stage) > callStageIdx(c.callStage || "")) next.callStage = stage;
+  /* on a cadence and not reached: a retry date you pick moves the cadence's
+     next step, rather than adding a second schedule beside it */
+  const onCadence = cadenceActive(c) && !reached;
+  if (onCadence && callbackDays > 0) next.cadence = { ...c.cadence, override: { tp: tpId, due: addDays(today(), callbackDays) } };
   /* a call-back becomes a real dated phone follow-up */
-  if (callbackDays > 0) next.followUps = insertCallback(phoneAnchorOf(next) || today(), next.followUps || c.followUps || [], callbackDays);
+  else if (callbackDays > 0 && !(reached && nextStep && nextStep.kind !== "callback")) next.followUps = insertCallback(phoneAnchorOf(next) || today(), next.followUps || c.followUps || [], callbackDays);
+  /* every conversation ends with a next step (chosen in the call log) */
+  if (reached && nextStep && !closes.includes(outcome)) {
+    const k = nextStep.kind;
+    if (k === "email") {
+      const r = addFollowUpOn(next, addDays(today(), Math.max(0, +nextStep.days || 0)), "Cold email");
+      if (r.rec) Object.assign(next, { followUps: r.rec.followUps });
+    } else if (k === "meeting" && /^\d{4}-\d{2}-\d{2}$/.test(nextStep.date || "")) {
+      next.meetingAt = nextStep.date;
+      if (!next.callStage || callStageIdx("booked") > callStageIdx(next.callStage)) next.callStage = "booked";
+      let r = addFollowUpOn(next, today(), "Cold email"); /* send the confirmation */
+      if (r.rec) next.followUps = r.rec.followUps;
+      r = addFollowUpOn(next, nextStep.date, PHONE_TRACK); /* the meeting itself */
+      if (r.rec) next.followUps = r.rec.followUps;
+    } else if (k.startsWith("nurture:")) {
+      Object.assign(next, applyNurtureTrack(next, k.slice(8)));
+    } else if (k === "close") next.status = closedStatus;
+    next.nextStep = { kind: k, ...(nextStep.date ? { date: nextStep.date } : {}), ...(nextStep.days != null ? { days: nextStep.days } : {}), at: today() };
+  }
   if (closes.includes(outcome)) next.status = closedStatus;
   if (reached && CALL_IS_REPLY.includes(outcome)) next.gotReply = true;
   /* a wrong number shouldn't stay in the field inviting a redial */
@@ -3442,6 +3901,9 @@ function migrate(saved) {
   if (!s.settings || typeof s.settings !== "object") s.settings = { checkinDay: 1 };
   if (!s.settings.checkinDay) s.settings.checkinDay = 1;
   if (typeof s.settings.timezoneOffset !== "number") s.settings.timezoneOffset = 8;
+  /* cadences start automatically only for calls made from now on — the
+     backlog is offered separately, so nothing changes behind your back */
+  if (!s.settings.cadenceSince) s.settings.cadenceSince = new Date().toISOString();
   if (!Array.isArray(s.settings.followUpDefaults) || !s.settings.followUpDefaults.length)
     s.settings.followUpDefaults = [...DEFAULT_FOLLOWUPS];
   /* max follow-ups to surface as "today's" work. Batch-adding 20 applications
@@ -5000,6 +5462,13 @@ export default function FlightDeck() {
   const [pipeStatusFilter, setPipeStatusFilter] = useState("");
   const [pipeFilterPanelOpen, setPipeFilterPanelOpen] = useState(false);
   const [accFilterPanelOpen, setAccFilterPanelOpen] = useState(false);
+  const [accFilterOpenGroups, setAccFilterOpenGroups] = useState({}); /* mobile sheet: which groups are expanded */
+  const [accTagQuery, setAccTagQuery] = useState("");
+  const [accTagsAll, setAccTagsAll] = useState(false);
+  const [accListTools, setAccListTools] = useState(false); /* mobile: list actions tucked behind ⋯ */
+  const [cadOpen, setCadOpen] = useState(false); /* Calls tab: written cadence steps list */
+  const [callsView, setCallsView] = useState("queue"); /* queue | plan | score */
+  const [cadSettingsOpen, setCadSettingsOpen] = useState(false);
   /* pagination — 100 per page across the CRM's larger lists, reset to page 1
      whenever the underlying filter/search changes so you never land on an
      empty page after narrowing down a list */
@@ -5121,6 +5590,60 @@ export default function FlightDeck() {
       },
       `Marked ${kind} — follow-ups scheduled`
     );
+
+  /* ---- cadence actions ---- */
+  const updateContactById = (contactId, fn, msg) =>
+    mutate((st) => {
+      const acc = (st.accounts || []).find((a) => (a.contacts || []).some((c) => c.id === contactId));
+      if (!acc) return st;
+      const oldContacts = acc.contacts;
+      const next = { ...st, accounts: st.accounts.map((a) => (a.id !== acc.id ? a : { ...a, contacts: a.contacts.map((c) => (c.id === contactId ? fn(c, a) : c)) })) };
+      return reconcileAccountApplications(next, acc.id, oldContacts);
+    }, msg);
+  /* an email or LinkedIn step done: it's a real touch, so it's logged as
+     one (and counts as outreach); the cadence moves on by itself */
+  const doneCadenceStep = (contactId, how = "") =>
+    updateContactById(
+      contactId,
+      (c) => {
+        const n = cadenceNext(c);
+        if (!n || n.ch === "call") return c;
+        const li = n.ch === "linkedin" ? (how === "request" ? { liStatus: "requested", liStatusAt: today() } : !c.liStatus ? { liStatus: "na", liStatusAt: today() } : {}) : {};
+        return {
+          ...c,
+          ...li,
+          contacted: c.contacted || today(),
+          status: c.status || "outreach",
+          /* the cadence is the plan, so no default follow-ups on top of it */
+          followUps: Array.isArray(c.followUps) ? c.followUps : [],
+          touchpoints: [...(c.touchpoints || []), { id: uid(), date: today(), at: new Date().toISOString(), channel: CADENCE_CH[n.ch].channel, note: `🔁 ${how === "request" ? "LinkedIn — connection request sent" : how === "message" ? "LinkedIn — messaged" : n.label}` }],
+        };
+      },
+      "✓ Step done — next one scheduled"
+    );
+  const skipCadenceStep = (contactId) =>
+    updateContactById(
+      contactId,
+      (c) => {
+        const n = cadenceNext(c);
+        if (!n) return c;
+        const def = n.def;
+        if (n.index >= def.steps.length) return stopCadence(c, "skipped the last call");
+        const nx = def.steps[n.index + 1];
+        return { ...c, cadence: { ...c.cadence, step: n.index + 1, due: cadenceDueAfter(def, n.index, today()), window: nx?.flip ? c.cadence.window || "" : "", done: [...(c.cadence.done || []), { step: n.index, date: today(), skipped: true }] } };
+      },
+      "Step skipped"
+    );
+  const startBacklogCadences = () => {
+    let n = 0;
+    mutate((st) => {
+      const r = startCadenceBacklog(st, 40);
+      n = r.count;
+      return r.st;
+    });
+    setTimeout(() => flash(`🔁 ${n} leads put back on a cadence — spread 40 a day`), 50);
+  };
+  const setCadenceSetting = (patch) => mutate((st) => ({ ...st, settings: { ...(st.settings || {}), ...patch } }), "Cadence settings saved");
 
   /* Writes a call straight to state. The account modal has its own copy that
      works on unsaved form data; this is for the call queue and contact card,
@@ -5365,7 +5888,8 @@ export default function FlightDeck() {
       if (archived.length) {
         nextState = { ...nextState, accomplishments: [...archived, ...(nextState.accomplishments || [])] };
       }
-      setState(nextState);
+      /* catch cadences up with anything logged on another device */
+      setState(cadenceSweep(nextState));
       setCoach(rolled);
       setLoaded(true);
       setCanAutoGen(remoteOk);
@@ -5819,7 +6343,8 @@ export default function FlightDeck() {
     setState((prev) => {
       undoStack.current = [JSON.parse(JSON.stringify(prev)), ...undoStack.current].slice(0, 3);
       setUndoCount(undoStack.current.length);
-      return fn(prev);
+      /* every change moves cadences along — whichever screen logged the touch */
+      return cadenceSweep(fn(prev));
     });
     if (msg) flash(msg);
   }, []);
@@ -10296,14 +10821,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     /* Contact-level filters added since the long chains below were written.
        Each is one predicate on a person; an account matches when any of its
        live contacts does, and the people view lists the contacts themselves. */
-    const allTags = Array.from(new Set(allContacts.flatMap(tagsOf))).sort();
+    /* tags merged by spelling, most-used first */
+    const tagCounts = new Map();
+    allContacts.forEach((c) => new Set(tagsOf(c).map(tagKey)).forEach((k) => k && tagCounts.set(k, (tagCounts.get(k) || 0) + 1)));
+    const allTags = [...tagCounts.keys()].sort((a, b) => tagCounts.get(b) - tagCounts.get(a) || a.localeCompare(b));
     const personFilters = {
       ...Object.fromEntries(LEAD_TEMPS.map((t) => [`temp:${t.key}`, (c) => c.temperature === t.key])),
       qualified: (c) => !!c.qualifiedAt && c.status !== "closed",
       wantsEmail: emailRequestOpen,
       ...Object.fromEntries(SENT_KINDS.map((k) => [`sent:${k.key}`, (c) => hasSent(c, k.key)])),
       sentAny: (c) => sentKindsOf(c).length > 0,
-      ...Object.fromEntries(allTags.map((tg) => [`tag:${tg}`, (c) => tagsOf(c).includes(tg)])),
+      ...Object.fromEntries(allTags.map((tg) => [`tag:${tg}`, (c) => tagsOf(c).some((t) => tagKey(t) === tg)])),
     };
     accFilterGroups.push(
       {
@@ -10312,9 +10840,9 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
           ...LEAD_TEMPS.map((t) => ({ key: `temp:${t.key}`, label: `${t.icon} ${t.label} (${allContacts.filter(personFilters[`temp:${t.key}`]).length})` })),
           { key: "qualified", label: `🎯 Qualified — not now (${allContacts.filter(personFilters.qualified).length})` },
           { key: "wantsEmail", label: `📧 Asked for an email (${allContacts.filter(emailRequestOpen).length})` },
-          ...allTags.map((tg) => ({ key: `tag:${tg}`, label: `#${tg} (${allContacts.filter(personFilters[`tag:${tg}`]).length})` })),
         ],
       },
+      ...(allTags.length ? [{ group: "Tags", items: allTags.map((tg) => ({ key: `tag:${tg}`, label: `#${tg} (${tagCounts.get(tg)})` })) }] : []),
       {
         group: "Sent them",
         items: [
@@ -10537,13 +11065,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </div>
           </div>
         ) : (
-          <div style={{ marginBottom: 12 }}>
-            <button
-              onClick={() => setAccFilterPanelOpen(true)}
-              style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "8px 14px", borderRadius: 20, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, cursor: "pointer" }}
-            >
-              🔍 {accFilters.find((f) => f.key === accFilter)?.label || "Filter"}
-            </button>
+          <div style={{ marginBottom: 0 }}>
 
             {accFilterPanelOpen && (
               <div
@@ -10558,30 +11080,96 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                     <div style={{ fontSize: 16, fontWeight: 800 }}>Filters</div>
                     <button onClick={() => setAccFilterPanelOpen(false)} style={{ background: "transparent", border: "none", color: C.muted, fontSize: 20, cursor: "pointer" }}>×</button>
                   </div>
-                  <div style={{ flex: 1, overflowY: "auto", padding: "0 20px 20px", display: "flex", flexDirection: "column", gap: 6 }}>
-                    {accFilters.map((f) => (
+                  {/* grouped like the desktop dropdowns; each group folds, chips
+                      instead of full-width rows, empty ones dimmed */}
+                  <div data-filter-sheet style={{ flex: 1, overflowY: "auto", padding: "0 16px 20px" }}>
+                    {accFilter !== "active" && (
                       <button
-                        key={f.key}
                         onClick={() => {
-                          setAccFilter(f.key);
+                          setAccFilter("active");
                           setAccFilterPanelOpen(false);
                         }}
-                        style={{
-                          textAlign: "left",
-                          fontFamily: sans,
-                          fontSize: 13,
-                          fontWeight: accFilter === f.key ? 700 : 500,
-                          padding: "10px 12px",
-                          borderRadius: 10,
-                          border: `1px solid ${accFilter === f.key ? C.amber : C.panelEdge}`,
-                          background: accFilter === f.key ? "rgba(245,185,66,0.1)" : "transparent",
-                          color: accFilter === f.key ? C.amber : C.ink,
-                          cursor: "pointer",
-                        }}
+                        style={{ fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "6px 12px", borderRadius: 16, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, cursor: "pointer", marginBottom: 10 }}
                       >
-                        {f.label}
+                        ✕ Clear filter
                       </button>
-                    ))}
+                    )}
+                    {accFilterGroups.map((g, gi) => {
+                      const activeHere = g.items.some((f) => f.key === accFilter);
+                      const isOpen = accFilterOpenGroups[g.group] ?? (activeHere || gi === 0);
+                      const isTags = g.group === "Tags";
+                      const countOf = (f) => Number((String(f.label).match(/\((\d+)/) || [])[1] || 0);
+                      const q = accTagQuery.trim().toLowerCase().replace(/^#/, "");
+                      let items = g.items;
+                      if (isTags && q) items = items.filter((f) => f.key.slice(4).includes(q));
+                      const hidden = isTags && !q && !accTagsAll ? Math.max(0, items.length - 12) : 0;
+                      if (hidden) items = items.slice(0, 12);
+                      const activeLabel = activeHere ? g.items.find((f) => f.key === accFilter)?.label : "";
+                      return (
+                        <div key={g.group} style={{ borderTop: gi ? `1px solid ${C.panelEdge}` : "none", padding: "8px 0" }}>
+                          <button
+                            onClick={() => setAccFilterOpenGroups((o) => ({ ...o, [g.group]: !isOpen }))}
+                            style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: "transparent", border: "none", padding: "4px 2px", cursor: "pointer", fontFamily: sans }}
+                          >
+                            <span style={{ fontFamily: mono, fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase", color: activeHere ? C.amber : C.muted }}>
+                              {g.group}
+                              {isTags ? ` · ${g.items.length}` : ""}
+                            </span>
+                            <span style={{ fontSize: 11, color: activeHere ? C.amber : C.muted, maxWidth: "60%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {!isOpen && activeLabel ? `${activeLabel} ` : ""}
+                              {isOpen ? "▾" : "▸"}
+                            </span>
+                          </button>
+                          {isOpen && (
+                            <>
+                              {isTags && g.items.length > 12 && (
+                                <input
+                                  value={accTagQuery}
+                                  onChange={(e) => setAccTagQuery(e.target.value)}
+                                  placeholder={`Find a tag (${g.items.length})…`}
+                                  style={{ ...inputStyle, fontSize: 12, padding: "7px 10px", margin: "6px 0" }}
+                                />
+                              )}
+                              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+                                {items.map((f) => {
+                                  const on = accFilter === f.key;
+                                  const n = countOf(f);
+                                  return (
+                                    <button
+                                      key={f.key}
+                                      onClick={() => {
+                                        setAccFilter(f.key);
+                                        setAccFilterPanelOpen(false);
+                                      }}
+                                      style={{
+                                        fontFamily: sans,
+                                        fontSize: 12,
+                                        fontWeight: on ? 700 : 500,
+                                        padding: "6px 10px",
+                                        borderRadius: 16,
+                                        border: `1px solid ${on ? C.amber : C.panelEdge}`,
+                                        background: on ? "rgba(245,185,66,0.12)" : "transparent",
+                                        color: on ? C.amber : C.ink,
+                                        opacity: n === 0 && !on ? 0.4 : 1,
+                                        cursor: "pointer",
+                                      }}
+                                    >
+                                      {f.label}
+                                    </button>
+                                  );
+                                })}
+                                {hidden > 0 && (
+                                  <button onClick={() => setAccTagsAll(true)} style={{ fontFamily: sans, fontSize: 12, padding: "6px 10px", borderRadius: 16, border: `1px dashed ${C.panelEdge}`, background: "transparent", color: C.blue, cursor: "pointer" }}>
+                                    +{hidden} more tags
+                                  </button>
+                                )}
+                                {isTags && q && !items.length && <span style={{ fontSize: 12, color: C.muted }}>No tag matches “{accTagQuery}”.</span>}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>
@@ -10600,9 +11188,52 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             ? accountsInList(state, activeList.id).flatMap((a) => (a.contacts || []).filter((c) => !c.archivedAt && hasPhone(c) && c.status !== "closed").map((c) => c.id))
             : [];
           const chipBtn = { fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "6px 11px", borderRadius: 16, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, cursor: "pointer" };
+          /* on a phone: filter + list side by side; the list actions open
+             from ⋯ so they don't take three rows before any account shows */
+          const showTools = isDesktop || accListTools || listsOpen;
+          const filterOn = accFilter !== "active";
           return (
             <div style={{ marginBottom: 12 }}>
-              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              {!isDesktop && (
+                <div data-acc-toolbar style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: showTools ? 8 : 0 }}>
+                  <button
+                    onClick={() => setAccFilterPanelOpen(true)}
+                    style={{ flex: "1 1 0", minWidth: 0, display: "flex", alignItems: "center", gap: 5, fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "8px 11px", borderRadius: 18, border: `1px solid ${filterOn ? C.amber : C.panelEdge}`, background: filterOn ? "rgba(245,185,66,0.1)" : "transparent", color: filterOn ? C.amber : C.muted, cursor: "pointer", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+                  >
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>⏷ {accFilters.find((f) => f.key === accFilter)?.label || "Filter"}</span>
+                  </button>
+                  <ChipSelect
+                    value={accList}
+                    onChange={(e) => {
+                      setAccList(e.target.value);
+                      setAccPage(0);
+                    }}
+                    ariaLabel="Show one list"
+                    active={!!accList}
+                    color={C.blue}
+                    label={accList === "none" ? "📋 Not in a list" : activeList ? `📋 ${listName(activeList)}` : "📋 All lists"}
+                    style={{ flex: "1 1 0" }}
+                  >
+                    <option value="">📋 All lists</option>
+                    {lists.map((l) => (
+                      <option key={l.id} value={l.id}>
+                        {listName(l)} ({accountsInList(state, l.id).length})
+                      </option>
+                    ))}
+                    <option value="none">Not in any list</option>
+                  </ChipSelect>
+                  <button
+                    aria-label="List actions"
+                    onClick={() => setAccListTools(!showTools)}
+                    style={{ ...chipBtn, flexShrink: 0, padding: "7px 11px", fontSize: 14, lineHeight: 1, color: showTools ? C.blue : C.muted, borderColor: showTools ? C.blue : C.panelEdge }}
+                  >
+                    ⋯
+                  </button>
+                </div>
+              )}
+              {showTools && (
+              <div style={{ display: "flex", gap: isDesktop ? 8 : 6, alignItems: "center", flexWrap: "wrap" }}>
+                {isDesktop && (
                 <select
                   value={accList}
                   onChange={(e) => {
@@ -10621,7 +11252,29 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   ))}
                   <option value="none">Not in any list</option>
                 </select>
-                {shownIds.length > 0 && lists.length > 0 && (
+                )}
+                {shownIds.length > 0 && lists.length > 0 && !isDesktop && (
+                  <ChipSelect
+                    value=""
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (v) addToList(v, shownIds);
+                    }}
+                    ariaLabel="Add the accounts shown to a list"
+                    label={`+ Add ${shownIds.length} shown to…`}
+                    style={{ padding: "6px 22px 6px 10px", fontSize: 11, borderRadius: 16 }}
+                  >
+                    <option value="">+ Add {shownIds.length} shown to…</option>
+                    {lists
+                      .filter((l) => l.id !== accList)
+                      .map((l) => (
+                        <option key={l.id} value={l.id}>
+                          {listName(l)}
+                        </option>
+                      ))}
+                  </ChipSelect>
+                )}
+                {shownIds.length > 0 && lists.length > 0 && isDesktop && (
                   <select
                     value=""
                     onChange={(e) => {
@@ -10629,7 +11282,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                       if (v) addToList(v, shownIds);
                     }}
                     aria-label="Add the accounts shown to a list"
-                    style={{ ...selectStyle, width: "auto", minWidth: 150, fontSize: 12, fontWeight: 700, padding: "7px 9px", color: C.muted, background: "transparent" }}
+                    style={{ ...selectStyle, width: "auto", minWidth: isDesktop ? 150 : 0, fontSize: isDesktop ? 12 : 11, fontWeight: 700, padding: isDesktop ? "7px 9px" : "6px 24px 6px 10px", borderRadius: isDesktop ? undefined : 16, color: C.muted, background: "transparent" }}
                   >
                     <option value="">+ Add {shownIds.length} shown to…</option>
                     {lists
@@ -10662,6 +11315,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                   ⚙ {lists.length ? "Manage lists" : "+ New list"}
                 </button>
               </div>
+              )}
               {listsOpen && <ListManager lists={lists} counts={Object.fromEntries(lists.map((l) => [l.id, accountsInList(state, l.id).length]))} onCreate={newAccountList} onUpdate={updateAccountList} onDelete={deleteAccountList} />}
             </div>
           );
@@ -12122,7 +12776,23 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const lastCall = (c) => (c.touchpoints || []).filter((t) => t.channel === "Phone call").map((t) => t.date).sort().pop() || "";
     const session = state.callSession || [];
     return rows
-      .map((r) => ({ ...r, ...callStanding(r.contact), callDue: isCallDue(r.contact), calls: calls(r.contact), lastCall: lastCall(r.contact), due: isContactDue(r.contact) || isCallDue(r.contact), dueDate: followUpOf(r.contact), dialable: hasPhone(r.contact), pick: session.indexOf(r.contact.id) }))
+      .map((r) => {
+        const cad = cadenceNext(r.contact);
+        const cadCall = !!(cad && cad.ch === "call" && cad.due <= today());
+        return {
+          ...r,
+          ...callStanding(r.contact),
+          cad,
+          cadCall,
+          callDue: isCallDue(r.contact) || cadCall,
+          calls: calls(r.contact),
+          lastCall: lastCall(r.contact),
+          due: isContactDue(r.contact) || isCallDue(r.contact) || cadCall,
+          dueDate: cadCall ? cad.due : followUpOf(r.contact),
+          dialable: hasPhone(r.contact),
+          pick: session.indexOf(r.contact.id),
+        };
+      })
       .sort(
         (a, b) =>
           /* anything you picked leads, in the order you picked it — a manual
@@ -12133,14 +12803,386 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
              this outranks due and never-called, because no ranking matters on
              a row you can't ring */
           (a.dialable ? 0 : 1) - (b.dialable ? 0 : 1) ||
-          /* then: never called first — those are what the queue exists for.
-             Then whoever is due. Then longest since the last attempt. */
+          /* then today's due steps — a cadence call or a follow-up you
+             committed to — oldest first; then never called; then longest
+             since the last attempt */
+          (b.callDue ? 1 : 0) - (a.callDue ? 1 : 0) ||
+          (a.callDue && b.callDue ? String(a.dueDate || "").localeCompare(String(b.dueDate || "")) : 0) ||
           a.calls - b.calls ||
           (b.due ? 1 : 0) - (a.due ? 1 : 0) ||
           (a.lastCall || "0000").localeCompare(b.lastCall || "0000") ||
           (a.company || "").localeCompare(b.company || "")
       );
   }, [state.accounts, state.callSession]);
+
+  /* ---- 📅 Today: the daily calling plan ---- */
+  const renderCallPlan = () => {
+    const target = Math.max(5, Math.min(200, +state.settings?.dailyDialTarget || 40));
+    const plan = buildDailyPlan(callQueue, { target, now: clockNow });
+    const st = dialStats(state);
+    const done = st.today.dials;
+    const inRun = new Set(state.callSession || []);
+    const notInRun = plan.filter((r) => !inRun.has(r.contact.id)).map((r) => r.contact.id);
+    const groups = [
+      ["Callable now", plan.filter((r) => r.win.window === "business" && (!r.rt.want || r.rt.ok))],
+      ["Callable now — but not their best half", plan.filter((r) => r.win.window === "business" && r.rt.want && !r.rt.ok)],
+      ["After hours now", plan.filter((r) => r.win.window === "after")],
+      ["Time zone unknown", plan.filter((r) => r.win.window === "unknown")],
+      ["Closed now — call in their business hours", plan.filter((r) => r.win.window === "closed")],
+    ].filter(([, xs]) => xs.length);
+    const bar = (v, max, col) => (
+      <div style={{ height: 6, background: C.bg, borderRadius: 3, overflow: "hidden", flex: 1 }}>
+        <div style={{ width: `${Math.min(100, max ? (v / max) * 100 : 0)}%`, height: "100%", background: col }} />
+      </div>
+    );
+    const setTarget = (n) => mutate((s2) => ({ ...s2, settings: { ...(s2.settings || {}), dailyDialTarget: Math.max(5, Math.min(200, n)) } }));
+    const ghostMini = { fontFamily: sans, fontSize: 13, fontWeight: 800, width: 26, height: 24, borderRadius: 7, border: `1px solid ${C.panelEdge}`, background: "transparent", color: C.muted, cursor: "pointer", padding: 0, lineHeight: 1 };
+    return (
+      <>
+        <div data-plan-head style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px", marginBottom: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+            <span style={{ fontSize: 14, fontWeight: 800, color: C.ink }}>Today: {done} / {target} dials</span>
+            <span style={{ marginLeft: "auto", display: "flex", gap: 4, alignItems: "center" }}>
+              <button aria-label="Lower target" onClick={() => setTarget(target - 5)} style={{ ...ghostMini }}>−</button>
+              <span style={{ fontSize: 10, color: C.muted }}>target</span>
+              <button aria-label="Raise target" onClick={() => setTarget(target + 5)} style={{ ...ghostMini }}>+</button>
+            </span>
+          </div>
+          {bar(done, target, done >= target ? C.green : C.amber)}
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 6 }}>
+            {st.today.connects} connected ({pct(st.today.rate)}) · {st.today.meetings} meeting{st.today.meetings === 1 ? "" : "s"} · {st.today.returned} called back
+          </div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+            Plan: {plan.filter((r) => r.why !== "new").length} due · {plan.filter((r) => r.why === "new").length} new to fill the target
+          </div>
+          {notInRun.length > 0 && (
+            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+              <Btn
+                onClick={() => {
+                  mutate((s2) => withCallRun(s2, [...(s2.callSession || []), ...plan.map((r) => r.contact.id).filter((id) => !(s2.callSession || []).includes(id))]), `📅 ${notInRun.length} added to the run, best time first`);
+                  setCallsView("queue");
+                }}
+                style={{ padding: "7px 12px", fontSize: 12 }}
+              >
+                ▶ Add {notInRun.length} to the run
+              </Btn>
+            </div>
+          )}
+        </div>
+        {groups.map(([label, xs]) => (
+          <div key={label} style={{ marginBottom: 10 }}>
+            <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", textTransform: "uppercase", color: C.muted, margin: "0 2px 4px" }}>
+              {label} · {xs.length}
+            </div>
+            {xs.map((r) => (
+              <div key={r.contact.id} data-plan-row onClick={() => setContactCard({ contact: r.contact, company: r.company, accountId: r.accountId })} style={{ background: C.panel, border: `1px solid ${inRun.has(r.contact.id) ? C.amber : C.panelEdge}`, borderRadius: 9, padding: "6px 10px", marginBottom: 3, cursor: "pointer" }}>
+                <div style={{ display: "flex", gap: 6, alignItems: "baseline", minWidth: 0 }}>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{r.contact.name || "Unnamed"}</span>
+                  <span style={{ fontSize: 11, color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, flex: 1 }}>{r.company}</span>
+                  <span style={{ fontFamily: mono, fontSize: 10, color: r.win.window === "business" ? C.green : C.muted, flexShrink: 0 }}>{r.win.local ? r.win.local.split(" ")[1] : ""}</span>
+                </div>
+                <div style={{ fontSize: 10, color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {r.why === "cadence" ? `🔁 ${cadenceStepText(r.cad, r.contact)}` : r.why === "follow-up" ? `⚑ call-back due ${r.dueDate}` : "✨ new — first call"}
+                  {r.rt.want ? ` · ⏰ ${halfLabel(r.rt.want)}${r.rt.ok ? " ✓" : r.rt.inHours != null ? ` in ~${r.rt.inHours}h` : ""}` : ""}
+                  {inRun.has(r.contact.id) ? " · in the run" : ""}
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+        {!plan.length && <div style={{ color: C.muted, fontSize: 13, textAlign: "center", padding: "20px 0" }}>Nothing due and no new numbers to call. Add contacts with phone numbers, or raise the target.</div>}
+            {(() => {
+              /* ---- today's cadence ----
+                 what the sequences want done today, by channel: calls go to
+                 the run, emails to the assistant, LinkedIn by hand */
+              const onCad = [];
+              (state.accounts || []).forEach((acc) =>
+                (acc.contacts || []).forEach((c) => {
+                  if (c.archivedAt) return;
+                  const n = cadenceNext(c);
+                  if (n) onCad.push({ c, acc, n, due: n.due <= today() });
+                })
+              );
+              const dueCalls = onCad.filter((x) => x.due && x.n.ch === "call" && hasPhone(x.c));
+              const dueWritten = onCad.filter((x) => x.due && x.n.ch !== "call").sort((a, b) => a.n.due.localeCompare(b.n.due));
+              const dueEmails = dueWritten.filter((x) => x.n.ch === "email");
+              const dueLi = dueWritten.filter((x) => x.n.ch === "linkedin");
+              const backlog = cadenceBacklog(state).length;
+              const chip = (on) => ({ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "5px 10px", borderRadius: 14, border: `1px solid ${on ? C.amber : C.panelEdge}`, background: "transparent", color: on ? C.amber : C.muted, cursor: "pointer", whiteSpace: "nowrap" });
+              const notInRun = dueCalls.filter((x) => !(state.callSession || []).includes(x.c.id)).map((x) => x.c.id);
+              return (
+                <div data-cadence-panel style={{ background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "9px 11px", marginBottom: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 13, fontWeight: 800, color: C.ink, marginRight: 2 }}>🔁 Cadence today</span>
+                    <span style={{ fontSize: 11, color: dueCalls.length ? C.amber : C.muted }}>☎ {dueCalls.length}</span>
+                    <span style={{ fontSize: 11, color: dueEmails.length ? C.amber : C.muted }}>✉ {dueEmails.length}</span>
+                    <span style={{ fontSize: 11, color: dueLi.length ? C.amber : C.muted }}>in {dueLi.length}</span>
+                    <span style={{ fontSize: 11, color: C.muted }}>· {onCad.length} on a cadence</span>
+                    <button aria-label="Cadence settings" onClick={() => setCadSettingsOpen(!cadSettingsOpen)} style={{ ...chip(cadSettingsOpen), marginLeft: "auto", padding: "4px 9px" }}>
+                      ⚙
+                    </button>
+                  </div>
+                  {(notInRun.length > 0 || dueEmails.length > 0 || dueWritten.length > 0) && (
+                    <div style={{ display: "flex", gap: 6, marginTop: 7, overflowX: "auto" }}>
+                      {notInRun.length > 0 && (
+                        <button onClick={() => addContactsToRun(notInRun, `☎ ${notInRun.length} cadence calls added to the run`)} style={{ ...chip(true), color: C.green, borderColor: C.green }}>
+                          ☎ Add {notInRun.length} call{notInRun.length === 1 ? "" : "s"} to run
+                        </button>
+                      )}
+                      {dueEmails.length > 0 && agentControl.current?.draftEmails && (
+                        <button
+                          onClick={() => {
+                            agentControl.current.draftEmails(
+                              dueEmails.map((x) => x.c.id),
+                              `✍ Draft the ${dueEmails.length} cadence email${dueEmails.length === 1 ? "" : "s"} due today`
+                            );
+                            setAgentOpen(true);
+                          }}
+                          style={chip(true)}
+                        >
+                          ✍ Draft {dueEmails.length} email{dueEmails.length === 1 ? "" : "s"}
+                        </button>
+                      )}
+                      {dueWritten.length > 0 && (
+                        <button onClick={() => setCadOpen(!cadOpen)} style={chip(cadOpen)}>
+                          {cadOpen ? "Hide" : "Show"} emails & LinkedIn ({dueWritten.length})
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {cadOpen &&
+                    dueWritten.slice(0, 40).map((x) => (
+                      <div key={x.c.id} data-cad-step style={{ display: "flex", alignItems: "center", gap: 6, borderTop: `1px solid ${C.panelEdge}`, padding: "6px 0", marginTop: 6 }}>
+                        <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={() => setContactCard({ contact: x.c, company: x.acc.company, accountId: x.acc.id })}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {CADENCE_CH[x.n.ch].icon} {x.c.name || "Unnamed"} <span style={{ fontWeight: 400, color: C.muted }}>· {x.acc.company}</span>
+                          </div>
+                          <div style={{ fontSize: 10, color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {cadenceStepText(x.n, x.c)} · {x.n.index + 1}/{x.n.total}
+                            {x.n.due < today() ? ` · due ${x.n.due}` : ""}
+                            {x.n.ch === "email" && !x.c.email ? " · no email on file" : ""}
+                            {x.n.ch === "linkedin" && !x.c.linkedin ? " · no LinkedIn on file" : ""}
+                          </div>
+                        </div>
+                        {x.n.ch === "email" && x.c.email && (
+                          <a href={`mailto:${x.c.email}`} style={{ ...chip(false), textDecoration: "none", color: C.blue }}>
+                            ✉
+                          </a>
+                        )}
+                        {x.n.ch === "linkedin" && x.c.linkedin && (
+                          <a href={x.c.linkedin} target="_blank" rel="noreferrer" style={{ ...chip(false), textDecoration: "none", color: C.blue }}>
+                            Open
+                          </a>
+                        )}
+                        {x.n.ch === "linkedin" && x.c.liStatus !== "connected" && x.c.liStatus !== "requested" ? (
+                          <button onClick={() => doneCadenceStep(x.c.id, "request")} style={{ ...chip(true), color: C.green, borderColor: C.green }}>
+                            ✓ Sent request
+                          </button>
+                        ) : (
+                          <button onClick={() => doneCadenceStep(x.c.id, x.n.ch === "linkedin" ? "message" : "")} style={{ ...chip(true), color: C.green, borderColor: C.green }}>
+                            ✓ {x.n.ch === "linkedin" ? "Messaged" : "Sent"}
+                          </button>
+                        )}
+                        <button onClick={() => skipCadenceStep(x.c.id)} style={chip(false)}>
+                          Skip
+                        </button>
+                      </div>
+                    ))}
+                  {backlog > 0 && (
+                    <div style={{ marginTop: 7, fontSize: 11, color: C.amber, lineHeight: 1.45 }}>
+                      {backlog} {backlog === 1 ? "person was" : "people were"} called and never reached, and {backlog === 1 ? "isn't" : "aren't"} on a cadence.{" "}
+                      <button data-start-backlog onClick={startBacklogCadences} style={{ ...chip(true), padding: "3px 9px" }}>
+                        🔁 Start cadences for them
+                      </button>
+                      <span style={{ color: C.muted }}> — spread 40 a day, picking up at call 2.</span>
+                    </div>
+                  )}
+                  {cadSettingsOpen && (
+                    <div style={{ borderTop: `1px solid ${C.panelEdge}`, marginTop: 8, paddingTop: 8 }}>
+                      <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 6 }}>
+                        A cadence runs until you reach them. A connected call or a reply ends it — the next step is then whatever you set in the call log. Closing a lead or tagging it DNC ends it too.
+                      </div>
+                      {CADENCES.map((d) => (
+                        <div key={d.key} style={{ fontSize: 11, color: C.ink, marginBottom: 5 }}>
+                          <b>{d.label}</b> <span style={{ color: C.muted }}>— {d.sub}</span>
+                          <div style={{ color: C.muted, fontSize: 10 }}>{d.steps.map((x) => `D${x.day} ${CADENCE_CH[x.ch].icon}${x.vm ? " +VM" : ""}${x.flip ? " ↻" : ""}`).join(" · ")} · +{d.rest}d ☎</div>
+                        </div>
+                      ))}
+                      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginTop: 6 }}>
+                        <span style={{ fontSize: 11, color: C.muted }}>Default</span>
+                        {CADENCES.map((d) => {
+                          const on = (state.settings?.cadenceDefault || "standard") === d.key;
+                          return (
+                            <button key={d.key} onClick={() => setCadenceSetting({ cadenceDefault: d.key })} style={{ ...chip(on), color: on ? C.amber : C.muted }}>
+                              {d.label}
+                            </button>
+                          );
+                        })}
+                        <button onClick={() => setCadenceSetting({ cadenceAuto: state.settings?.cadenceAuto === false })} style={chip(state.settings?.cadenceAuto !== false)}>
+                          {state.settings?.cadenceAuto === false ? "☐" : "☑"} Start one after a first unanswered call
+                        </button>
+                      </div>
+                      {(state.accountLists || []).length > 0 && (
+                        <div style={{ marginTop: 8 }}>
+                          <div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Per list</div>
+                          {(state.accountLists || []).map((l) => (
+                            <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                              <span style={{ fontSize: 12, color: C.ink, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{listName(l)}</span>
+                              <ChipSelect
+                                value={state.settings?.listCadence?.[l.id] || ""}
+                                onChange={(e) => setCadenceSetting({ listCadence: { ...(state.settings?.listCadence || {}), [l.id]: e.target.value } })}
+                                label={cadenceDef(state.settings?.listCadence?.[l.id])?.label || "Default"}
+                                ariaLabel={`Cadence for ${listName(l)}`}
+                                active={!!cadenceDef(state.settings?.listCadence?.[l.id])}
+                                color={C.amber}
+                                style={{ padding: "5px 22px 5px 10px", fontSize: 11 }}
+                              >
+                                <option value="">Default</option>
+                                {CADENCES.map((d) => (
+                                  <option key={d.key} value={d.key}>
+                                    {d.label}
+                                  </option>
+                                ))}
+                              </ChipSelect>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+      </>
+    );
+  };
+
+  /* ---- 📊 Scoreboard: what's working, and when ---- */
+  const renderScoreboard = () => {
+    const st = dialStats(state);
+    const lists = listStats(state, st.calls);
+    const card = { background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px", marginBottom: 10 };
+    const head = { fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", textTransform: "uppercase", color: C.muted, marginBottom: 6 };
+    const stat = (label, v, sub, col = C.ink) => (
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 9, letterSpacing: "0.12em", color: C.muted, textTransform: "uppercase" }}>{label}</div>
+        <div style={{ fontFamily: mono, fontSize: 18, fontWeight: 700, color: col }}>{v}</div>
+        {sub && <div style={{ fontSize: 10, color: C.muted }}>{sub}</div>}
+      </div>
+    );
+    const maxHourDials = Math.max(1, ...st.hours.map((h) => h.dials));
+    const ratedHours = st.hours.filter((h) => h.dials >= 3);
+    const bestHour = ratedHours.filter((h) => h.connects > 0).sort((a, b) => b.connects / b.dials - a.connects / a.dials || b.connects - a.connects)[0];
+    const maxDay = Math.max(1, ...st.days.map((d) => d.dials));
+    const reachedTotal = st.tries.reduce((n, x) => n + x.people, 0);
+    return (
+      <>
+        <div data-score-periods style={{ display: "grid", gridTemplateColumns: isDesktop ? "repeat(3, 1fr)" : "1fr", gap: 8, marginBottom: 10 }}>
+          {[
+            ["Today", st.today],
+            ["Last 7 days", st.week],
+            ["Last 30 days", st.month],
+          ].map(([label, p]) => (
+            <div key={label} style={{ ...card, marginBottom: 0 }}>
+              <div style={head}>{label}</div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 6 }}>
+                {stat("Dials", p.dials)}
+                {stat("Connected", p.connects, pct(p.rate), p.rate >= 0.25 ? C.green : C.ink)}
+                {stat("Meetings", p.meetings, p.connects ? `${pct(p.meetings / p.connects)} of talks` : "", p.meetings ? C.green : C.ink)}
+                {stat("Emails asked", p.emails)}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div style={card}>
+          <div style={head}>Dials per day · last 14 days</div>
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 56 }}>
+            {st.days.map((d) => (
+              <div key={d.d} title={`${d.d}: ${d.dials} dials, ${d.connects} connected`} style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end", height: "100%" }}>
+                <div style={{ height: `${(d.dials / maxDay) * 100}%`, minHeight: d.dials ? 2 : 0, background: C.blue, borderRadius: "2px 2px 0 0", position: "relative" }}>
+                  <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: d.dials ? `${(d.connects / d.dials) * 100}%` : 0, background: C.green, borderRadius: d.connects === d.dials ? "2px 2px 0 0" : 0 }} />
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: C.muted, marginTop: 3 }}>
+            <span>{st.days[0].d.slice(5)}</span>
+            <span>
+              <span style={{ color: C.blue }}>■</span> dials <span style={{ color: C.green }}>■</span> connected
+            </span>
+            <span>today</span>
+          </div>
+        </div>
+
+        <div style={card}>
+          <div style={head}>Connect rate by their local hour · 30 days</div>
+          {st.hours.every((h) => !h.dials) ? (
+            <div style={{ fontSize: 12, color: C.muted }}>Not enough calls with a known time zone yet — this fills in as you call.</div>
+          ) : (
+            <>
+              {st.hours.map((h) => (
+                <div key={h.hour} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+                  <span style={{ fontFamily: mono, fontSize: 10, color: C.muted, width: 34, textAlign: "right" }}>{hourLabel(h.hour)}</span>
+                  <div style={{ flex: 1, height: 9, background: C.bg, borderRadius: 3, overflow: "hidden", position: "relative" }}>
+                    <div style={{ width: `${(h.dials / maxHourDials) * 100}%`, height: "100%", background: "rgba(125,176,247,0.35)" }} />
+                    <div style={{ position: "absolute", top: 0, left: 0, width: `${(h.connects / maxHourDials) * 100}%`, height: "100%", background: C.green }} />
+                  </div>
+                  <span style={{ fontFamily: mono, fontSize: 10, color: h.dials >= 3 && bestHour && h.hour === bestHour.hour ? C.green : C.muted, width: 70 }}>
+                    {h.dials ? `${pct(h.connects / h.dials)} · ${h.dials}` : "—"}
+                  </span>
+                </div>
+              ))}
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+                {bestHour ? `Best so far: around ${hourLabel(bestHour.hour)} their time (${pct(bestHour.connects / bestHour.dials)} of ${bestHour.dials} dials).` : "Needs 3+ dials in an hour to rank it."}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div style={card}>
+          <div style={head}>Tries it took to reach someone</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 6 }}>
+            {st.tries.map((x) => stat(x.n < 5 ? `${x.n}${x.n === 1 ? "st" : x.n === 2 ? "nd" : x.n === 3 ? "rd" : "th"}` : "5th+", x.people, reachedTotal ? pct(x.people / reachedTotal) : ""))}
+          </div>
+          <div style={{ fontSize: 11, color: st.givenUp ? C.amber : C.muted, marginTop: 6, lineHeight: 1.45 }}>
+            {st.neverReached} called but never reached{st.givenUp ? ` — ${st.givenUp} of them only tried once` : ""}.
+          </div>
+        </div>
+
+        <div style={card} data-list-stats>
+          <div style={head}>By list</div>
+          {lists.map((l) => (
+            <div key={l.id || "none"} style={{ borderTop: `1px solid ${C.panelEdge}`, padding: "8px 0" }}>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                <button
+                  onClick={() => {
+                    setCallList(l.id || "");
+                    setCallsView("queue");
+                  }}
+                  style={{ background: "none", border: "none", padding: 0, fontFamily: sans, fontSize: 13, fontWeight: 800, color: C.ink, cursor: l.id ? "pointer" : "default", textAlign: "left", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                >
+                  {l.name}
+                </button>
+                <span style={{ fontSize: 10, color: C.muted, flexShrink: 0 }}>
+                  {l.accounts} accounts · {l.people} people{l.industry ? ` · ${l.industry}` : ""}
+                </span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: isDesktop ? "repeat(6, minmax(0, 1fr))" : "repeat(3, minmax(0, 1fr))", gap: 6, marginTop: 4 }}>
+                {stat("Called", `${l.called}/${l.dialable}`, pct(l.coverage))}
+                {stat("Dials", l.dials)}
+                {stat("Connected", l.connects, pct(l.rate), l.rate >= 0.25 ? C.green : C.ink)}
+                {stat("Meetings", l.meetings, "", l.meetings ? C.green : C.ink)}
+                {stat("On cadence", l.onCadence)}
+                {stat("Best hour", l.bestHour != null ? hourLabel(l.bestHour) : "—", l.hot ? `${l.hot} hot` : "")}
+              </div>
+            </div>
+          ))}
+        </div>
+      </>
+    );
+  };
 
   const renderCalls = () => {
     const uncalled = callQueue.filter((r) => r.calls === 0 && r.dialable).length;
@@ -12271,6 +13313,25 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             )}
             {r.inbound > 0 && <span style={{ color: C.green }}> · ↩ called you back{r.inbound > 1 ? ` ×${r.inbound}` : ""}</span>}
             {r.due && <span style={{ color: C.red, fontWeight: 800 }}> · ⚑ DUE {r.dueDate}</span>}
+            {(() => {
+              const rt = retryTiming(r.contact, r.account, clockNow);
+              if (!rt.want) return null;
+              return (
+                <span style={{ color: rt.ok ? C.green : C.muted }}>
+                  {" "}
+                  · ⏰ their {halfLabel(rt.want)}
+                  {rt.ok ? " — now" : rt.inHours != null ? ` in ~${rt.inHours}h` : ""}
+                </span>
+              );
+            })()}
+            {r.cad && (
+              <span style={{ color: r.cadCall ? C.amber : C.muted }}>
+                {" "}
+                · 🔁 {r.cad.index + 1}/{r.cad.total} {r.cad.vm ? "leave a voicemail" : r.cad.ch !== "call" ? `${CADENCE_CH[r.cad.ch].label} next` : ""}
+                {r.cad.ch !== "call" ? "" : ""}
+                {!r.cadCall && r.cad.due > today() ? ` · next ${r.cad.due}` : ""}
+              </span>
+            )}
             {/* knowing you last died at the opener changes how you open
                 this one — that's the whole point of tracking it */}
             {r.contact.callStage && (
@@ -12327,10 +13388,30 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
       </div>
       </div>
     );
+    const seg = (
+      <div data-calls-views style={{ display: "flex", gap: 4, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: 3, marginBottom: 12 }}>
+        {[
+          ["queue", "☎ Queue"],
+          ["plan", "📅 Today"],
+          ["score", "📊 Scoreboard"],
+        ].map(([k, lab]) => (
+          <button
+            key={k}
+            onClick={() => setCallsView(k)}
+            style={{ flex: 1, fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "7px 4px", borderRadius: 9, border: "none", cursor: "pointer", background: callsView === k ? "rgba(245,185,66,0.14)" : "transparent", color: callsView === k ? C.amber : C.muted }}
+          >
+            {lab}
+          </button>
+        ))}
+      </div>
+    );
+    if (callsView === "plan") return <>{seg}{renderCallPlan()}</>;
+    if (callsView === "score") return <>{seg}{renderScoreboard()}</>;
     return (
       <>
+        {seg}
         <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.55, marginBottom: 12 }}>
-          Everyone with a phone number, ordered by who&apos;s most worth calling — never-called first, then due, then longest since the last attempt. Closed contacts are left out.
+          Everyone with a phone number — today&apos;s due calls first, then never called, then longest since the last attempt. Closed and DNC leads are left out of plans.
         </div>
         {callOnly.length > 0 && (
           <div style={{ background: "rgba(245,185,66,0.08)", border: `1px solid ${C.amber}`, borderRadius: 12, padding: "10px 13px", marginBottom: 12 }}>
@@ -12480,6 +13561,15 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
               </div>
             )}
 
+            {(() => {
+              /* the plan lives on its own view; here just the count */
+              const dueToday = callQueue.filter((r) => r.callDue && r.dialable).length;
+              return dueToday > 0 ? (
+                <button onClick={() => setCallsView("plan")} style={{ width: "100%", textAlign: "left", background: "rgba(245,185,66,0.07)", border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "7px 11px", marginBottom: 10, fontSize: 12, color: C.amber, fontWeight: 700, cursor: "pointer", fontFamily: sans }}>
+                  📅 {dueToday} call{dueToday === 1 ? "" : "s"} due today — see today&apos;s plan →
+                </button>
+              ) : null;
+            })()}
             <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
               <div style={{ flex: 1, background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px" }}>
                 <div style={{ fontSize: 9, letterSpacing: "0.16em", color: C.muted }}>DIALABLE</div>
@@ -17145,7 +18235,16 @@ function ReapplySuggestionModal({ pendingApp, priorAttempts, onConfirm, onKeepNe
    exist rather than sitting in its own silo: a touch point (so the activity
    date, nurture clock and history timeline all move), optionally a ticked
    follow-up, and a status change when the outcome ends the pursuit. */
-function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES }) {
+const NEXT_STEP_OPTIONS = [
+  ["callback", "📞 Call back"],
+  ["email", "✉ Send an email"],
+  ["meeting", "📅 Meeting booked"],
+  ["nurture:30", "🌱 Nurture — 30 days"],
+  ["nurture:60", "🌱 Nurture — 60 days"],
+  ["nurture:90", "🌱 Nurture — 90 days"],
+  ["close", "✕ Nothing — close the lead"],
+];
+function ColdCallModal({ contact, company, account = null, onClose, onSave, closes = CALL_CLOSES }) {
   const [outcome, setOutcome] = useState("");
   /* "they called me back": a missed call of yours is what it usually answers */
   const missed = missedCallToReturn(contact);
@@ -17157,6 +18256,11 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
   const [tickFollowUp, setTickFollowUp] = useState(true);
   const [stage, setStage] = useState("");
   const [callbackDays, setCallbackDays] = useState(0);
+  /* after a conversation: what happens next (required) */
+  const [nextKind, setNextKind] = useState("");
+  const [emailDays, setEmailDays] = useState(1);
+  const [meetingDate, setMeetingDate] = useState("");
+  const cad = cadenceNext(contact);
   /* null = go with what the outcome implies; set once you say otherwise */
   const [connectedPick, setConnectedPick] = useState(null);
   const picked = callOutcome(outcome);
@@ -17198,6 +18302,13 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
           <div style={{ fontSize: 11, color: C.amber, marginBottom: 12 }}>No phone number saved for this contact.</div>
         )}
 
+        {cad && cad.ch === "call" && (
+          <div style={{ background: "rgba(245,185,66,0.07)", border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "7px 10px", marginBottom: 10, fontSize: 11, color: C.ink, lineHeight: 1.5 }}>
+            🔁 {cad.label} ({cad.index + 1}/{cad.total})
+            {cad.window ? ` · aim for their ${halfLabel(cad.window)}` : ""}
+            {cad.vm && <div style={{ color: C.muted }}>No answer? Leave a voicemail — about 20 seconds: your name, one reason they&apos;d care, your number twice. Log it as “Voicemail”.</div>}
+          </div>
+        )}
         {past.length > 0 && (
           <div style={{ background: C.bg, border: `1px solid ${C.panelEdge}`, borderRadius: 10, padding: "8px 10px", marginBottom: 12 }}>
             <div style={{ fontFamily: mono, fontSize: 9, letterSpacing: "0.12em", color: C.muted, marginBottom: 4 }}>
@@ -17350,9 +18461,66 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
             retry, and gating this on a connection meant the outcomes that most
             need a next attempt were the only ones that couldn't book one.
             Only the closing outcomes are excluded. */}
-        {picked && !closes.includes(picked.key) && (
+        {/* A conversation always ends with a next step — that's how someone
+            you spoke to stops slipping through. Required before saving. */}
+        {picked && connected && !closes.includes(picked.key) && (
           <>
-            <Label>{connected ? "Call back in…" : "Try again in…"}</Label>
+            <Label>What happens next?</Label>
+            <ChipSelect
+              value={nextKind}
+              onChange={(e) => {
+                const k = e.target.value;
+                setNextKind(k);
+                if (k === "callback" && !callbackDays) setCallbackDays(picked.autoCallback || 3);
+                if (k !== "callback") setCallbackDays(0);
+              }}
+              ariaLabel="What happens next"
+              active={!!nextKind}
+              color={C.green}
+              label={NEXT_STEP_OPTIONS.find(([k]) => k === nextKind)?.[1] || "Choose the next step…"}
+              style={{ width: "100%", boxSizing: "border-box", fontSize: 13, padding: "10px 26px 10px 12px", borderRadius: 10, marginBottom: 6, background: nextKind ? "rgba(74,222,128,0.08)" : "transparent", border: `1px solid ${nextKind ? C.green : C.amber}` }}
+            >
+              <option value="">Choose the next step…</option>
+              {NEXT_STEP_OPTIONS.map(([k, lab]) => (
+                <option key={k} value={k} data-next-step={k}>
+                  {lab}
+                </option>
+              ))}
+            </ChipSelect>
+            {nextKind === "email" && (
+              <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 6 }}>
+                {[
+                  [0, "today"],
+                  [1, "tomorrow"],
+                  [2, "in 2 days"],
+                ].map(([d, lab]) => (
+                  <button key={d} onClick={() => setEmailDays(d)} style={{ fontFamily: sans, fontSize: 11, fontWeight: 700, padding: "5px 10px", borderRadius: 14, cursor: "pointer", border: `1px solid ${emailDays === d ? C.amber : C.panelEdge}`, background: "transparent", color: emailDays === d ? C.amber : C.muted }}>
+                    {lab}
+                  </button>
+                ))}
+              </div>
+            )}
+            {nextKind === "meeting" && <input type="date" value={meetingDate} min={today()} onChange={(e) => setMeetingDate(e.target.value)} style={{ ...inputStyle, marginBottom: 6 }} />}
+            <div style={{ fontSize: 11, color: nextKind ? C.muted : C.amber, lineHeight: 1.5, marginBottom: 10 }}>
+              {!nextKind
+                ? "Pick one — every conversation ends with a next step."
+                : nextKind === "email"
+                ? `An email follow-up comes due ${emailDays === 0 ? "today" : addDays(today(), emailDays)} — the assistant can draft it from these notes.`
+                : nextKind === "meeting"
+                ? meetingDate
+                  ? `A confirmation email is due today, and the meeting shows up on ${meetingDate}.`
+                  : "Pick the meeting date."
+                : nextKind.startsWith("nurture:")
+                ? `They go on a ${nextKind.slice(8)}-day nurture plan.`
+                : nextKind === "close"
+                ? "Closes the lead — it leaves the queue and due lists."
+                : ""}
+            </div>
+          </>
+        )}
+        {picked && !closes.includes(picked.key) && (!connected || nextKind === "callback") && (
+          <>
+            <Label>{connected ? "Call back in…" : cad ? "Try again in… (your cadence decides if you don't)" : "Try again in…"}</Label>
             <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 4 }}>
               {/* an unanswered call is often worth retrying tomorrow at a
                   different time of day, which a 3-day minimum can't express */}
@@ -17380,7 +18548,17 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
               })}
             </div>
             <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
-              {callbackDays
+              {!connected && cad
+                ? callbackDays
+                  ? `Moves the cadence's next step to ${addDays(today(), callbackDays)}.`
+                  : `🔁 Cadence: next is ${(() => {
+                      const def = cad.def;
+                      const ni = cad.ch === "call" ? cad.index + 1 : cad.index;
+                      const st2 = ni < def.steps.length ? def.steps[ni] : null;
+                      const when = cad.ch === "call" ? cadenceDueAfter(def, cad.index, today()) : cad.due;
+                      return st2 ? `${st2.label.toLowerCase()}, on ${when}` : `a last call on ${when}`;
+                    })()} — no need to pick a date.`
+                : callbackDays
                 ? `Adds a follow-up due ${addDays(today(), callbackDays)} so it comes back in your due queue.`
                 : connected
                 ? "No call-back scheduled — this call just gets logged."
@@ -17425,7 +18603,10 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
         {/* a request you'll want to see again when you sit down to write */}
         {picked && connected && (
           <button
-            onClick={() => setWantsEmail(!wantsEmail)}
+            onClick={() => {
+              if (!wantsEmail && !nextKind) setNextKind("email");
+              setWantsEmail(!wantsEmail);
+            }}
             style={{
               width: "100%",
               boxSizing: "border-box",
@@ -17499,8 +18680,22 @@ function ColdCallModal({ contact, company, onClose, onSave, closes = CALL_CLOSES
             Cancel
           </Btn>
           <Btn
-            disabled={!outcome}
-            onClick={() => onSave({ outcome, notes, tickFollowUp, followUpIndex: nextUnticked, stage: connected ? stage : "", callbackDays, connected, temperature, wantsEmail: connected && wantsEmail, inbound })}
+            disabled={!outcome || (connected && picked && !closes.includes(picked.key) && (!nextKind || (nextKind === "meeting" && !meetingDate) || (nextKind === "callback" && !callbackDays)))}
+            onClick={() =>
+              onSave({
+                outcome,
+                notes,
+                tickFollowUp,
+                followUpIndex: nextUnticked,
+                stage: connected ? (nextKind === "meeting" && !stage ? "booked" : stage) : "",
+                callbackDays: connected && nextKind !== "callback" ? 0 : callbackDays,
+                connected,
+                temperature,
+                wantsEmail: connected && wantsEmail,
+                inbound,
+                nextStep: connected && nextKind ? { kind: nextKind, ...(nextKind === "email" ? { days: emailDays } : {}), ...(nextKind === "meeting" ? { date: meetingDate } : {}) } : null,
+              })
+            }
             style={{ flex: 2 }}
           >
             Log call
@@ -17808,7 +19003,7 @@ function actionTargets(st, a) {
   const ids = Array.isArray(a.ids) ? a.ids : a.id ? [a.id] : [];
   return ids.map((id) => locateRecord(st, id)).filter((r) => r && r.kind !== "account");
 }
-const PERSON_ACTIONS = ["set_status", "set_nurture", "set_linkedin", "log_touchpoint", "tick_followup"];
+const PERSON_ACTIONS = ["set_status", "set_nurture", "set_linkedin", "log_touchpoint", "tick_followup", "set_cadence"];
 /* why this action can't apply to this person, or "" when it can */
 function personActionProblem(a, r) {
   const x = r.kind === "contact" ? r.c : r.app;
@@ -17817,6 +19012,13 @@ function personActionProblem(a, r) {
       return (r.kind === "contact" ? CONTACT_STATUSES : APP_STATUSES).includes(a.status ?? "") ? "" : `“${a.status}” isn't a ${r.kind === "contact" ? "contact" : "lead"} status`;
     case "set_nurture":
       return nurtureTrack(String(a.plan)) ? (r.kind === "contact" ? "" : "nurture plans are for account contacts here") : `“${a.plan}” isn't a plan (30, 60, 90 or refresh)`;
+    case "set_cadence":
+      if (r.kind !== "contact") return "cadences are for account contacts";
+      if (a.cadence === "stop") return cadenceActive(x) ? "" : "isn't on a cadence";
+      if (!cadenceDef(a.cadence)) return `“${a.cadence}” isn't a cadence (standard, highvalue, quick or stop)`;
+      if (!hasPhone(x)) return "no number to call";
+      if (isDnc(x, r.acc)) return "tagged DNC";
+      return "";
     case "set_linkedin":
       return LI_STATUSES.some((l) => l.key === (a.status ?? "")) ? (r.kind === "contact" ? "" : "LinkedIn status lives on account contacts") : `“${a.status}” isn't a LinkedIn status`;
     case "log_touchpoint":
@@ -17835,6 +19037,8 @@ function personActionWords(a) {
       return `status → ${a.status ? a.status : "not contacted"}`;
     case "set_nurture":
       return `🌱 ${nurtureTrack(String(a.plan))?.label || a.plan}`;
+    case "set_cadence":
+      return a.cadence === "stop" ? "⏹ stop their cadence" : `🔁 start the ${cadenceDef(a.cadence)?.label || a.cadence} cadence`;
     case "set_linkedin":
       return `LinkedIn → ${LI_META(a.status).label}`;
     case "log_touchpoint":
@@ -17851,6 +19055,14 @@ function personActionApply(a, x, kind) {
       return kind === "contact" ? setContactStatusPure(x, a.status || "") : setLeadStatusPure(x, a.status || "");
     case "set_nurture":
       return applyNurtureTrack(x, String(a.plan));
+    case "set_cadence": {
+      if (a.cadence === "stop") return stopCadence(x, "stopped by you");
+      /* picks up after their last call if they've had one */
+      const prior = (x.touchpoints || []).filter(isCallTouch);
+      const last = prior.filter(isOutboundCall).map((t) => t.at || `${t.date}T12:00:00`).sort().pop();
+      const n = startCadence({ ...x, cadence: undefined }, a.cadence, last ? { firstCallAt: last } : {});
+      return { ...n, cadence: { ...n.cadence, used: prior.map((t) => t.id) } };
+    }
     case "set_linkedin":
       return { ...x, liStatus: a.status || "", liStatusAt: a.status ? today() : "", history: withLog(x, [logEntry("linkedin", `LinkedIn → ${LI_META(a.status).label} (assistant)`)]).history };
     case "log_touchpoint":
@@ -18157,6 +19369,7 @@ PEOPLE — each takes "id", or "ids":[…], or "criteria":{ same as find } for e
 - {"type":"set_linkedin","id":"…","status":"requested"|"connected"|"declined"|"withdrawn"|"na"|"blocked"|""}
 - {"type":"log_touchpoint","id":"…","channel":"Cold email","note":"…","date":"YYYY-MM-DD (default today)","sent":["video"|"voicenote"|"content"]}   (something the user already did)
 - {"type":"tick_followup","id":"…","track":"email"|"call"}   (marks the next pending follow-up done today — only when the user says they did it)
+- {"type":"set_cadence","id":"…","cadence":"standard"|"highvalue"|"quick"|"stop"}   (puts someone not yet reached on a call cadence — calls on set days at the other half of their day, a voicemail, LinkedIn and emails — or stops it. Ends by itself on a connected call or reply)
 - {"type":"temperature","criteria":{…},"value":"hot"} also works in bulk
 ACCOUNTS & CONTACTS:
 - {"type":"create_account","company":"Acme","website":"acme.com","industry":"SaaS","lists":["list"]}
@@ -18363,6 +19576,7 @@ function describeAgentAction(st, a, plannedLists = new Set()) {
     case "set_nurture":
     case "set_linkedin":
     case "log_touchpoint":
+    case "set_cadence":
     case "tick_followup": {
       const targets = actionTargets(st, a);
       if (!targets.length) return bad(`${personActionWords(a)}: ${a.criteria ? `nobody matches ${findSummary(a.criteria, st)}` : `no contact or lead with id ${a.id || (a.ids || []).join(", ")}`}`);
@@ -18500,6 +19714,7 @@ function runAgentActions(st0, reviewed) {
       case "set_nurture":
       case "set_linkedin":
       case "log_touchpoint":
+      case "set_cadence":
       case "tick_followup":
         actionTargets(st, a)
           .filter((t) => !personActionProblem(a, t))
@@ -20622,6 +21837,20 @@ function DraftCard({ d, state, onApply, onOpen }) {
           {sent ? "✓ Logged as sent" : "✓ Mark as sent"}
         </Btn>
       </div>
+    </div>
+  );
+}
+/* A compact dropdown for phones: a small label, with the real (invisible)
+   select laid over it. iOS needs selects at 16px or it zooms the page, which
+   made these the biggest things on screen. */
+function ChipSelect({ value, onChange, label, color, active, children, ariaLabel, style }) {
+  return (
+    <div style={{ position: "relative", display: "flex", alignItems: "center", minWidth: 0, fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "8px 24px 8px 11px", borderRadius: 18, border: `1px solid ${active ? color : C.panelEdge}`, background: active ? "rgba(125,176,247,0.08)" : "transparent", color: active ? color : C.muted, ...style }}>
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
+      <span style={{ position: "absolute", right: 9, fontSize: 9, opacity: 0.8 }}>▾</span>
+      <select aria-label={ariaLabel} value={value} onChange={onChange} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }}>
+        {children}
+      </select>
     </div>
   );
 }
