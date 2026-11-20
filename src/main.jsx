@@ -158,7 +158,16 @@ const iso = (d) => {
   const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
   return z.toISOString().slice(0, 10);
 };
-const fmtShort = (d) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+/* one formatter, made once: toLocaleDateString builds a new one on every
+   call, and the week tables call this for every entry */
+const SHORT_DATE_FMT = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" });
+const fmtShort = (d) => {
+  try {
+    return SHORT_DATE_FMT.format(d);
+  } catch (e) {
+    return "Invalid Date";
+  }
+};
 const weekLabel = (mon) => {
   const sat = new Date(mon);
   sat.setDate(sat.getDate() + 5);
@@ -252,15 +261,36 @@ const TLD_TZ = [
   [".ph", "Asia/Manila"], [".sg", "Asia/Singapore"], [".ie", "Europe/Dublin"], [".ca", "America/Toronto"], [".de", "Europe/Berlin"], [".nl", "Europe/Amsterdam"], [".be", "Europe/Brussels"],
   [".fr", "Europe/Paris"], [".es", "Europe/Madrid"], [".it", "Europe/Rome"], [".in", "Asia/Kolkata"], [".ae", "Asia/Dubai"], [".za", "Africa/Johannesburg"], [".hk", "Asia/Hong_Kong"], [".jp", "Asia/Tokyo"],
 ];
+/* Time-zone work is cached. Building an Intl formatter costs far more than
+   using one, and the call queue asks about every contact's zone on every
+   render — uncached, that alone took seconds per tap on a phone. */
+const TZ_VALID = new Map();
 const validTz = (tz) => {
   if (!tz) return false;
+  const hit = TZ_VALID.get(tz);
+  if (hit !== undefined) return hit;
+  let ok;
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: tz });
-    return true;
+    ok = true;
   } catch (e) {
-    return false;
+    ok = false;
   }
+  if (typeof tz === "string") TZ_VALID.set(tz, ok);
+  return ok;
 };
+const TZ_PARTS_FMT = new Map();
+const tzPartsFmt = (tz) => {
+  let f = TZ_PARTS_FMT.get(tz);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+    TZ_PARTS_FMT.set(tz, f);
+  }
+  return f;
+};
+/* a zone's wall clock only changes once a minute, so the answer is kept per
+   zone + minute + opening hours */
+const CALL_WINDOW_CACHE = new Map();
 /* what a number alone says: { tz, how: "area" | "country" | "guess" } */
 function tzFromPhone(phone) {
   const t = String(phone || "").trim();
@@ -313,7 +343,19 @@ const hoursOf = (acc) => {
    real now, wherever you are, read off their wall clock. */
 function callWindowAt(tz, now = new Date(), hours = null) {
   if (!validTz(tz)) return { window: "unknown" };
-  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(now).map((p) => [p.type, p.value]));
+  const ms = +now;
+  /* a bad timestamp on an old touch point used to throw and blank the tab */
+  if (!Number.isFinite(ms)) return { window: "unknown" };
+  const key = `${tz}|${Math.floor(ms / 60000)}|${hours ? `${hours.open}-${hours.close}-${(hours.days || []).join("")}` : ""}`;
+  const hit = CALL_WINDOW_CACHE.get(key);
+  if (hit) return { ...hit };
+  const res = callWindowCompute(tz, ms, hours);
+  if (CALL_WINDOW_CACHE.size > 20000) CALL_WINDOW_CACHE.clear();
+  CALL_WINDOW_CACHE.set(key, res);
+  return { ...res };
+}
+function callWindowCompute(tz, ms, hours) {
+  const parts = Object.fromEntries(tzPartsFmt(tz).formatToParts(ms).map((p) => [p.type, p.value]));
   const hour = (+parts.hour % 24) + +parts.minute / 60;
   const open = hours ? hours.open : BUSINESS_START;
   const close = hours ? hours.close : BUSINESS_END;
@@ -328,7 +370,8 @@ const tzCity = (tz) => String(tz || "").split("/").pop().replace(/_/g, " ");
 function callWindowOf(c, acc, now = new Date()) {
   const z = tzOf(c, acc);
   if (!z) return { window: "unknown", tz: "", source: "" };
-  return { ...callWindowAt(z.tz, now, hoursOf(acc)), tz: z.tz, source: z.source, guess: !!z.guess, hours: hoursOf(acc) };
+  const hours = hoursOf(acc);
+  return { ...callWindowAt(z.tz, now, hours), tz: z.tz, source: z.source, guess: !!z.guess, hours };
 }
 /* "business", "after", "closed", "unknown", or "callable" (business or after) */
 const WIN_RANK = { business: 0, after: 1, unknown: 2, closed: 3 };
@@ -422,6 +465,17 @@ const tagsOf = (x) => (Array.isArray(x?.tags) ? x.tags.filter(Boolean) : []);
 /* "business consulting", "Business-Consulting" and "#business_consulting"
    are one tag when filtering */
 const tagKey = (t) => normTag(t).replace(/^#/, "").replace(/[\s_]+/g, "-");
+/* each tag once for display — imports can carry "AU" and "au" side by side,
+   and two chips with the same key made React drop or repeat chips */
+const uniqueTags = (x) => {
+  const seen = new Set();
+  return tagsOf(x).filter((t) => {
+    const k = tagKey(t);
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+};
 /* Do Not Call: a DNC tag on the person, or on their company, keeps them out
    of every call run the assistant builds. Spellings people actually use. */
 const DNC_TAG_RE = /^(dnc|d\.n\.c\.?|dnc list|do[\s_-]*not[\s_-]*call|donotcall|don'?t[\s_-]*call|no[\s_-]*calls?|never[\s_-]*call)$/i;
@@ -3350,8 +3404,25 @@ async function loadSnapshots() {
   }
   return list;
 }
+/* The list is 14 full copies of the CRM. The app only needs their dates and
+   counts until you restore or export one, so a small index is kept beside
+   it: opening the app reads the index, not every copy (which also kept all
+   14 in memory the whole time). */
+const SNAP_INDEX_KEY = "fd-snapshots-index";
+const snapMeta = (x) => ({ date: x?.date || "", at: x?.at || "", summary: x?.summary || {}, preRestore: !!x?.preRestore, note: x?.note || "" });
+const sameSnap = (a, b) => !!a && !!b && a.date === b.date && !!a.preRestore === !!b.preRestore && (a.at || "") === (b.at || "");
 async function saveSnapshots(list) {
-  return idbStore.set(SNAP_KEY, (list || []).slice(0, SNAP_KEEP));
+  const kept = (list || []).slice(0, SNAP_KEEP);
+  const ok = await idbStore.set(SNAP_KEY, kept);
+  if (ok) await idbStore.set(SNAP_INDEX_KEY, kept.map(snapMeta));
+  return ok;
+}
+async function loadSnapshotIndex() {
+  const idx = await idbStore.get(SNAP_INDEX_KEY);
+  if (Array.isArray(idx)) return idx;
+  const meta = (await loadSnapshots()).map(snapMeta);
+  await idbStore.set(SNAP_INDEX_KEY, meta);
+  return meta;
 }
 /* a snapshot is worth taking only if there's something in it — an empty state
    would otherwise overwrite a good history on a fresh install or failed load */
@@ -3594,7 +3665,19 @@ function insertCallback(contacted, fus, daysFromToday) {
    necessarily the earliest by date — a phone follow-up listed second can fall
    due before an email listed first. Picking by index would have reported the
    later date and hidden an overdue call from the due queue. */
+/* worked out once per record — lists, sorts and badges ask for it thousands
+   of times per render. The answer depends only on the fields below, so it's
+   kept with them and recomputed if any of them was swapped out. */
+const NEXT_FU_CACHE = new WeakMap();
 const nextFollowUp = (a) => {
+  if (!a || typeof a !== "object") return nextFollowUpCompute(a);
+  const hit = NEXT_FU_CACHE.get(a);
+  if (hit && hit.f === a.followUps && hit.d === a.followUpDays && hit.c === a.contacted && hit.n === a.nurturedAt && hit.k === a.callAnchor) return hit.v;
+  const v = nextFollowUpCompute(a);
+  NEXT_FU_CACHE.set(a, { v, f: a.followUps, d: a.followUpDays, c: a.contacted, n: a.nurturedAt, k: a.callAnchor });
+  return v;
+};
+const nextFollowUpCompute = (a) => {
   if (!anchorOf(a) && !phoneAnchorOf(a)) return null;
   const fus = normFollowUps(a);
   let best = null;
@@ -4030,6 +4113,16 @@ function buildSyncBase(state) {
   };
   if (isPlainObj(state)) walk(state, "@");
   return B;
+}
+/* The base is only read when two copies are merged (a pull that brought
+   changes, or a boot after another device saved). So a sync pack carries the
+   server copy it describes (baseSrc) and the fingerprint is built from it on
+   first use — building it after every save cost ~0.1s on a laptop and ~0.5s
+   on a phone, for a value that's usually never read. */
+function syncBaseOf(pack) {
+  if (!pack) return null;
+  if (pack.base == null && pack.baseSrc) pack.base = buildSyncBase(pack.baseSrc);
+  return pack.base || null;
 }
 function merge3Obj(L, R, key, B) {
   const fb = key ? B[key] : null;
@@ -5065,14 +5158,14 @@ function keepServerItems(st, server, kinds) {
 }
 const newSyncEpoch = () => new Date().toISOString() + "-" + Math.random().toString(36).slice(2, 8);
 const STALE_MS = 24 * 60 * 60 * 1000;
-async function rpc(fn, args, timeoutMs = 6000) {
+async function rpc(fn, args, timeoutMs = 6000, rawBody = null) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(`${SUPA_URL}/rest/v1/rpc/${fn}`, {
       method: "POST",
       headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, "content-type": "application/json" },
-      body: JSON.stringify(args),
+      body: rawBody != null ? rawBody : JSON.stringify(args),
       signal: ctrl.signal,
     });
     if (!r.ok) {
@@ -5486,6 +5579,9 @@ export default function FlightDeck() {
   const [callFilter, setCallFilter] = useState("");
   const [callAttempts, setCallAttempts] = useState("");
   const [callList, setCallList] = useState("");
+  const [callShow, setCallShow] = useState({ key: "", n: 50 }); /* how much of the queue remainder is drawn */
+  const [pipeShow, setPipeShow] = useState({ key: "", n: 30 }); /* rows drawn on the applications page */
+  const [accShow, setAccShow] = useState({ key: "", n: 50 }); /* rows drawn on the accounts page */
   /* the queue's local-time labels move with the clock */
   const [clockNow, setClockNow] = useState(() => new Date());
   useEffect(() => {
@@ -5814,6 +5910,7 @@ export default function FlightDeck() {
       let trusted = false;
       let localRev = null;
       let localBase = null;
+      let localBaseSrc = null;
       let savedAt = 0;
       const rec = await idbStore.get("local");
       if (rec && rec.key === key && rec.state) {
@@ -5822,6 +5919,7 @@ export default function FlightDeck() {
           localCoach = { ...DEFAULT_COACH, ...(rec.coach || {}) };
           localRev = rec.rev ?? null;
           localBase = rec.base || null;
+          localBaseSrc = rec.baseState || null;
           savedAt = rec.savedAt || 0;
           trusted = true;
         } catch (e) {
@@ -5862,10 +5960,10 @@ export default function FlightDeck() {
             nextState = local;
             nextCoach = localCoach || rc || DEFAULT_COACH;
           } else {
-            nextState = mergeStates(local, rd, localBase);
+            nextState = mergeStates(local, rd, localBase || (localBaseSrc ? buildSyncBase(localBaseSrc) : null));
             nextCoach = rc ? mergeCoach(localCoach || DEFAULT_COACH, rc) : localCoach || DEFAULT_COACH;
           }
-          pack = { rev: rrev, base: buildSyncBase(rd), server: { data: rd, coach: remote.coach ?? null, json: JSON.stringify(rd) + "|" + JSON.stringify(remote.coach ?? null) } };
+          pack = { rev: rrev, base: null, baseSrc: rd, server: { data: rd, coach: remote.coach ?? null, json: JSON.stringify(rd) + "|" + JSON.stringify(remote.coach ?? null) } };
         } else {
           /* nothing on the server for this code yet */
           nextState = (trusted ? local : legacy) || DEFAULT_STATE;
@@ -5878,7 +5976,7 @@ export default function FlightDeck() {
            has been read and merged (see flushSave). */
         nextState = (trusted ? local : legacy) || DEFAULT_STATE;
         nextCoach = (trusted ? localCoach : legacyCoach) || DEFAULT_COACH;
-        pack = trusted ? { rev: localRev, base: localBase, server: null } : { rev: null, base: null, server: null };
+        pack = trusted ? { rev: localRev, base: localBase, baseSrc: localBaseSrc, server: null } : { rev: null, base: null, server: null };
         setSyncStatus("offline");
       }
       setSync(pack);
@@ -5907,24 +6005,31 @@ export default function FlightDeck() {
      restore or delete without needing the modal reopened */
   const [snapshots, setSnapshots] = useState([]);
   const snapChecked = useRef(false);
-  const refreshSnapshots = async () => setSnapshots(await loadSnapshots());
-  const addSnapshot = async (entry, { replaceTodayPre = false } = {}) => {
+  /* the list on screen holds dates and counts only — see SNAP_INDEX_KEY */
+  const addSnapshot = async (entry, { replaceTodayPre = false, dailyOnce = false } = {}) => {
     const list = await loadSnapshots();
+    if (dailyOnce && list.some((x) => x.date === entry.date && !x.preRestore)) {
+      setSnapshots(list.map(snapMeta));
+      return true;
+    }
     const rest = replaceTodayPre ? list.filter((x) => !(x.date === today() && x.preRestore)) : list;
-    const ok = await saveSnapshots([entry, ...rest]);
+    const next = [entry, ...rest];
+    const ok = await saveSnapshots(next);
     if (!ok) flash("⚠ Couldn't store the snapshot on this device (storage full?)");
-    await refreshSnapshots();
+    setSnapshots((ok ? next : list).slice(0, SNAP_KEEP).map(snapMeta));
     return ok;
   };
+  /* the full copy behind a row of the list */
+  const snapshotData = async (snap) => (snap?.data ? snap : (await loadSnapshots()).find((x) => sameSnap(x, snap))) || null;
   useEffect(() => {
     if (!loaded || snapChecked.current) return;
     snapChecked.current = true;
     (async () => {
-      const list = await loadSnapshots();
-      setSnapshots(list);
+      const idx = await loadSnapshotIndex();
+      setSnapshots(idx);
       if (!snapshotWorthKeeping(state)) return;
-      if (list.some((x) => x.date === today() && !x.preRestore)) return; /* already have one for today */
-      await addSnapshot({ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state });
+      if (idx.some((x) => x.date === today() && !x.preRestore)) return; /* already have one for today */
+      await addSnapshot({ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state }, { dailyOnce: true });
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
@@ -5936,14 +6041,21 @@ export default function FlightDeck() {
   /* a restore starts a new sync epoch, so other devices take it as a whole
      instead of merging their own copies back into it */
   const restoreSnapshot = async (snap) => {
-    if (!snap?.data) return;
+    /* read the copy BEFORE taking the pre-restore snapshot: that step replaces
+       today's earlier pre-restore copy, which may be the one being restored */
+    const full = await snapshotData(snap);
+    if (!full?.data) return flash("That snapshot couldn't be loaded");
     await addSnapshot({ date: today(), at: new Date().toISOString(), summary: snapshotSummary(state), data: state, preRestore: true }, { replaceTodayPre: true });
-    setState({ ...migrate(snap.data), syncEpoch: newSyncEpoch() });
-    flash(`↺ Restored ${snap.date} — sync will push it to your other devices`);
+    setState({ ...migrate(full.data), syncEpoch: newSyncEpoch() });
+    flash(`↺ Restored ${full.date} — sync will push it to your other devices`);
   };
-  const deleteSnapshot = async (date) => {
-    await saveSnapshots((await loadSnapshots()).filter((x) => x.date !== date));
-    await refreshSnapshots();
+  /* removes just that one — deleting a "before restore" copy used to take the
+     same day's daily snapshot with it */
+  const deleteSnapshot = async (snap) => {
+    const list = await loadSnapshots();
+    const next = typeof snap === "string" ? list.filter((x) => x.date !== snap) : list.filter((x) => !sameSnap(x, snap));
+    await saveSnapshots(next);
+    setSnapshots(next.slice(0, SNAP_KEEP).map(snapMeta));
     flash("Snapshot removed");
   };
   /* Restores from a file. Kept separate from the snapshot list because it's
@@ -5972,9 +6084,11 @@ export default function FlightDeck() {
   };
 
   /* an off-device copy: the one thing that survives losing the browser */
-  const exportSnapshot = (snap) => {
+  const exportSnapshot = async (snap) => {
     try {
-      const blob = new Blob([JSON.stringify(snap.data, null, 2)], { type: "application/json" });
+      const full = await snapshotData(snap);
+      if (!full?.data) return flash("That snapshot couldn't be loaded");
+      const blob = new Blob([JSON.stringify(full.data, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -6004,8 +6118,13 @@ export default function FlightDeck() {
       schedulePersist(200);
       return false;
     }
-    const { rev, base } = syncRef.current;
-    const ok = await idbStore.set("local", { key: syncKeyRef.current, rev, base, state: st, coach: co, savedAt: Date.now() });
+    const { rev, base, baseSrc } = syncRef.current;
+    /* the base travels as the server copy it describes; it shares almost all
+       of its records with the state, and IndexedDB stores shared objects once */
+    const rec = { key: syncKeyRef.current, rev, state: st, coach: co, savedAt: Date.now() };
+    if (baseSrc) rec.baseState = baseSrc;
+    else rec.base = base;
+    const ok = await idbStore.set("local", rec);
     if (ok) {
       setLocalWarn("");
       if (!legacyCleanedRef.current) {
@@ -6037,11 +6156,12 @@ export default function FlightDeck() {
     const rev = remote?.rev ?? 0;
     const pack = {
       rev,
-      base: rd ? buildSyncBase(rd) : null,
+      base: null,
+      baseSrc: rd,
       server: { data: rd, coach: remote?.coach ?? null, json: rd ? JSON.stringify(rd) + "|" + JSON.stringify(remote?.coach ?? null) : null },
     };
     setState((prev) => {
-      const next = !rd ? prev : replace ? rd : mergeStates(prev, rd, syncRef.current.base);
+      const next = !rd ? prev : replace ? rd : mergeStates(prev, rd, syncBaseOf(syncRef.current));
       setSync(pack);
       return next === prev || JSON.stringify(next) === JSON.stringify(prev) ? prev : next;
     });
@@ -6101,10 +6221,16 @@ export default function FlightDeck() {
       }
       const { state: sent, coach: sentCoach } = latestRef.current;
       const { rev, server } = syncRef.current;
-      const sentJson = JSON.stringify(sent) + "|" + JSON.stringify(sentCoach ?? null);
+      const stateJson = JSON.stringify(sent);
+      const coachJson = JSON.stringify(sentCoach ?? null);
+      const sentJson = stateJson + "|" + coachJson;
       let wrote = false;
       if (server.json && server.json === sentJson) {
-        /* the server already has exactly this */
+        /* the server already has exactly this. Point the pack at the on-screen
+           copy (same content): the local cache then stores one tree instead
+           of two, and the separate server copy can be freed */
+        syncRef.current.baseSrc = sent;
+        syncRef.current.server = { ...server, data: sent };
       } else {
         const force = forceNextRef.current;
         if (!force) {
@@ -6116,12 +6242,15 @@ export default function FlightDeck() {
             return;
           }
         }
-        const res = await rpc("fd_put", { k, d: sent, c: sentCoach, expected: rev, force: !!force }, 30000);
+        /* the state is already serialized above — the body reuses it rather
+           than serializing the whole thing a second time */
+        const body = `{"k":${JSON.stringify(k)},"d":${stateJson}${sentCoach === undefined ? "" : `,"c":${coachJson}`},"expected":${JSON.stringify(rev)},"force":${!!force}}`;
+        const res = await rpc("fd_put", null, 30000, body);
         if (res && res.ok) {
           forceNextRef.current = false;
           /* the server now holds exactly what was sent; the state on screen
              already contains it (plus anything typed since) */
-          setSync({ rev: res.rev, base: buildSyncBase(sent), server: { data: sent, coach: sentCoach ?? null, json: sentJson } });
+          setSync({ rev: res.rev, base: null, baseSrc: sent, server: { data: sent, coach: sentCoach ?? null, json: sentJson } });
           if (latestRef.current.state === sent) latestRef.current = { ...latestRef.current, stamp: syncRef.current.stamp };
           setPersistTick((t) => t + 1);
           wrote = true;
@@ -6334,14 +6463,21 @@ export default function FlightDeck() {
     };
   }, [loaded, keyVersion, pullRemote]);
 
+  /* one timer for the toast: two messages in a row used to share the screen
+     time, the first one's timer cutting the second off early */
+  const toastTimer = useRef(null);
   const flash = (msg) => {
     setToast(msg);
-    setTimeout(() => setToast(""), 1600);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(""), 1600);
   };
 
   const mutate = useCallback((fn, msg) => {
     setState((prev) => {
-      undoStack.current = [JSON.parse(JSON.stringify(prev)), ...undoStack.current].slice(0, 3);
+      /* state is never edited in place, so the previous state object IS the
+         undo point — deep-copying the whole CRM on every edit cost ~0.2s on
+         a phone */
+      undoStack.current = [prev, ...undoStack.current].slice(0, 3);
       setUndoCount(undoStack.current.length);
       /* every change moves cadences along — whichever screen logged the touch */
       return cadenceSweep(fn(prev));
@@ -8676,7 +8812,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
          saves to it straight away (the usual save picks it up) */
       setSync({
         rev: remote?.rev ?? 0,
-        base: rd ? buildSyncBase(rd) : null,
+        base: null,
+        baseSrc: rd,
         server: { data: rd, coach: remote?.coach ?? null, json: rd ? JSON.stringify(rd) + "|" + JSON.stringify(remote?.coach ?? null) : null },
       });
       setState(nextState);
@@ -9617,6 +9754,12 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     const dueQueuedIds = new Set(dueSplit.queued.map((a) => a.id));
     const visible = pipeFilter === "due" && dueSplit.queued.length > 0 && !showQueuedDue ? dueSplit.batch : shown;
     const shownPage = visible.slice(pipePage * PAGE_SIZE, (pipePage + 1) * PAGE_SIZE);
+    /* a page draws 30 rows first and the rest as you scroll — each row is a
+       full set of editable cells, and 100 at once took ~1s on a phone */
+    const pipeShowKey = `${pipePage}|${pipeFilter}|${pipeSearch}|${pipeSourceFilter}|${pipeStatusFilter}|${showQueuedDue}`;
+    const pipeShowN = pipeShow.key === pipeShowKey ? pipeShow.n : ROWS_STEP;
+    const pageRows = shownPage.slice(0, pipeShowN);
+    const pageMore = <AutoMore shown={pageRows.length} total={shownPage.length} step={ROWS_STEP} onMore={() => setPipeShow({ key: pipeShowKey, n: pipeShowN + ROWS_STEP })} />;
 
     const totalContacts = (state.accounts || []).reduce((s, a) => s + (a.contacts || []).length, 0);
     const realApplicationsCount = apps.filter((a) => !a.fromAccountContact && !a.archivedAt).length;
@@ -10133,7 +10276,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </tr>
               </thead>
               <tbody>
-                {shownPage.map((a) => {
+                {pageRows.map((a) => {
                   const nf = nextFollowUp(a);
                   const due = isDue(a);
                   const fus = normFollowUps(a);
@@ -10517,6 +10660,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </table>
           </div>
         )}
+        {visible.length > 0 && isDesktop && pageMore}
         {visible.length > 0 && isDesktop && <Pagination page={pipePage} setPage={setPipePage} total={visible.length} />}
 
         {shown.length > 0 && !isDesktop && (
@@ -10541,7 +10685,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 </tr>
               </thead>
               <tbody>
-                {shownPage.map((a) => {
+                {pageRows.map((a) => {
                   const nf = nextFollowUp(a);
                   const due = isDue(a);
                   const fus = normFollowUps(a);
@@ -10733,6 +10877,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </table>
           </div>
         )}
+        {visible.length > 0 && !isDesktop && pageMore}
         {visible.length > 0 && !isDesktop && <Pagination page={pipePage} setPage={setPipePage} total={visible.length} />}
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
           {isDesktop
@@ -10745,12 +10890,15 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
     );
   };
 
-  const renderAccounts = () => {
+  /* The accounts filter menu shows ~35 counts, each a pass over every
+     contact. Worked out once per change to the accounts (and once a day,
+     since several depend on dates) instead of on every keystroke. */
+  const accFilterMemo = useRef({ src: null, day: "", v: null });
+  const accountFilterData = () => {
+    const day = today();
+    const m = accFilterMemo.current;
+    if (m.v && m.src === state.accounts && m.day === day) return m.v;
     const accounts = state.accounts || [];
-    /* Twelve filters in a flat row read as a wall. Grouped by the question
-       they answer — what am I looking at, what needs doing, where does the
-       relationship stand — so the one you want is findable rather than
-       remembered by position. */
     const allContacts = accounts.flatMap(liveContacts);
     const accFilterGroups = [
       {
@@ -10852,6 +11000,17 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
       }
     );
     const accFilters = accFilterGroups.flatMap((g) => g.items);
+    const v = { allContacts, accFilterGroups, tagCounts, allTags, personFilters, accFilters };
+    accFilterMemo.current = { src: state.accounts, day, v };
+    return v;
+  };
+  const renderAccounts = () => {
+    const accounts = state.accounts || [];
+    /* Twelve filters in a flat row read as a wall. Grouped by the question
+       they answer — what am I looking at, what needs doing, where does the
+       relationship stand — so the one you want is findable rather than
+       remembered by position. */
+    const { allContacts, accFilterGroups, tagCounts, allTags, personFilters, accFilters } = accountFilterData();
     /* the list picker narrows whatever filter is on — "hot leads in my SaaS list" */
     const activeList = (state.accountLists || []).find((l) => l.id === accList) || null;
     const inChosenList = (acc) => (!accList ? true : accList === "none" ? !(acc.listIds || []).some((id) => (state.accountLists || []).some((l) => l.id === id)) : (acc.listIds || []).includes(accList));
@@ -10925,7 +11084,11 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             .sort()[0] || "9999-12-31";
         return soonest(a).localeCompare(soonest(b)) || (a.company || "").localeCompare(b.company || "");
       });
-    const shownAccountsPage = shownAccounts.slice(accPage * PAGE_SIZE, (accPage + 1) * PAGE_SIZE);
+    const accShowKey = `${accPage}|${accFilter}|${accSearch}|${accList}`;
+    const accShowN = accShow.key === accShowKey ? accShow.n : LIST_STEP;
+    const accMore = (total) => <AutoMore shown={Math.min(accShowN, total)} total={total} onMore={() => setAccShow({ key: accShowKey, n: accShowN + LIST_STEP })} />;
+    const shownAccountsPage = shownAccounts.slice(accPage * PAGE_SIZE, (accPage + 1) * PAGE_SIZE).slice(0, accShowN);
+    const accPageLen = shownAccounts.slice(accPage * PAGE_SIZE, (accPage + 1) * PAGE_SIZE).length;
 
     const rowsDesktop = shownAccounts.length > 0 && isDesktop;
     const rowsMobile = shownAccounts.length > 0 && !isDesktop;
@@ -10991,7 +11154,8 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
               : a._company.localeCompare(b._company)
           )
       : [];
-    const flatContactsPage = flatContacts.slice(accPage * PAGE_SIZE, (accPage + 1) * PAGE_SIZE);
+    const flatContactsFull = flatContacts.slice(accPage * PAGE_SIZE, (accPage + 1) * PAGE_SIZE);
+    const flatContactsPage = flatContactsFull.slice(0, accShowN);
 
     return (
       <>
@@ -11397,6 +11561,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
                 );
               })}
             </div>
+            {accMore(flatContactsFull.length)}
             <Pagination page={accPage} setPage={setAccPage} total={flatContacts.length} />
             <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>Tap a contact to open their account and edit details.</div>
           </>
@@ -11563,6 +11728,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             </table>
           </div>
         )}
+        {rowsDesktop && accMore(accPageLen)}
         {rowsDesktop && <Pagination page={accPage} setPage={setAccPage} total={shownAccounts.length} />}
 
         {rowsMobile && (
@@ -11642,6 +11808,7 @@ Structure the arc: (1) a brief settling opening — one slow breath together; (2
             })}
           </div>
         )}
+        {rowsMobile && accMore(accPageLen)}
         {rowsMobile && <Pagination page={accPage} setPage={setAccPage} total={shownAccounts.length} />}
 
         <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
@@ -12814,6 +12981,23 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
           (a.company || "").localeCompare(b.company || "")
       );
   }, [state.accounts, state.callSession]);
+  /* The filter menu shows a count beside every option. Worked out once per
+     queue change (and once a minute, since the local-time options move with
+     the clock) — on every render it was ~30 passes over the whole queue. */
+  const callCountsRef = useRef({ queue: null, minute: null, counts: {} });
+  const callFilterCounts = () => {
+    const minute = Math.floor(clockNow.getTime() / 60000);
+    const m = callCountsRef.current;
+    if (m.queue !== callQueue || m.minute !== minute) {
+      const unpicked = callQueue.filter((r) => r.pick === -1);
+      const counts = {};
+      CALL_FILTERS.forEach((x) => {
+        counts[x.key] = unpicked.filter(x.test).length;
+      });
+      callCountsRef.current = { queue: callQueue, minute, counts };
+    }
+    return callCountsRef.current.counts;
+  };
 
   /* ---- 📅 Today: the daily calling plan ---- */
   const renderCallPlan = () => {
@@ -13065,7 +13249,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const card = { background: C.panel, border: `1px solid ${C.panelEdge}`, borderRadius: 12, padding: "10px 12px", marginBottom: 10 };
     const head = { fontFamily: mono, fontSize: 9, letterSpacing: "0.14em", textTransform: "uppercase", color: C.muted, marginBottom: 6 };
     const stat = (label, v, sub, col = C.ink) => (
-      <div style={{ minWidth: 0 }}>
+      <div key={label} style={{ minWidth: 0 }}>
         <div style={{ fontSize: 9, letterSpacing: "0.12em", color: C.muted, textTransform: "uppercase" }}>{label}</div>
         <div style={{ fontFamily: mono, fontSize: 18, fontWeight: 700, color: col }}>{v}</div>
         {sub && <div style={{ fontSize: 10, color: C.muted }}>{sub}</div>}
@@ -13206,6 +13390,11 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
     const attemptsTyped = callAttempts.trim() !== "";
     const callListObj = (state.accountLists || []).find((l) => l.id === callList) || null;
     const rest = unpicked.filter((r) => matches(r) && (!activeFilter || activeFilter.test(r)) && (!attemptsTest || attemptsTest(r.calls)) && (!callListObj || r.listIds.includes(callListObj.id)));
+    const filterCounts = callFilterCounts();
+    /* the remainder draws 50 rows at a time, more as you scroll — the whole
+       queue at once was ~14,000 elements and froze phones for seconds */
+    const showKey = `${callSearch}|${callFilter}|${callAttempts}|${callList}`;
+    const showN = callShow.key === showKey ? callShow.n : LIST_STEP;
     const hiddenBySearch = unpicked.length - rest.length;
     const narrowed = !!q || !!activeFilter || !!attemptsTest || !!callListObj;
     const addShownToRun = () => {
@@ -13695,7 +13884,7 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
                   <optgroup key={g.label} label={g.label}>
                     {g.items.map((x) => (
                       <option key={x.key} value={x.key}>
-                        {x.label} ({unpicked.filter(x.test).length})
+                        {x.label} ({filterCounts[x.key] ?? 0})
                       </option>
                     ))}
                   </optgroup>
@@ -13737,7 +13926,8 @@ ${purpose === "reconnect" ? "This lead went quiet months ago. Treat it as a fres
             </div>
 
             {/* numbering continues past the run so positions stay unique */}
-            {rest.map((r, i) => callRow(r, picked + i))}
+            {rest.slice(0, showN).map((r, i) => callRow(r, picked + i))}
+            <AutoMore shown={showN} total={rest.length} step={LIST_STEP} onMore={() => setCallShow({ key: showKey, n: showN + LIST_STEP })} />
             {!q && (activeFilter || attemptsTest || callListObj) && rest.length === 0 && (
               <div style={{ color: C.muted, fontSize: 13, padding: "14px 4px", textAlign: "center", lineHeight: 1.6 }}>
                 Nobody left in the queue matches {[callListObj ? `the ${listName(callListObj)} list` : "", activeFilter ? `“${activeFilter.label}”` : "", attemptsTest ? `${callAttempts.trim()} attempts` : ""].filter(Boolean).join(" with ")}.
@@ -16401,25 +16591,25 @@ function Modal({ modal, onClose, onSave, totals, apps, onDownloadCsv, onDeleteCs
                       </div>
                       <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
                         <Btn
-                          color={confirmRestore === snap.date ? C.red : undefined}
+                          color={confirmRestore === snap.date + (snap.preRestore ? "-pre" : "") ? C.red : undefined}
                           ghost={confirmRestore !== snap.date}
                           onClick={() => {
-                            if (confirmRestore === snap.date) {
+                            if (confirmRestore === snap.date + (snap.preRestore ? "-pre" : "")) {
                               onRestoreSnapshot(snap);
                               setConfirmRestore("");
                               return;
                             }
-                            setConfirmRestore(snap.date);
+                            setConfirmRestore(snap.date + (snap.preRestore ? "-pre" : ""));
                             setTimeout(() => setConfirmRestore(""), 5000);
                           }}
                           style={{ padding: "5px 10px", fontSize: 11 }}
                         >
-                          {confirmRestore === snap.date ? "Replace everything?" : "↺ Restore"}
+                          {confirmRestore === snap.date + (snap.preRestore ? "-pre" : "") ? "Replace everything?" : "↺ Restore"}
                         </Btn>
                         <Btn ghost onClick={() => onExportSnapshot(snap)} style={{ padding: "5px 10px", fontSize: 11 }}>
                           ⬇ File
                         </Btn>
-                        <Btn ghost onClick={() => onDeleteSnapshot(snap.date)} style={{ padding: "5px 10px", fontSize: 11 }}>
+                        <Btn ghost onClick={() => onDeleteSnapshot(snap)} style={{ padding: "5px 10px", fontSize: 11 }}>
                           ×
                         </Btn>
                       </div>
@@ -21843,6 +22033,44 @@ function DraftCard({ d, state, onApply, onOpen }) {
 /* A compact dropdown for phones: a small label, with the real (invisible)
    select laid over it. iOS needs selects at 16px or it zooms the page, which
    made these the biggest things on screen. */
+/* Long lists draw their first rows straight away and the rest as you scroll
+   down to them (or tap). Building hundreds of rows in one go is what made the
+   bigger lists freeze on a phone. */
+const LIST_STEP = 50;
+const ROWS_STEP = 30; /* heavier rows (the applications sheet) */
+function AutoMore({ shown, total, step = LIST_STEP, onMore }) {
+  const ref = useRef(null);
+  const more = useRef(onMore);
+  more.current = onMore;
+  const left = total - shown;
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || left <= 0 || typeof IntersectionObserver === "undefined") return;
+    let fired = false;
+    const io = new IntersectionObserver(
+      (es) => {
+        if (!fired && es.some((e) => e.isIntersecting)) {
+          fired = true;
+          more.current?.();
+        }
+      },
+      { rootMargin: "700px 0px" }
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [shown, total, left]);
+  if (left <= 0) return null;
+  return (
+    <button
+      ref={ref}
+      data-auto-more
+      onClick={() => more.current?.()}
+      style={{ display: "block", width: "100%", margin: "6px 0 10px", padding: "9px 12px", borderRadius: 10, border: `1px dashed ${C.panelEdge}`, background: "transparent", color: C.muted, fontFamily: sans, fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+    >
+      Show {Math.min(step, left)} more · {left} not shown yet
+    </button>
+  );
+}
 function ChipSelect({ value, onChange, label, color, active, children, ariaLabel, style }) {
   return (
     <div style={{ position: "relative", display: "flex", alignItems: "center", minWidth: 0, fontFamily: sans, fontSize: 12, fontWeight: 700, padding: "8px 24px 8px 11px", borderRadius: 18, border: `1px solid ${active ? color : C.panelEdge}`, background: active ? "rgba(125,176,247,0.08)" : "transparent", color: active ? color : C.muted, ...style }}>
@@ -21953,7 +22181,7 @@ function FoundList({ ids, state, onApply, onOpen, onDraft }) {
    they set has to be correctable here. */
 function ContactTagRow({ contact, onChange }) {
   const [draft, setDraft] = useState("");
-  const tags = tagsOf(contact);
+  const tags = uniqueTags(contact);
   const add = () => {
     const parts = draft.split(",").map(normTag).filter(Boolean);
     if (parts.length) onChange({ tags: withTags(contact, parts).tags });
@@ -22057,7 +22285,7 @@ const TONE_COL = { blue: C.blue, amber: C.amber, red: C.red, green: C.green };
 function ContactBadges({ contact, style, compact }) {
   const t = leadTemp(contact?.temperature);
   const sent = sentKindsOf(contact);
-  const allTags = tagsOf(contact);
+  const allTags = uniqueTags(contact);
   /* the queue shows two tags and a count; the card shows them all */
   const tags = compact ? allTags.slice(0, 2) : allTags;
   const email = emailRequestOpen(contact);
